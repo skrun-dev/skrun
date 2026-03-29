@@ -1,5 +1,7 @@
 # CLI Reference
 
+> **Windows (PowerShell):** use `curl.exe` instead of `curl`. PowerShell aliases `curl` to `Invoke-WebRequest`, which breaks the shell examples below. For JSON request bodies, prefer a file input such as `curl.exe ... -d "@input.json"`.
+
 ## skrun init
 
 Create a new Skrun agent.
@@ -198,4 +200,28 @@ skrun deploy       # npx installs MCP server at runtime
 # Edit SKILL.md or agent.yaml
 skrun test         # Verify changes
 skrun deploy       # Re-deploy (bump version in agent.yaml first)
+```
+
+### Test POST /run from PowerShell
+```powershell
+$body = @{
+  input = "Audit this landing page for SEO issues"
+} | ConvertTo-Json
+
+$body | Set-Content -Path input.json
+curl.exe -X POST http://localhost:3000/run `
+  -H "Content-Type: application/json" `
+  -d "@input.json"
+```
+
+### Call a deployed agent from PowerShell
+```powershell
+$body = @{
+  input = "Summarize the latest changelog entry"
+} | ConvertTo-Json
+
+$body | Set-Content -Path input.json
+curl.exe -X POST https://your-agent.example/run `
+  -H "Content-Type: application/json" `
+  -d "@input.json"
 ```
