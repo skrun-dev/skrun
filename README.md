@@ -40,6 +40,7 @@ curl -X POST localhost:4000/api/agents/dev/my-skill/run \
 
 ```bash
 skrun init my-agent
+skrun init my-agent --provider google
 cd my-agent
 # Creates SKILL.md (instructions) + agent.yaml (config)
 ```
