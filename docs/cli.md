@@ -82,9 +82,12 @@ Push a built `.agent` bundle to the registry.
 
 ```bash
 skrun push
+skrun push --force
 ```
 
 Requires authentication and a built `.agent` bundle (`skrun build` first).
+
+`--force` overwrites an existing version in the local registry so you can re-push the same `agent.yaml` version during development.
 
 ## skrun pull
 

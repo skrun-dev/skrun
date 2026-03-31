@@ -67,6 +67,36 @@ export class MemoryDb {
     return version;
   }
 
+  replaceVersion(
+    agentId: string,
+    data: { version: string; size: number; bundle_key: string },
+  ): AgentVersion {
+    const versions = this.versions.get(agentId) ?? [];
+    const nextVersion: AgentVersion = {
+      id: randomUUID(),
+      agent_id: agentId,
+      ...data,
+      pushed_at: new Date().toISOString(),
+    };
+    const existingIndex = versions.findIndex((version) => version.version === data.version);
+
+    if (existingIndex >= 0) {
+      versions[existingIndex] = nextVersion;
+    } else {
+      versions.push(nextVersion);
+    }
+    this.versions.set(agentId, versions);
+
+    for (const agent of this.agents.values()) {
+      if (agent.id === agentId) {
+        agent.updated_at = nextVersion.pushed_at;
+        break;
+      }
+    }
+
+    return nextVersion;
+  }
+
   getVersions(agentId: string): AgentVersion[] {
     return this.versions.get(agentId) ?? [];
   }

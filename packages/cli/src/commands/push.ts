@@ -11,7 +11,8 @@ export function registerPushCommand(program: Command): void {
   program
     .command("push")
     .description("Push agent to the Skrun registry")
-    .action(async () => {
+    .option("--force", "Overwrite an existing version in the local registry")
+    .action(async (opts: { force?: boolean }) => {
       const dir = process.cwd();
 
       // Check auth
@@ -47,7 +48,7 @@ export function registerPushCommand(program: Command): void {
       // Push
       const client = new RegistryClient(getRegistryUrl(), token);
       try {
-        await client.push(bundle, namespace, slug, version);
+        await client.push(bundle, namespace, slug, version, opts.force ?? false);
         format.success(
           `Pushed ${namespace}/${slug}@${version} (${(bundle.length / 1024).toFixed(1)} KB)`,
         );
