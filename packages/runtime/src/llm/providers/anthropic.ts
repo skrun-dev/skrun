@@ -12,26 +12,31 @@ export class AnthropicProvider implements LLMProvider {
   async call(request: LLMCallRequest): Promise<LLMCallResponse> {
     const messages: Anthropic.MessageParam[] = [];
 
-    // User message
-    messages.push({ role: "user", content: request.userMessage });
-
-    // Tool results from previous iteration
+    // Tool results from previous iteration — build conversation history:
+    // [user(message), assistant(tool_use), user(tool_result)]
     if (request.toolResults?.length) {
-      // Add assistant message with tool_use blocks, then user message with tool_result blocks
+      // Original user message
+      messages.push({ role: "user", content: request.userMessage });
+
+      // Assistant message with tool_use blocks
       const toolUseBlocks: Anthropic.ContentBlockParam[] = request.toolResults.map((tr) => ({
         type: "tool_use" as const,
         id: tr.id ?? tr.name,
         name: tr.name,
         input: {},
       }));
-      messages.splice(messages.length - 1, 0, { role: "assistant", content: toolUseBlocks });
+      messages.push({ role: "assistant", content: toolUseBlocks });
 
+      // User message with tool_result blocks
       const toolResultContent: Anthropic.ToolResultBlockParam[] = request.toolResults.map((tr) => ({
         type: "tool_result" as const,
         tool_use_id: tr.id ?? tr.name,
         content: tr.result,
       }));
       messages.push({ role: "user", content: toolResultContent });
+    } else {
+      // No tool results — simple user message
+      messages.push({ role: "user", content: request.userMessage });
     }
 
     // Map tools

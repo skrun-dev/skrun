@@ -7,6 +7,7 @@ import { gunzipSync } from "node:zlib";
 /**
  * Extract files from a .agent bundle (tar.gz).
  * Returns a map of filename → content as string.
+ * Skips entries with path traversal (e.g., "../") or absolute paths.
  */
 export function extractFiles(gzBuffer: Buffer): Record<string, string> {
   const tarBuffer = gunzipSync(gzBuffer);
@@ -30,7 +31,11 @@ export function extractFiles(gzBuffer: Buffer): Record<string, string> {
 
     // Read content
     const content = tarBuffer.subarray(offset, offset + size);
-    files[fileName] = content.toString("utf-8");
+
+    // Skip entries with path traversal or absolute paths
+    if (!fileName.startsWith("/") && !fileName.includes("..")) {
+      files[fileName] = content.toString("utf-8");
+    }
 
     // Skip to next 512-byte boundary
     const padding = (512 - (size % 512)) % 512;
@@ -56,6 +61,10 @@ export function extractBundleToDisk(gzBuffer: Buffer): {
 
   for (const [name, content] of Object.entries(files)) {
     const filePath = join(dir, name);
+    // Verify the resolved path is still within the target directory
+    if (!filePath.startsWith(dir)) {
+      continue;
+    }
     const fileDir = dirname(filePath);
     if (!existsSync(fileDir)) {
       mkdirSync(fileDir, { recursive: true });
