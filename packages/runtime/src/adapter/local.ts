@@ -122,6 +122,7 @@ export class LocalAdapter implements RuntimeAdapter {
       llmTools.length > 0 ? llmTools : undefined,
       llmTools.length > 0 ? onToolCall : undefined,
       config.model.temperature,
+      request.callerKeys,
     );
 
     this.audit.log({

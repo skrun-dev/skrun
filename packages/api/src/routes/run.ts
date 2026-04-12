@@ -7,6 +7,7 @@ import {
   MemoryStateStore,
   ScriptToolProvider,
   ToolRegistry,
+  redactSecretsFromString,
 } from "@skrun-dev/runtime";
 import type { StateStore } from "@skrun-dev/runtime";
 import { parseAgentYaml } from "@skrun-dev/schema";
@@ -36,7 +37,63 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
       return c.json({ error: { code: "INVALID_REQUEST", message: "Invalid JSON body" } }, 400);
     }
 
-    // 2. Load agent from registry
+    // 2. Parse caller-provided LLM API keys (optional)
+    let callerKeys: Record<string, string> | undefined;
+    const llmKeyHeader = c.req.header("X-LLM-API-Key");
+    if (llmKeyHeader) {
+      try {
+        const parsed = JSON.parse(llmKeyHeader);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          return c.json(
+            {
+              error: {
+                code: "INVALID_LLM_KEY_HEADER",
+                message: 'X-LLM-API-Key must be a JSON object, e.g. {"anthropic": "sk-..."}',
+              },
+            },
+            400,
+          );
+        }
+        const entries = Object.entries(parsed);
+        if (entries.length === 0) {
+          return c.json(
+            {
+              error: {
+                code: "INVALID_LLM_KEY_HEADER",
+                message: "X-LLM-API-Key must contain at least one provider key",
+              },
+            },
+            400,
+          );
+        }
+        for (const [key, value] of entries) {
+          if (typeof value !== "string") {
+            return c.json(
+              {
+                error: {
+                  code: "INVALID_LLM_KEY_HEADER",
+                  message: `X-LLM-API-Key value for "${key}" must be a string`,
+                },
+              },
+              400,
+            );
+          }
+        }
+        callerKeys = parsed as Record<string, string>;
+      } catch {
+        return c.json(
+          {
+            error: {
+              code: "INVALID_LLM_KEY_HEADER",
+              message: "X-LLM-API-Key header is not valid JSON",
+            },
+          },
+          400,
+        );
+      }
+    }
+
+    // 3. Load agent from registry
     let bundleBuffer: Buffer;
     try {
       const result = await service.pull(namespace, name);
@@ -156,6 +213,7 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
         agentsMdContent,
         input,
         runId,
+        callerKeys,
       });
 
       await toolRegistry.disconnectAll();
@@ -181,11 +239,18 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
       cleanupBundle();
 
       const isTimeout = (err as Error).name === "TimeoutError";
+      let errorMessage = err instanceof Error ? err.message : "Agent execution failed";
+
+      // Sanitize: strip caller API keys from error messages (LLM SDKs may include them)
+      if (callerKeys) {
+        errorMessage = redactSecretsFromString(errorMessage, Object.values(callerKeys));
+      }
+
       return c.json(
         {
           error: {
             code: isTimeout ? "TIMEOUT" : "EXECUTION_FAILED",
-            message: err instanceof Error ? err.message : "Agent execution failed",
+            message: errorMessage,
           },
         },
         isTimeout ? 504 : 502,

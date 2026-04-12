@@ -5,8 +5,8 @@ export class AnthropicProvider implements LLMProvider {
   readonly name = "anthropic";
   private client: Anthropic;
 
-  constructor() {
-    this.client = new Anthropic();
+  constructor(apiKey?: string) {
+    this.client = new Anthropic(apiKey ? { apiKey } : undefined);
   }
 
   async call(request: LLMCallRequest): Promise<LLMCallResponse> {

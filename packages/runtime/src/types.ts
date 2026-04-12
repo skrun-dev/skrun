@@ -7,6 +7,8 @@ export interface RunRequest {
   input: Record<string, unknown>;
   runId: string;
   state?: Record<string, unknown>;
+  /** Caller-provided LLM API keys (provider name → API key). Overrides server-side env keys. */
+  callerKeys?: Record<string, string>;
 }
 
 export interface RunResult {

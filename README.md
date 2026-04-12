@@ -84,6 +84,24 @@ skrun deploy
 - **Stateful** — Agents remember across runs via key-value state
 - **Tool calling** — Two approaches: CLI tools ([`scripts/`](docs/agent-yaml.md#tools-optional) — write your own, bundled with the agent) and MCP servers ([`npx`](docs/agent-yaml.md#mcp_servers-optional) — [standard ecosystem](https://github.com/modelcontextprotocol/servers), same as Claude Desktop)
 
+## Caller-provided API Keys
+
+By default, POST /run uses the server's LLM API keys (from `.env`). You can instead provide your own keys per request via the `X-LLM-API-Key` header:
+
+```bash
+curl -X POST http://localhost:4000/api/agents/dev/code-review/run \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -H 'X-LLM-API-Key: {"anthropic": "sk-ant-your-key"}' \
+  -d '{"input": {"code": "function add(a,b) { return a + b; }"}}'
+```
+
+The header value is a JSON object mapping provider names to API keys. Accepted providers: `anthropic`, `openai`, `google`, `mistral`, `groq`.
+
+**Key priority**: caller key > server key > 401 error. If the caller key fails (invalid, quota exceeded), the error is returned directly — no fallback to server keys.
+
+**Security**: caller keys are never logged, stored, or returned in responses. Use HTTPS in production.
+
 ## Demo Agents
 
 All examples use Google Gemini Flash by default. Change the `model` section in `agent.yaml` to use any [supported provider](#key-concepts).
@@ -136,6 +154,7 @@ curl -X POST http://localhost:4000/api/agents/dev/code-review/run \
 
 ## Documentation
 
+- [API reference](docs/api.md)
 - [agent.yaml specification](docs/agent-yaml.md)
 - [CLI reference](docs/cli.md)
 - [Contributing](CONTRIBUTING.md)

@@ -62,6 +62,7 @@ export class LLMRouter {
     tools?: ToolDefinitionForLLM[],
     onToolCall?: ToolCallHandler,
     temperature?: number,
+    callerKeys?: Record<string, string>,
   ): Promise<LLMRouterResponse> {
     const start = Date.now();
     let totalPromptTokens = 0;
@@ -77,6 +78,7 @@ export class LLMRouter {
         tools,
         onToolCall,
         temperature ?? modelConfig.temperature,
+        callerKeys,
       );
       totalPromptTokens += result.usage.promptTokens;
       totalCompletionTokens += result.usage.completionTokens;
@@ -104,6 +106,7 @@ export class LLMRouter {
           tools,
           onToolCall,
           temperature ?? modelConfig.temperature,
+          callerKeys,
         );
         totalPromptTokens += result.usage.promptTokens;
         totalCompletionTokens += result.usage.completionTokens;
@@ -129,13 +132,9 @@ export class LLMRouter {
     tools?: ToolDefinitionForLLM[],
     onToolCall?: ToolCallHandler,
     temperature?: number,
+    callerKeys?: Record<string, string>,
   ): Promise<{ content: string; usage: { promptTokens: number; completionTokens: number } }> {
-    const llmProvider = this.providers.get(provider);
-    if (!llmProvider) {
-      throw new Error(
-        `Provider "${provider}" not available. Set the ${provider.toUpperCase()}_API_KEY env var.`,
-      );
-    }
+    const llmProvider = this.resolveProvider(provider, callerKeys);
 
     let totalPromptTokens = 0;
     let totalCompletionTokens = 0;
@@ -179,6 +178,41 @@ export class LLMRouter {
         "[Max tool iterations reached — agent may need fewer tool calls or a higher iteration limit]",
       usage: { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens },
     };
+  }
+
+  /** Resolve the provider for a given request: caller key takes precedence over server key. */
+  private resolveProvider(providerName: string, callerKeys?: Record<string, string>): LLMProvider {
+    // 1. Caller-provided key → ephemeral provider instance
+    if (callerKeys?.[providerName]) {
+      return this.createProvider(providerName, callerKeys[providerName]);
+    }
+    // 2. Server-side provider (registered at startup from env vars)
+    const serverProvider = this.providers.get(providerName);
+    if (serverProvider) {
+      return serverProvider;
+    }
+    // 3. No key available
+    throw new Error(
+      `No API key available for provider "${providerName}". Provide one via X-LLM-API-Key header or set ${providerName.toUpperCase()}_API_KEY env var.`,
+    );
+  }
+
+  /** Create an ephemeral provider instance with an explicit API key. */
+  private createProvider(providerName: string, apiKey: string): LLMProvider {
+    switch (providerName) {
+      case "anthropic":
+        return new AnthropicProvider(apiKey);
+      case "openai":
+        return createOpenAIProvider(apiKey);
+      case "google":
+        return new GoogleProvider(apiKey);
+      case "mistral":
+        return createMistralProvider(apiKey);
+      case "groq":
+        return createGroqProvider(apiKey);
+      default:
+        throw new Error(`Unknown provider: "${providerName}"`);
+    }
   }
 
   private buildResponse(

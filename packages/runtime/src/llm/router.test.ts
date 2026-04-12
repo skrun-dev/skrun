@@ -71,7 +71,7 @@ describe("LLMRouter", () => {
   it("should throw if provider not registered", async () => {
     await expect(
       router.call({ provider: "anthropic", name: "model" }, "sys", "user"),
-    ).rejects.toThrow('Provider "anthropic" not available');
+    ).rejects.toThrow('No API key available for provider "anthropic"');
   });
 
   it("should track token usage", async () => {
@@ -152,5 +152,102 @@ describe("LLMRouter", () => {
     expect(onToolCall).toHaveBeenCalledOnce();
     expect(provider.call).toHaveBeenCalledTimes(2);
     expect(result.usage.totalTokens).toBe(320); // 100+150 + 20+50
+  });
+
+  describe("caller-provided keys", () => {
+    it("should use caller key instead of server key", async () => {
+      const serverProvider = createMockProvider("anthropic", { content: "server response" });
+      router.registerProvider("anthropic", serverProvider);
+
+      const callerKeys = { anthropic: "sk-ant-caller-key" };
+
+      // The call will fail because the caller key is fake, but the server provider must NOT be called
+      try {
+        await router.call(
+          { provider: "anthropic", name: "claude-sonnet-4-20250514" },
+          "sys",
+          "user",
+          undefined,
+          undefined,
+          undefined,
+          callerKeys,
+        );
+      } catch {
+        // Expected: real API call fails with fake key
+      }
+
+      expect(serverProvider.call).not.toHaveBeenCalled();
+    });
+
+    it("should fall back to server key when caller key not provided for that provider", async () => {
+      const serverProvider = createMockProvider("anthropic");
+      router.registerProvider("anthropic", serverProvider);
+
+      const callerKeys = { openai: "sk-caller-openai" };
+
+      const result = await router.call(
+        { provider: "anthropic", name: "claude-sonnet-4-20250514" },
+        "sys",
+        "user",
+        undefined,
+        undefined,
+        undefined,
+        callerKeys,
+      );
+
+      expect(result.content).toBe("Response from anthropic");
+      expect(serverProvider.call).toHaveBeenCalledOnce();
+    });
+
+    it("should use caller key for primary and server key for fallback", async () => {
+      const serverFallback = createMockProvider("openai");
+      router.registerProvider("openai", serverFallback);
+
+      const callerKeys = { anthropic: "sk-ant-fake" };
+
+      const result = await router.call(
+        {
+          provider: "anthropic",
+          name: "claude-sonnet-4-20250514",
+          fallback: { provider: "openai", name: "gpt-4o" },
+        },
+        "sys",
+        "user",
+        undefined,
+        undefined,
+        undefined,
+        callerKeys,
+      );
+
+      expect(result.content).toBe("Response from openai");
+      expect(result.provider).toBe("openai");
+      expect(serverFallback.call).toHaveBeenCalledOnce();
+    });
+
+    it("should throw when no key available from any source", async () => {
+      await expect(
+        router.call(
+          { provider: "mistral", name: "mistral-large" },
+          "sys",
+          "user",
+          undefined,
+          undefined,
+          undefined,
+          { anthropic: "sk-ant-key" },
+        ),
+      ).rejects.toThrow('No API key available for provider "mistral"');
+    });
+
+    it("should work with no callerKeys (backward compatibility)", async () => {
+      router.registerProvider("anthropic", createMockProvider("anthropic"));
+
+      const result = await router.call(
+        { provider: "anthropic", name: "claude-sonnet-4-20250514" },
+        "sys",
+        "user",
+      );
+
+      expect(result.content).toBe("Response from anthropic");
+    });
   });
 });

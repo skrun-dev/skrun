@@ -86,22 +86,22 @@ export class OpenAICompatibleProvider implements LLMProvider {
   }
 }
 
-export function createOpenAIProvider(): OpenAICompatibleProvider {
-  return new OpenAICompatibleProvider("openai", process.env.OPENAI_API_KEY ?? "");
+export function createOpenAIProvider(apiKey?: string): OpenAICompatibleProvider {
+  return new OpenAICompatibleProvider("openai", apiKey ?? process.env.OPENAI_API_KEY ?? "");
 }
 
-export function createMistralProvider(): OpenAICompatibleProvider {
+export function createMistralProvider(apiKey?: string): OpenAICompatibleProvider {
   return new OpenAICompatibleProvider(
     "mistral",
-    process.env.MISTRAL_API_KEY ?? "",
+    apiKey ?? process.env.MISTRAL_API_KEY ?? "",
     "https://api.mistral.ai/v1",
   );
 }
 
-export function createGroqProvider(): OpenAICompatibleProvider {
+export function createGroqProvider(apiKey?: string): OpenAICompatibleProvider {
   return new OpenAICompatibleProvider(
     "groq",
-    process.env.GROQ_API_KEY ?? "",
+    apiKey ?? process.env.GROQ_API_KEY ?? "",
     "https://api.groq.com/openai/v1",
   );
 }

@@ -17,6 +17,10 @@ export interface AuditEntry {
 
 export class AuditLogger {
   log(entry: AuditEntry): void {
-    console.log(JSON.stringify(entry));
+    // Safety net: strip callerKeys from details before logging
+    const sanitized = entry.details?.callerKeys
+      ? { ...entry, details: { ...entry.details, callerKeys: "[REDACTED]" } }
+      : entry;
+    console.log(JSON.stringify(sanitized));
   }
 }

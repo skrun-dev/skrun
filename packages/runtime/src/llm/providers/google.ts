@@ -20,8 +20,8 @@ export class GoogleProvider implements LLMProvider {
   readonly name = "google";
   private client: GoogleGenerativeAI;
 
-  constructor() {
-    this.client = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY ?? "");
+  constructor(apiKey?: string) {
+    this.client = new GoogleGenerativeAI(apiKey ?? process.env.GOOGLE_API_KEY ?? "");
   }
 
   async call(request: LLMCallRequest): Promise<LLMCallResponse> {
