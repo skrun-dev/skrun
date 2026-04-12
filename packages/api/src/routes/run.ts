@@ -186,14 +186,29 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
 
     // 6. Setup tool registry
     const toolRegistry = new ToolRegistry();
+    const warnings: string[] = [];
 
-    // Add script tool provider if scripts/ exists in the bundle
+    // Add script tool provider if scripts/ exists AND agent is verified (or dev-token)
     if (bundleDir) {
       const { existsSync } = await import("node:fs");
       const scriptsDir = join(bundleDir, "scripts");
       if (existsSync(scriptsDir)) {
-        const scriptProvider = new ScriptToolProvider(scriptsDir);
-        await toolRegistry.addProvider(scriptProvider);
+        const token = c.req.header("Authorization")?.slice(7).trim() ?? "";
+        const isDevToken = token === "dev-token";
+        let isVerified = false;
+        try {
+          const metadata = await service.getMetadata(namespace, name);
+          isVerified = metadata.verified;
+        } catch {
+          // Agent not found in registry — treat as unverified
+        }
+
+        if (isVerified || isDevToken) {
+          const scriptProvider = new ScriptToolProvider(scriptsDir);
+          await toolRegistry.addProvider(scriptProvider);
+        } else {
+          warnings.push("agent_not_verified_scripts_disabled");
+        }
       }
     }
 
@@ -228,6 +243,7 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
           completion_tokens: result.usage.completionTokens,
           total_tokens: result.usage.totalTokens,
         },
+        ...(warnings.length > 0 && { warnings }),
         cost: {
           estimated: result.usage.estimatedCost,
         },

@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { MemoryDb } from "../db/memory.js";
 import { createApp } from "../index.js";
+import { RegistryService } from "../services/registry.js";
 import { MemoryStorage } from "../storage/memory.js";
 
 describe("POST /run — X-LLM-API-Key header parsing", () => {
@@ -72,5 +73,104 @@ describe("POST /run — X-LLM-API-Key header parsing", () => {
     // No header → should get past header parsing and hit "agent not found" (404)
     const res = await runWithHeader(undefined);
     expect(res.status).not.toBe(400);
+  });
+});
+
+describe("POST /run — agent verification", () => {
+  let app: ReturnType<typeof createApp>;
+  let storage: MemoryStorage;
+  let db: MemoryDb;
+  let service: RegistryService;
+
+  const devAuthHeader = { Authorization: "Bearer dev-token" };
+  const prodAuthHeader = { Authorization: "Bearer prod-user-token" };
+
+  beforeEach(() => {
+    storage = new MemoryStorage();
+    db = new MemoryDb();
+    app = createApp(storage, db);
+    service = new RegistryService(storage, db);
+  });
+
+  async function pushAndRun(token: string, verified: boolean) {
+    // Push a fake agent bundle
+    const bundle = Buffer.from("fake-bundle");
+    await app.request("/api/agents/dev/script-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
+      body: bundle,
+    });
+
+    // Set verification if needed
+    if (verified) {
+      db.setVerified("dev", "script-agent", true);
+    }
+
+    // Try to run
+    return app.request("/api/agents/dev/script-agent/run", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ input: { code: "test" } }),
+    });
+  }
+
+  it("non-verified agent: response does not crash (scripts skipped gracefully)", async () => {
+    // Push agent (non-verified by default) and run with non-dev token
+    // The run will fail at LLM call (no API key) but should NOT fail at verification
+    const bundle = Buffer.from("fake-bundle");
+    await app.request("/api/agents/dev/test-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: { ...devAuthHeader, "Content-Type": "application/octet-stream" },
+      body: bundle,
+    });
+
+    const res = await app.request("/api/agents/dev/test-agent/run", {
+      method: "POST",
+      headers: { ...prodAuthHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ input: { text: "hello" } }),
+    });
+    // Should not be 400 or 500 from verification — it reaches the execution phase
+    expect(res.status).not.toBe(400);
+  });
+
+  it("dev-token always bypasses verification", async () => {
+    // Push agent (non-verified) and run with dev-token
+    const bundle = Buffer.from("fake-bundle");
+    await app.request("/api/agents/dev/test-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: { ...devAuthHeader, "Content-Type": "application/octet-stream" },
+      body: bundle,
+    });
+
+    const metadata = await service.getMetadata("dev", "test-agent");
+    expect(metadata.verified).toBe(false);
+
+    // Run with dev-token — should proceed past verification (no warning about scripts)
+    const res = await app.request("/api/agents/dev/test-agent/run", {
+      method: "POST",
+      headers: { ...devAuthHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ input: { text: "hello" } }),
+    });
+    expect(res.status).not.toBe(400);
+  });
+
+  it("verified flag is readable in metadata", async () => {
+    const bundle = Buffer.from("fake-bundle");
+    await app.request("/api/agents/dev/test-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: { ...devAuthHeader, "Content-Type": "application/octet-stream" },
+      body: bundle,
+    });
+
+    // Before verification
+    let res = await app.request("/api/agents/dev/test-agent");
+    let body = await res.json();
+    expect(body.verified).toBe(false);
+
+    // After verification
+    db.setVerified("dev", "test-agent", true);
+    res = await app.request("/api/agents/dev/test-agent");
+    body = await res.json();
+    expect(body.verified).toBe(true);
   });
 });

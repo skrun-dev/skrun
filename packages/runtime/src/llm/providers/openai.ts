@@ -18,14 +18,17 @@ export class OpenAICompatibleProvider implements LLMProvider {
 
     // Tool results from previous iteration
     if (request.toolResults?.length) {
-      // Add assistant message with tool calls
+      // Add assistant message with tool calls (use original args if available)
       messages.push({
         role: "assistant",
         content: null,
-        tool_calls: request.toolResults.map((tr) => ({
+        tool_calls: request.toolResults.map((tr, i) => ({
           id: tr.id ?? tr.name,
           type: "function" as const,
-          function: { name: tr.name, arguments: "{}" },
+          function: {
+            name: tr.name,
+            arguments: JSON.stringify(request.toolCalls?.[i]?.args ?? {}),
+          },
         })),
       });
       // Add tool results

@@ -139,6 +139,7 @@ export class LLMRouter {
     let totalPromptTokens = 0;
     let totalCompletionTokens = 0;
     let toolResults: ToolCallResult[] | undefined;
+    let previousToolCalls: ToolCallRequest[] | undefined;
 
     for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
       const response: LLMCallResponse = await llmProvider.call({
@@ -146,6 +147,7 @@ export class LLMRouter {
         systemPrompt,
         userMessage,
         tools: tools?.length ? tools : undefined,
+        toolCalls: previousToolCalls,
         toolResults,
         temperature,
       });
@@ -161,7 +163,8 @@ export class LLMRouter {
         };
       }
 
-      // Execute tool calls
+      // Execute tool calls and store originals for next iteration
+      previousToolCalls = response.toolCalls;
       toolResults = [];
       for (const call of response.toolCalls) {
         const result = await onToolCall(call);

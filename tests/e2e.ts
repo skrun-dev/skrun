@@ -1,21 +1,24 @@
 /**
- * E2E test script — tests all 5 demo agents against a real LLM.
+ * E2E live test script — tests demo agents + Phase 2 features against a real LLM.
  *
  * Prerequisites:
  *   1. Copy .env.example to .env and set at least GOOGLE_API_KEY
- *   2. Start the registry: pnpm dev:registry
- *   3. Run: node --env-file=.env --import tsx tests/e2e.ts
+ *   2. Run: pnpm test:e2e:live
  *
  * The script will:
+ *   - Auto-start the registry (kills existing process on port 4000)
  *   - Patch each agent to dev/ namespace + google provider
  *   - Build and push each agent
  *   - POST /run and verify the response
+ *   - Test caller-provided LLM keys
+ *   - Test agent verification (script blocking, dev-token bypass)
  *   - Test seo-audit stateful behavior (2 runs)
  *   - Restore original agent.yaml files
+ *   - Auto-stop the registry
  *   - Print a summary
  */
 
-import { execFileSync } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -23,6 +26,55 @@ const ROOT = resolve(import.meta.dirname, "..");
 const CLI = join(ROOT, "packages/cli/bin/skrun.js");
 const REGISTRY = "http://localhost:4000";
 const TOKEN = "dev-token";
+let registryProcess: ChildProcess | null = null;
+
+// --- Registry auto-start/stop ---
+
+function killPort4000(): void {
+  try {
+    const output = execFileSync("netstat", ["-ano"], { encoding: "utf-8" });
+    for (const line of output.split("\n")) {
+      if (line.includes(":4000") && line.includes("LISTENING")) {
+        const pid = line.trim().split(/\s+/).pop();
+        if (pid && pid !== "0") {
+          try { execFileSync("taskkill", ["//PID", pid, "//F"], { stdio: "pipe" }); } catch {}
+        }
+      }
+    }
+  } catch {
+    try { execFileSync("pkill", ["-f", "dev.ts"], { stdio: "pipe" }); } catch {}
+  }
+}
+
+async function startRegistry(): Promise<void> {
+  killPort4000();
+  await new Promise((r) => setTimeout(r, 1000)); // Wait for port release
+
+  const devTs = join(ROOT, "packages/api/src/dev.ts");
+  registryProcess = spawn(process.execPath, ["--import", "tsx", devTs], {
+    cwd: ROOT,
+    env: { ...process.env, PORT: "4000" },
+    stdio: "pipe",
+  });
+
+  // Poll health endpoint
+  for (let i = 0; i < 30; i++) {
+    try {
+      const res = await fetch(`${REGISTRY}/health`);
+      const body = await res.json() as Record<string, string>;
+      if (body.status === "ok") return;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error("Registry failed to start");
+}
+
+function stopRegistry(): void {
+  if (registryProcess) {
+    registryProcess.kill("SIGTERM");
+    registryProcess = null;
+  }
+}
 
 interface TestResult {
   agent: string;
@@ -131,17 +183,13 @@ async function testAgent(
   }
 }
 
-// --- Login ---
-console.log("Setting up...");
-skrun(["login", "--token", TOKEN], ROOT);
-
-// --- Health check ---
-const health = await fetch(`${REGISTRY}/health`).then((r) => r.json());
-if ((health as Record<string, string>).status !== "ok") {
-  console.error("Registry not running. Start with: pnpm dev:registry");
-  process.exit(1);
-}
+// --- Start registry ---
+console.log("Starting registry...");
+await startRegistry();
 console.log("Registry OK\n");
+
+// --- Login ---
+skrun(["login", "--token", TOKEN], ROOT);
 
 // --- Test each agent ---
 
@@ -244,6 +292,155 @@ await testAgent(
   },
 );
 
+// --- Phase 2: Caller-provided LLM keys ---
+
+console.log("Testing caller-provided keys (valid key)...");
+{
+  const googleKey = process.env.GOOGLE_API_KEY;
+  if (googleKey) {
+    const res = await fetch(`${REGISTRY}/api/agents/dev/code-review/run`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        "Content-Type": "application/json",
+        "X-LLM-API-Key": JSON.stringify({ google: googleKey }),
+      },
+      body: JSON.stringify({ input: { code: "const x = 1;" } }),
+    });
+    const body = await res.json() as Record<string, unknown>;
+    results.push({
+      agent: "caller-keys",
+      feature: "Valid caller key → completed",
+      passed: body.status === "completed",
+      duration: (body.duration_ms as number) ?? 0,
+      cost: ((body.cost as Record<string, number>)?.estimated as number) ?? 0,
+      detail: `status=${body.status}`,
+    });
+  }
+}
+
+console.log("Testing caller-provided keys (invalid key → no fallback)...");
+{
+  const res = await fetch(`${REGISTRY}/api/agents/dev/code-review/run`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+      "X-LLM-API-Key": JSON.stringify({ google: "fake-invalid-key" }),
+    },
+    body: JSON.stringify({ input: { code: "const x = 1;" } }),
+  });
+  const body = await res.json() as Record<string, unknown>;
+  results.push({
+    agent: "caller-keys",
+    feature: "Invalid caller key → failed (no fallback)",
+    passed: body.status === "failed",
+    duration: (body.duration_ms as number) ?? 0,
+    cost: 0,
+    detail: `status=${body.status}`,
+  });
+}
+
+console.log("Testing caller-provided keys (malformed header → 400)...");
+{
+  const res = await fetch(`${REGISTRY}/api/agents/dev/code-review/run`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+      "X-LLM-API-Key": "not-json",
+    },
+    body: JSON.stringify({ input: { code: "x" } }),
+  });
+  const body = await res.json() as Record<string, unknown>;
+  const err = body.error as Record<string, string> | undefined;
+  results.push({
+    agent: "caller-keys",
+    feature: "Malformed header → 400",
+    passed: res.status === 400 && err?.code === "INVALID_LLM_KEY_HEADER",
+    duration: 0,
+    cost: 0,
+    detail: `status=${res.status}, code=${err?.code}`,
+  });
+}
+
+// --- Phase 2: Agent verification ---
+
+console.log("Testing verification (default verified=false)...");
+{
+  const res = await fetch(`${REGISTRY}/api/agents/dev/pdf-processing`);
+  const body = await res.json() as Record<string, unknown>;
+  results.push({
+    agent: "verification",
+    feature: "Default verified=false",
+    passed: body.verified === false,
+    duration: 0,
+    cost: 0,
+    detail: `verified=${body.verified}`,
+  });
+}
+
+console.log("Testing verification (PATCH /verify → true)...");
+{
+  const res = await fetch(`${REGISTRY}/api/agents/dev/pdf-processing/verify`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ verified: true }),
+  });
+  const body = await res.json() as Record<string, unknown>;
+  results.push({
+    agent: "verification",
+    feature: "PATCH /verify → true",
+    passed: body.verified === true,
+    duration: 0,
+    cost: 0,
+    detail: `verified=${body.verified}`,
+  });
+}
+
+console.log("Testing verification (non-dev token + non-verified → warning)...");
+{
+  // Revoke first
+  await fetch(`${REGISTRY}/api/agents/dev/pdf-processing/verify`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ verified: false }),
+  });
+  const res = await fetch(`${REGISTRY}/api/agents/dev/pdf-processing/run`, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer test-user-token",
+      "Content-Type": "application/json",
+      "X-LLM-API-Key": JSON.stringify({ google: "fake" }),
+    },
+    body: JSON.stringify({ input: { content: "test", task: "summarize" } }),
+  });
+  const body = await res.json() as Record<string, unknown>;
+  const warnings = body.warnings as string[] | undefined;
+  results.push({
+    agent: "verification",
+    feature: "Non-dev + non-verified → warning",
+    passed: Array.isArray(warnings) && warnings.includes("agent_not_verified_scripts_disabled"),
+    duration: 0,
+    cost: 0,
+    detail: `warnings=${JSON.stringify(warnings)}`,
+  });
+}
+
+console.log("Testing verification (dev-token bypass → no warning)...");
+{
+  const res = await postRun("dev", "pdf-processing", { content: "test", task: "summarize" });
+  const warnings = res.warnings as string[] | undefined;
+  results.push({
+    agent: "verification",
+    feature: "Dev-token bypass → no warning",
+    passed: warnings === undefined,
+    duration: 0,
+    cost: 0,
+    detail: `warnings=${JSON.stringify(warnings)}`,
+  });
+}
+
 // --- Summary ---
 console.log(`\n${"=".repeat(70)}`);
 console.log("E2E TEST RESULTS");
@@ -263,5 +460,8 @@ for (const r of results) {
 console.log(`\n${"-".repeat(70)}`);
 console.log(`${passed} passed, ${failed} failed, ${results.length} total`);
 console.log("-".repeat(70));
+
+// --- Cleanup ---
+stopRegistry();
 
 process.exit(failed > 0 ? 1 : 0);

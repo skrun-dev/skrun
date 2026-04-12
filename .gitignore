@@ -143,3 +143,4 @@ vite.config.ts.timestamp-*
 
 # Local tool config
 .claude/
+.playwright-mcp/

@@ -86,6 +86,7 @@ Input fields must match the `inputs` defined in the agent's `agent.yaml`.
 | `usage.prompt_tokens` | number | Tokens sent to the LLM |
 | `usage.completion_tokens` | number | Tokens received from the LLM |
 | `usage.total_tokens` | number | Total tokens |
+| `warnings` | string[] | Warnings (only present if non-empty). E.g., `["agent_not_verified_scripts_disabled"]` |
 | `cost.estimated` | number | Estimated cost in USD |
 | `duration_ms` | number | Total execution time in milliseconds |
 | `error` | string | Error message (only when `status` is `"failed"`) |
@@ -230,11 +231,41 @@ Get metadata for a specific agent. Public, no auth required.
 {
   "name": "code-review",
   "namespace": "dev",
+  "verified": false,
   "latest_version": "1.0.0",
   "created_at": "2026-04-11T...",
   "updated_at": "2026-04-11T..."
 }
 ```
+
+---
+
+### Verify an agent
+
+```
+PATCH /api/agents/:namespace/:name/verify
+```
+
+Set or unset the `verified` flag on an agent. Only verified agents can execute scripts from `scripts/`. Operator action — requires authentication.
+
+**Headers**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Authorization` | Yes | `Bearer <token>` |
+| `Content-Type` | Yes | `application/json` |
+
+**Request body**
+
+```json
+{ "verified": true }
+```
+
+**Response** `200`: returns the updated agent metadata (same format as GET metadata, with `verified` updated).
+
+**Errors**: `401` if no auth, `404` if agent not found, `400` if body is invalid.
+
+**Note**: in dev mode (`dev-token`), verification is bypassed — all agents can execute scripts without being verified. This ensures zero friction for local development.
 
 ---
 
@@ -286,6 +317,14 @@ All errors follow the same format:
 | `BUNDLE_CORRUPT` | 500 | Failed to extract agent bundle |
 | `MISSING_CONFIG` | 500 | agent.yaml not found in bundle |
 | `INVALID_CONFIG` | 500 | agent.yaml is invalid |
+
+### Warning codes
+
+Warnings appear in the `warnings` array of POST /run responses (not errors — the run still executes).
+
+| Code | Description |
+|------|-------------|
+| `agent_not_verified_scripts_disabled` | Agent has `scripts/` but is not verified — scripts were skipped. Agent ran with LLM + MCP only. |
 | `TIMEOUT` | 504 | Agent execution timed out |
 | `EXECUTION_FAILED` | 502 | Agent execution failed |
 

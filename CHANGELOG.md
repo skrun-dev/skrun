@@ -9,9 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Caller-provided LLM API keys via `X-LLM-API-Key` header on POST /run — callers bring their own keys, operators have zero LLM cost exposure
-- `docs/api.md` — full API reference (endpoints, error codes, rate limits, caller keys)
+- Agent verification — `verified` flag controls script execution for third-party agents. Non-verified agents run with LLM + MCP only (scripts skipped). Dev-token bypasses verification for local development.
+- `PATCH /api/agents/:ns/:name/verify` endpoint for operators to verify/unverify agents
+- `warnings` field in POST /run response (e.g., `agent_not_verified_scripts_disabled`)
+- `docs/api.md` — full API reference (endpoints, error codes, rate limits, caller keys, verification)
 - `redactCallerKeys` utility — caller keys never logged, persisted, or returned
-- 24 new tests (header parsing, router key override, redact utility)
+- Centralized E2E test suite (`tests/e2e/`, 24 tests) — registry, run, caller-keys, verification
+- Live E2E tests with auto-start registry (`tests/e2e.ts`, 14 tests)
+
+### Fixed
+- Path traversal vulnerability in bundle extraction — skip `../` and absolute paths, verify resolved path with `resolve()` + `sep` (thanks @hobostay, PR #7)
+- Anthropic provider message ordering — tool results now correctly ordered as `[user, assistant, user]` (thanks @hobostay, PR #7)
+- Tool call args: providers now pass original args instead of hardcoded `{}` when reconstructing conversation history
 
 ### Changed
 - LLM providers accept explicit `apiKey` parameter (AnthropicProvider, GoogleProvider, OpenAI-compatible)

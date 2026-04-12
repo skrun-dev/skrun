@@ -129,5 +129,37 @@ export function createRegistryRoutes(service: RegistryService): Hono {
     }
   });
 
+  // Verify — auth required (operator action)
+  router.patch("/agents/:namespace/:name/verify", authMiddleware, async (c) => {
+    const { namespace, name } = c.req.param();
+
+    let body: { verified: boolean };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: { code: "INVALID_REQUEST", message: "Invalid JSON body" } }, 400);
+    }
+
+    if (typeof body.verified !== "boolean") {
+      return c.json(
+        { error: { code: "INVALID_REQUEST", message: "Body must contain { verified: boolean }" } },
+        400,
+      );
+    }
+
+    try {
+      const metadata = await service.setVerified(namespace, name, body.verified);
+      return c.json(metadata);
+    } catch (err) {
+      if (err instanceof RegistryError) {
+        return c.json(
+          { error: { code: err.code, message: err.message } },
+          err.status as 400 | 404 | 409 | 500,
+        );
+      }
+      throw err;
+    }
+  });
+
   return router;
 }

@@ -20,6 +20,9 @@ export interface LLMCallRequest {
   systemPrompt: string;
   userMessage: string;
   tools?: ToolDefinitionForLLM[];
+  /** Original tool call requests from the previous LLM response (contains args) */
+  toolCalls?: ToolCallRequest[];
+  /** Tool execution results matching the toolCalls above */
   toolResults?: ToolCallResult[];
   temperature?: number;
   model: string;

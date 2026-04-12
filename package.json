@@ -22,11 +22,13 @@
     "lint:fix": "biome check --write .",
     "dev": "pnpm -r run dev",
     "dev:registry": "pnpm --filter @skrun-dev/api dev",
-    "test:e2e": "node --env-file=.env --import tsx tests/e2e.ts"
+    "test:e2e": "vitest run --config vitest.config.e2e.ts",
+    "test:e2e:live": "node --env-file=.env --import tsx tests/e2e.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.0",
-    "tsx": "^4.21.0"
+    "tsx": "^4.21.0",
+    "vitest": "^3.2.4"
   },
   "engines": {
     "node": ">=20.0.0",

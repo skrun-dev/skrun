@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { gunzipSync } from "node:zlib";
 
 /**
@@ -61,8 +61,8 @@ export function extractBundleToDisk(gzBuffer: Buffer): {
 
   for (const [name, content] of Object.entries(files)) {
     const filePath = join(dir, name);
-    // Verify the resolved path is still within the target directory
-    if (!filePath.startsWith(dir)) {
+    // Verify the resolved path stays within the target directory
+    if (!resolve(filePath).startsWith(resolve(dir) + sep)) {
       continue;
     }
     const fileDir = dirname(filePath);

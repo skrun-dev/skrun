@@ -18,12 +18,12 @@ export class AnthropicProvider implements LLMProvider {
       // Original user message
       messages.push({ role: "user", content: request.userMessage });
 
-      // Assistant message with tool_use blocks
-      const toolUseBlocks: Anthropic.ContentBlockParam[] = request.toolResults.map((tr) => ({
+      // Assistant message with tool_use blocks (use original args if available)
+      const toolUseBlocks: Anthropic.ContentBlockParam[] = request.toolResults.map((tr, i) => ({
         type: "tool_use" as const,
         id: tr.id ?? tr.name,
         name: tr.name,
-        input: {},
+        input: request.toolCalls?.[i]?.args ?? {},
       }));
       messages.push({ role: "assistant", content: toolUseBlocks });
 

@@ -48,11 +48,11 @@ export class GoogleProvider implements LLMProvider {
 
     // Tool results from previous iteration
     if (request.toolResults?.length) {
-      // Model response with function calls
+      // Model response with function calls (use original args if available)
       contents.push({
         role: "model",
-        parts: request.toolResults.map((tr) => ({
-          functionCall: { name: tr.name, args: {} },
+        parts: request.toolResults.map((tr, i) => ({
+          functionCall: { name: tr.name, args: request.toolCalls?.[i]?.args ?? {} },
         })),
       });
       // Function responses

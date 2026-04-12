@@ -2,6 +2,7 @@ export interface AgentMetadata {
   name: string;
   namespace: string;
   description: string;
+  verified: boolean;
   latest_version: string;
   versions: string[];
   created_at: string;

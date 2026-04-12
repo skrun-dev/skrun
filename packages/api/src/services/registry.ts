@@ -108,6 +108,7 @@ export class RegistryService {
         name: a.name,
         namespace: a.namespace,
         description: a.description,
+        verified: a.verified,
         latest_version: latest?.version ?? "",
         versions: versions.map((v) => v.version),
         created_at: a.created_at,
@@ -133,6 +134,14 @@ export class RegistryService {
     }));
   }
 
+  async setVerified(namespace: string, name: string, verified: boolean): Promise<AgentMetadata> {
+    const agent = this.db.setVerified(namespace, name, verified);
+    if (!agent) {
+      throw new RegistryError("NOT_FOUND", `Agent ${namespace}/${name} not found`, 404);
+    }
+    return this.buildMetadata(namespace, name);
+  }
+
   private buildMetadata(namespace: string, name: string): AgentMetadata {
     const agent = this.db.getAgent(namespace, name);
     if (!agent) {
@@ -144,6 +153,7 @@ export class RegistryService {
       name: agent.name,
       namespace: agent.namespace,
       description: agent.description,
+      verified: agent.verified,
       latest_version: latest?.version ?? "",
       versions: versions.map((v) => v.version),
       created_at: agent.created_at,

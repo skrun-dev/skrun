@@ -61,7 +61,7 @@ my-agent/
 
 Scripts are bundled into the `.agent` archive at build time and available on the filesystem at runtime.
 
-> **Note**: For security, only verified publishers can push agents with scripts (see [ADR-005](https://github.com/skrun-dev/skrun)). Unverified agents can use MCP servers but not custom scripts.
+> **Note**: On multi-user instances, `scripts/` only execute for **verified agents**. Non-verified agents can still run (LLM + MCP), but scripts are skipped. Operators verify agents via `PATCH /api/agents/:ns/:name/verify` (see [API reference](api.md#verify-an-agent)). In dev mode (`dev-token`), verification is bypassed — all scripts execute locally.
 
 ### `mcp_servers` (optional)
 - **Type**: array of objects

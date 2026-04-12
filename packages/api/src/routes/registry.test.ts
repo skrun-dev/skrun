@@ -133,6 +133,78 @@ describe("Registry Routes", () => {
     expect(body.versions).toEqual(["1.0.0"]);
   });
 
+  it("GET /agents/:ns/:name metadata includes verified=false by default", async () => {
+    await pushAgent();
+    const res = await app.request("/api/agents/dev/test-agent");
+    const body = await res.json();
+    expect(body.verified).toBe(false);
+  });
+
+  it("PATCH /verify sets verified=true", async () => {
+    await pushAgent();
+    const res = await app.request("/api/agents/dev/test-agent/verify", {
+      method: "PATCH",
+      headers: { ...authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.verified).toBe(true);
+  });
+
+  it("PATCH /verify sets verified=false (revoke)", async () => {
+    await pushAgent();
+    // First verify
+    await app.request("/api/agents/dev/test-agent/verify", {
+      method: "PATCH",
+      headers: { ...authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    });
+    // Then revoke
+    const res = await app.request("/api/agents/dev/test-agent/verify", {
+      method: "PATCH",
+      headers: { ...authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: false }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.verified).toBe(false);
+  });
+
+  it("PATCH /verify returns 404 for non-existent agent", async () => {
+    const res = await app.request("/api/agents/dev/nonexistent/verify", {
+      method: "PATCH",
+      headers: { ...authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("PATCH /verify returns 401 without auth", async () => {
+    const res = await app.request("/api/agents/dev/test-agent/verify", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("Re-push preserves verified flag", async () => {
+    await pushAgent();
+    // Verify the agent
+    await app.request("/api/agents/dev/test-agent/verify", {
+      method: "PATCH",
+      headers: { ...authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    });
+    // Re-push with new version
+    await pushAgent("dev", "test-agent", "2.0.0");
+    // Check verified is still true
+    const res = await app.request("/api/agents/dev/test-agent");
+    const body = await res.json();
+    expect(body.verified).toBe(true);
+  });
+
   it("GET /agents/:ns/:name/versions returns versions (public)", async () => {
     await pushAgent("dev", "agent", "1.0.0");
     await app.request("/api/agents/dev/agent/push?version=2.0.0", {

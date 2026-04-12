@@ -20,6 +20,7 @@ export class MemoryDb {
     const agent: Agent = {
       id: randomUUID(),
       ...data,
+      verified: false,
       created_at: now,
       updated_at: now,
     };
@@ -78,6 +79,14 @@ export class MemoryDb {
   getVersionByNumber(agentId: string, version: string): AgentVersion | null {
     const versions = this.getVersions(agentId);
     return versions.find((v) => v.version === version) ?? null;
+  }
+
+  setVerified(namespace: string, name: string, verified: boolean): Agent | null {
+    const agent = this.getAgent(namespace, name);
+    if (!agent) return null;
+    agent.verified = verified;
+    agent.updated_at = new Date().toISOString();
+    return agent;
   }
 
   clear(): void {
