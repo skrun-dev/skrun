@@ -5,9 +5,9 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   DEV_TOKEN,
   PROD_TOKEN,
-  createTestApp as setup,
   pushAgent,
   runAgent,
+  createTestApp as setup,
   verifyAgent,
 } from "./setup.js";
 

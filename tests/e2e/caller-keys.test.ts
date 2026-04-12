@@ -2,7 +2,7 @@
  * E2E: Caller-provided LLM API keys — X-LLM-API-Key header
  */
 import { beforeEach, describe, expect, it } from "vitest";
-import { createTestApp as setup, pushAgent, runAgent } from "./setup.js";
+import { pushAgent, runAgent, createTestApp as setup } from "./setup.js";
 
 describe("E2E: Caller-provided LLM keys", () => {
   let ctx: ReturnType<typeof setup>;

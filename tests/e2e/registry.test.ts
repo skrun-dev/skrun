@@ -2,7 +2,7 @@
  * E2E: Registry — push, pull, list, metadata, versions, auth
  */
 import { beforeEach, describe, expect, it } from "vitest";
-import { type createTestApp, createTestApp as setup, devAuth, pushAgent } from "./setup.js";
+import { devAuth, pushAgent, createTestApp as setup } from "./setup.js";
 
 describe("E2E: Registry", () => {
   let ctx: ReturnType<typeof setup>;

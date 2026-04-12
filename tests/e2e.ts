@@ -37,12 +37,16 @@ function killPort4000(): void {
       if (line.includes(":4000") && line.includes("LISTENING")) {
         const pid = line.trim().split(/\s+/).pop();
         if (pid && pid !== "0") {
-          try { execFileSync("taskkill", ["//PID", pid, "//F"], { stdio: "pipe" }); } catch {}
+          try {
+            execFileSync("taskkill", ["//PID", pid, "//F"], { stdio: "pipe" });
+          } catch {}
         }
       }
     }
   } catch {
-    try { execFileSync("pkill", ["-f", "dev.ts"], { stdio: "pipe" }); } catch {}
+    try {
+      execFileSync("pkill", ["-f", "dev.ts"], { stdio: "pipe" });
+    } catch {}
   }
 }
 
@@ -61,7 +65,7 @@ async function startRegistry(): Promise<void> {
   for (let i = 0; i < 30; i++) {
     try {
       const res = await fetch(`${REGISTRY}/health`);
-      const body = await res.json() as Record<string, string>;
+      const body = (await res.json()) as Record<string, string>;
       if (body.status === "ok") return;
     } catch {}
     await new Promise((r) => setTimeout(r, 500));
@@ -307,7 +311,7 @@ console.log("Testing caller-provided keys (valid key)...");
       },
       body: JSON.stringify({ input: { code: "const x = 1;" } }),
     });
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     results.push({
       agent: "caller-keys",
       feature: "Valid caller key → completed",
@@ -330,7 +334,7 @@ console.log("Testing caller-provided keys (invalid key → no fallback)...");
     },
     body: JSON.stringify({ input: { code: "const x = 1;" } }),
   });
-  const body = await res.json() as Record<string, unknown>;
+  const body = (await res.json()) as Record<string, unknown>;
   results.push({
     agent: "caller-keys",
     feature: "Invalid caller key → failed (no fallback)",
@@ -352,7 +356,7 @@ console.log("Testing caller-provided keys (malformed header → 400)...");
     },
     body: JSON.stringify({ input: { code: "x" } }),
   });
-  const body = await res.json() as Record<string, unknown>;
+  const body = (await res.json()) as Record<string, unknown>;
   const err = body.error as Record<string, string> | undefined;
   results.push({
     agent: "caller-keys",
@@ -369,7 +373,7 @@ console.log("Testing caller-provided keys (malformed header → 400)...");
 console.log("Testing verification (default verified=false)...");
 {
   const res = await fetch(`${REGISTRY}/api/agents/dev/pdf-processing`);
-  const body = await res.json() as Record<string, unknown>;
+  const body = (await res.json()) as Record<string, unknown>;
   results.push({
     agent: "verification",
     feature: "Default verified=false",
@@ -387,7 +391,7 @@ console.log("Testing verification (PATCH /verify → true)...");
     headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify({ verified: true }),
   });
-  const body = await res.json() as Record<string, unknown>;
+  const body = (await res.json()) as Record<string, unknown>;
   results.push({
     agent: "verification",
     feature: "PATCH /verify → true",
@@ -415,7 +419,7 @@ console.log("Testing verification (non-dev token + non-verified → warning)..."
     },
     body: JSON.stringify({ input: { content: "test", task: "summarize" } }),
   });
-  const body = await res.json() as Record<string, unknown>;
+  const body = (await res.json()) as Record<string, unknown>;
   const warnings = body.warnings as string[] | undefined;
   results.push({
     agent: "verification",

@@ -2,7 +2,7 @@
  * E2E: POST /run — input validation, auth, response format
  */
 import { beforeEach, describe, expect, it } from "vitest";
-import { createTestApp as setup, devAuth, pushAgent, runAgent } from "./setup.js";
+import { devAuth, pushAgent, runAgent, createTestApp as setup } from "./setup.js";
 
 describe("E2E: POST /run", () => {
   let ctx: ReturnType<typeof setup>;
