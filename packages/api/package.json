@@ -10,9 +10,7 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": [
-    "dist"
-  ],
+  "files": ["dist"],
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
@@ -42,11 +40,7 @@
   },
   "homepage": "https://github.com/skrun-dev/skrun#readme",
   "bugs": "https://github.com/skrun-dev/skrun/issues",
-  "keywords": [
-    "skrun",
-    "agent-skills",
-    "ai-agents"
-  ],
+  "keywords": ["skrun", "agent-skills", "ai-agents"],
   "engines": {
     "node": ">=20.0.0"
   }
