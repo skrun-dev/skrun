@@ -1,7 +1,17 @@
 // @skrun-dev/runtime — Agent execution engine
 
 // Types
-export type { RunRequest, RunResult } from "./types.js";
+export type {
+  RunRequest,
+  RunResult,
+  RunEvent,
+  RunStartEvent,
+  ToolCallEvent,
+  ToolResultEvent,
+  LlmCompleteEvent,
+  RunCompleteEvent,
+  RunErrorEvent,
+} from "./types.js";
 
 // Adapter
 export type { RuntimeAdapter } from "./adapter/adapter.js";

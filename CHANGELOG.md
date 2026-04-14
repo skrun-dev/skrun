@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **SSE streaming** — `Accept: text/event-stream` on POST /run streams real-time events (run_start, tool_call, tool_result, llm_complete, run_complete, run_error)
+- **Async webhook** — `webhook_url` in POST /run body returns 202 Accepted, delivers result via POST callback with HMAC-SHA256 signature (`X-Skrun-Signature`)
+- Webhook retry: 3 attempts with exponential backoff (1s, 4s, 16s) on non-2xx
+- `executeStream()` async generator on RuntimeAdapter — event-driven execution core
+- SSE helper (`formatSSEEvent`) and webhook delivery utility (`deliverWebhook`)
+- 20 new unit tests (executeStream, SSE formatting, webhook HMAC/retry)
+- 11 new E2E integration tests (streaming modes, validation, conflicts)
+- 5 new E2E live tests (SSE with real LLM, SSE with tool calls, webhook with real callback)
+
 ## [0.2.0] - 2026-04-12
 
 ### Added

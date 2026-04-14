@@ -81,6 +81,7 @@ skrun deploy
 - **[agent.yaml](docs/agent-yaml.md)** — Runtime config: model, inputs/outputs, permissions, state, tests
 - **[POST /run](docs/cli.md)** — Every agent is an API. Typed inputs, structured outputs.
 - **Multi-model** — Anthropic, OpenAI, Google, Mistral, Groq with automatic fallback
+- **Streaming** — SSE for real-time events, async webhooks for long-running agents
 - **Stateful** — Agents remember across runs via key-value state
 - **Tool calling** — Two approaches: CLI tools ([`scripts/`](docs/agent-yaml.md#tools-optional) — write your own, bundled with the agent) and MCP servers ([`npx`](docs/agent-yaml.md#mcp_servers-optional) — [standard ecosystem](https://github.com/modelcontextprotocol/servers), same as Claude Desktop)
 
@@ -101,6 +102,37 @@ The header value is a JSON object mapping provider names to API keys. Accepted p
 **Key priority**: caller key > server key > 401 error. If the caller key fails (invalid, quota exceeded), the error is returned directly — no fallback to server keys.
 
 **Security**: caller keys are never logged, stored, or returned in responses. Use HTTPS in production.
+
+## Streaming
+
+### SSE — real-time events
+
+Add `Accept: text/event-stream` to get live progress during agent execution:
+
+```bash
+curl -N -X POST http://localhost:4000/api/agents/dev/code-review/run \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"input": {"code": "const x = 1;"}}'
+```
+
+Events: `run_start` → `tool_call` / `tool_result` → `llm_complete` → `run_complete`. Without the header, POST /run returns a normal JSON response (backward compatible).
+
+### Async webhook
+
+For long-running agents, provide a `webhook_url` to get the result via callback:
+
+```bash
+curl -X POST http://localhost:4000/api/agents/dev/code-review/run \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"input": {"code": "const x = 1;"}, "webhook_url": "https://your-app.com/callback"}'
+# → 202 Accepted with { "run_id": "..." }
+# → Result POSTed to your webhook_url when done (with HMAC signature)
+```
+
+[Full API reference →](docs/api.md)
 
 ## Demo Agents
 

@@ -35,7 +35,10 @@ GET /health
 POST /api/agents/:namespace/:name/run
 ```
 
-Execute an agent and return the result.
+Execute an agent and return the result. Supports three modes:
+- **Sync** (default): blocks until completion, returns full result
+- **SSE streaming**: real-time events via Server-Sent Events
+- **Async webhook**: returns immediately, delivers result via callback
 
 **Headers**
 
@@ -43,6 +46,7 @@ Execute an agent and return the result.
 |--------|----------|-------------|
 | `Authorization` | Yes | `Bearer <token>` |
 | `Content-Type` | Yes | `application/json` |
+| `Accept` | No | Set to `text/event-stream` for SSE streaming mode |
 | `X-LLM-API-Key` | No | Caller-provided LLM API keys (see [Caller-provided API keys](#caller-provided-api-keys)) |
 
 **Request body**
@@ -51,11 +55,17 @@ Execute an agent and return the result.
 {
   "input": {
     "field_name": "value"
-  }
+  },
+  "webhook_url": "https://your-app.com/callback"
 }
 ```
 
-Input fields must match the `inputs` defined in the agent's `agent.yaml`.
+| Field | Required | Description |
+|-------|----------|-------------|
+| `input` | Yes | Input fields matching the agent's `agent.yaml` |
+| `webhook_url` | No | URL to receive the result when execution completes (activates async mode) |
+
+**Note**: `Accept: text/event-stream` and `webhook_url` are mutually exclusive. If both are present, the server returns `400`.
 
 **Response** `200`
 
@@ -92,6 +102,72 @@ Input fields must match the `inputs` defined in the agent's `agent.yaml`.
 | `error` | string | Error message (only when `status` is `"failed"`) |
 
 **Rate limit**: 60 requests per minute per IP.
+
+---
+
+### SSE Streaming
+
+Send `Accept: text/event-stream` to receive real-time events during agent execution.
+
+```bash
+curl -N -X POST http://localhost:4000/api/agents/dev/my-agent/run \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"input": {"query": "hello"}}'
+```
+
+**Event types**
+
+| Event | Description | Data fields |
+|-------|-------------|-------------|
+| `run_start` | Agent execution started | `run_id`, `agent`, `timestamp` |
+| `tool_call` | Agent is calling a tool | `run_id`, `tool`, `args`, `timestamp` |
+| `tool_result` | Tool returned a result | `run_id`, `tool`, `result`, `is_error`, `timestamp` |
+| `llm_complete` | LLM finished generating | `run_id`, `provider`, `model`, `tokens`, `timestamp` |
+| `run_complete` | Execution finished successfully | `run_id`, `output`, `usage`, `cost`, `duration_ms`, `timestamp` |
+| `run_error` | Execution failed | `run_id`, `error.code`, `error.message`, `timestamp` |
+
+Events follow the W3C SSE spec (`event: <type>\ndata: <json>\n\n`). The stream closes after `run_complete` or `run_error`.
+
+Validation errors (401, 400, etc.) return normal JSON responses, not SSE streams.
+
+---
+
+### Async Webhook
+
+Send `webhook_url` in the request body to trigger async execution.
+
+```bash
+curl -X POST http://localhost:4000/api/agents/dev/my-agent/run \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"input": {"query": "hello"}, "webhook_url": "https://your-app.com/callback"}'
+```
+
+**Response** `202 Accepted`
+
+```json
+{
+  "run_id": "uuid"
+}
+```
+
+The server executes the agent in the background and POSTs the full result to `webhook_url` when done.
+
+**Webhook delivery**
+
+- Method: `POST`
+- Content-Type: `application/json`
+- Body: same format as the sync response (run_id, status, output, usage, cost, duration_ms)
+- Header `X-Skrun-Signature`: `sha256=<hmac>` — HMAC-SHA256 of the body using the server's signing key
+- Retries: up to 3 times with exponential backoff (1s, 4s, 16s) on non-2xx responses
+
+**Requirements**
+
+- `webhook_url` must be a valid URL
+- `webhook_url` must use HTTPS in production (HTTP allowed in dev mode)
+- Cannot be combined with `Accept: text/event-stream`
 
 ---
 
@@ -310,6 +386,8 @@ All errors follow the same format:
 | `MISSING_INPUT` | 400 | Required input field missing |
 | `INVALID_INPUT_TYPE` | 400 | Input field has wrong type |
 | `INVALID_LLM_KEY_HEADER` | 400 | Malformed X-LLM-API-Key header |
+| `SSE_WEBHOOK_CONFLICT` | 400 | Both SSE and webhook requested in the same call |
+| `INVALID_WEBHOOK_URL` | 400 | webhook_url is not a valid URL or not HTTPS |
 | `MISSING_VERSION` | 400 | Version query param missing on push |
 | `NOT_FOUND` | 404 | Agent not found in registry |
 | `CONFLICT` | 409 | Version already exists |

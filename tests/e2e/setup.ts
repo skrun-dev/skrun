@@ -61,6 +61,105 @@ export async function runAgent(
   });
 }
 
+/** Call POST /run with Accept: text/event-stream and parse SSE events */
+export async function runAgentSSE(
+  app: ReturnType<typeof createApp>,
+  opts: {
+    ns?: string;
+    name?: string;
+    input?: Record<string, unknown>;
+    token?: string;
+    llmKeyHeader?: string;
+    webhookUrl?: string;
+  } = {},
+) {
+  const {
+    ns = "dev",
+    name = "test-agent",
+    input = {},
+    token = DEV_TOKEN,
+    llmKeyHeader,
+    webhookUrl,
+  } = opts;
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+  };
+  if (llmKeyHeader) {
+    headers["X-LLM-API-Key"] = llmKeyHeader;
+  }
+  const body: Record<string, unknown> = { input };
+  if (webhookUrl) {
+    body.webhook_url = webhookUrl;
+  }
+  const res = await app.request(`/api/agents/${ns}/${name}/run`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  return res;
+}
+
+/** Call POST /run with webhook_url in body */
+export async function runAgentWebhook(
+  app: ReturnType<typeof createApp>,
+  opts: {
+    ns?: string;
+    name?: string;
+    input?: Record<string, unknown>;
+    token?: string;
+    webhookUrl: string;
+    llmKeyHeader?: string;
+  },
+) {
+  const {
+    ns = "dev",
+    name = "test-agent",
+    input = {},
+    token = DEV_TOKEN,
+    webhookUrl,
+    llmKeyHeader,
+  } = opts;
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
+  if (llmKeyHeader) {
+    headers["X-LLM-API-Key"] = llmKeyHeader;
+  }
+  return app.request(`/api/agents/${ns}/${name}/run`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ input, webhook_url: webhookUrl }),
+  });
+}
+
+/** Parse SSE response text into array of events */
+export function parseSSEEvents(
+  text: string,
+): Array<{ event: string; data: Record<string, unknown> }> {
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const blocks = text.split("\n\n").filter(Boolean);
+  for (const block of blocks) {
+    const lines = block.split("\n");
+    let eventName = "";
+    let dataStr = "";
+    for (const line of lines) {
+      if (line.startsWith("event: ")) eventName = line.slice(7);
+      if (line.startsWith("data: ")) dataStr = line.slice(6);
+    }
+    if (eventName && dataStr) {
+      try {
+        events.push({ event: eventName, data: JSON.parse(dataStr) });
+      } catch {
+        // Skip malformed events
+      }
+    }
+  }
+  return events;
+}
+
 /** Set verification flag on an agent */
 export async function verifyAgent(
   app: ReturnType<typeof createApp>,
