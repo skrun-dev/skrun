@@ -1,10 +1,19 @@
 import * as p from "@clack/prompts";
 
+export const DEFAULT_MODELS_BY_PROVIDER = {
+  anthropic: "claude-sonnet-4-20250514",
+  openai: "gpt-4o",
+  google: "gemini-2.5-flash",
+  mistral: "mistral-large-latest",
+  groq: "llama-3.3-70b-versatile",
+} as const;
+
 const MODEL_OPTIONS = [
-  { value: "anthropic/claude-sonnet-4-20250514", label: "Anthropic — claude-sonnet-4" },
-  { value: "openai/gpt-4o", label: "OpenAI — gpt-4o" },
-  { value: "mistral/mistral-large-latest", label: "Mistral — mistral-large" },
-  { value: "groq/llama-3.3-70b-versatile", label: "Groq — llama-3.3-70b" },
+  { value: "anthropic/claude-sonnet-4-20250514", label: "Anthropic - claude-sonnet-4" },
+  { value: "openai/gpt-4o", label: "OpenAI - gpt-4o" },
+  { value: "google/gemini-2.5-flash", label: "Google - gemini-2.5-flash" },
+  { value: "mistral/mistral-large-latest", label: "Mistral - mistral-large" },
+  { value: "groq/llama-3.3-70b-versatile", label: "Groq - llama-3.3-70b" },
 ] as const;
 
 function handleCancel(value: unknown): asserts value is string {

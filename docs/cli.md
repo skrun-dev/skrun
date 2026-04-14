@@ -7,6 +7,7 @@ Create a new Skrun agent.
 ```bash
 skrun init [dir]
 skrun init my-agent
+skrun init my-agent --provider google
 skrun init --from-skill ./existing-skill
 ```
 
@@ -17,6 +18,7 @@ skrun init --from-skill ./existing-skill
 | `--force` | Overwrite existing files |
 | `--name <name>` | Agent name (non-interactive) |
 | `--description <desc>` | Agent description (non-interactive) |
+| `--provider <provider>` | Provider with a default model: `anthropic`, `openai`, `google`, `mistral`, `groq` |
 | `--model <provider/name>` | Model (non-interactive) |
 | `--namespace <ns>` | Namespace (non-interactive) |
 
