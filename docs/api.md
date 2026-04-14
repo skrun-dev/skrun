@@ -2,6 +2,8 @@
 
 Base URL: `http://localhost:4000` (local dev) or your deployed instance.
 
+> **Interactive docs**: visit `GET /docs` on your running server for a live API explorer (Scalar UI).
+> **OpenAPI schema**: `GET /openapi.json` — import into Postman, Insomnia, or use for SDK generation.
 > **Prefer the SDK?** Use `@skrun-dev/sdk` for a typed client instead of raw HTTP calls: `npm install @skrun-dev/sdk`
 
 ## Authentication

@@ -215,6 +215,8 @@ curl -X POST http://localhost:4000/api/agents/dev/code-review/run \
 
 ## Documentation
 
+- [Interactive API docs](http://localhost:4000/docs) — live explorer (start the registry first)
+- [OpenAPI schema](http://localhost:4000/openapi.json) — import into Postman/Insomnia
 - [API reference](docs/api.md)
 - [agent.yaml specification](docs/agent-yaml.md)
 - [CLI reference](docs/cli.md)

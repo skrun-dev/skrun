@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 30 SDK unit tests (client, errors, SSE parser)
 - 9 SDK E2E integration tests (against real HTTP server)
 - 3 SDK live tests (run, stream, list against real LLM)
+- **OpenAPI 3.1 schema** — `GET /openapi.json` returns the full API spec (all 9 endpoints, auth, errors, SSE events)
+- **Interactive API docs** — `GET /docs` serves Scalar UI with "Try it" functionality
+- 7 OpenAPI unit tests (schema validity, endpoints, auth, SSE, error refs)
+- 4 OpenAPI E2E tests (/openapi.json, /docs, regression)
 
 ## [0.2.0] - 2026-04-12
 

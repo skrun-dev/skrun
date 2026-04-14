@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.19.14",
+    "@scalar/hono-api-reference": "^0.10.7",
     "@skrun-dev/runtime": "workspace:*",
     "@skrun-dev/schema": "workspace:*",
     "hono": "^4.12.12"

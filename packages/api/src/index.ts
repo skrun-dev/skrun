@@ -1,7 +1,9 @@
+import { apiReference } from "@scalar/hono-api-reference";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { MemoryDb } from "./db/memory.js";
 import { rateLimiter } from "./middleware/rate-limit.js";
+import { getOpenAPISchema } from "./openapi.js";
 import { createRegistryRoutes } from "./routes/registry.js";
 import { createRunRoutes } from "./routes/run.js";
 import { RegistryService } from "./services/registry.js";
@@ -19,6 +21,20 @@ export function createApp(storage: StorageAdapter, db: MemoryDb) {
   app.use("/api/agents/*/run", rateLimiter({ windowMs: 60_000, max: 60 }));
 
   app.get("/health", (c) => c.json({ status: "ok" }));
+
+  // OpenAPI schema + interactive docs
+  app.get("/openapi.json", (c) => {
+    const baseUrl = new URL(c.req.url).origin;
+    return c.json(getOpenAPISchema(baseUrl));
+  });
+  app.get(
+    "/docs",
+    apiReference({
+      url: "/openapi.json",
+      pageTitle: "Skrun API — Interactive Docs",
+    }),
+  );
+
   app.route("/api", createRegistryRoutes(service));
   app.route("/api", createRunRoutes(service));
 
