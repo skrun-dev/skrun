@@ -100,7 +100,7 @@ export class McpToolProvider implements ToolProvider {
   private async connectStdio(): Promise<void> {
     const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
 
-    const command = this.config.command!;
+    const command = this.config.command ?? "";
     const args = this.config.args ?? [];
 
     // MCP servers are npm packages launched via npx (ecosystem standard).
@@ -123,7 +123,8 @@ export class McpToolProvider implements ToolProvider {
     }
 
     const { SSEClientTransport } = await import("@modelcontextprotocol/sdk/client/sse.js");
-    const transport = new SSEClientTransport(new URL(this.config.url!));
+    const url = this.config.url ?? "";
+    const transport = new SSEClientTransport(new URL(url));
     await this.client.connect(transport);
   }
 
@@ -138,7 +139,8 @@ export class McpToolProvider implements ToolProvider {
     const { StreamableHTTPClientTransport } = await import(
       "@modelcontextprotocol/sdk/client/streamableHttp.js"
     );
-    const transport = new StreamableHTTPClientTransport(new URL(this.config.url!));
+    const url = this.config.url ?? "";
+    const transport = new StreamableHTTPClientTransport(new URL(url));
     await this.client.connect(transport);
   }
 
