@@ -9,6 +9,8 @@ export interface RunRequest {
   state?: Record<string, unknown>;
   /** Caller-provided LLM API keys (provider name → API key). Overrides server-side env keys. */
   callerKeys?: Record<string, string>;
+  /** Resolved agent version (semver) actually being executed. Echoed in run_start and final results. */
+  agent_version?: string;
 }
 
 export interface RunResult {
@@ -36,6 +38,8 @@ interface BaseRunEvent {
 export interface RunStartEvent extends BaseRunEvent {
   type: "run_start";
   agent: string;
+  /** Resolved version of the agent being executed. Fallback: "unknown" if the runtime is invoked outside the API (e.g., unit tests). */
+  agent_version: string;
 }
 
 export interface ToolCallEvent extends BaseRunEvent {

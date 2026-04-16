@@ -1,6 +1,6 @@
 {
   "name": "@skrun-dev/runtime",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "exports": {
     ".": {
@@ -22,7 +22,9 @@
     "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@skrun-dev/schema": "workspace:*",
-    "openai": "^4.104.0"
+    "ajv": "^8.12.0",
+    "openai": "^4.104.0",
+    "pino": "^9.0.0"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",

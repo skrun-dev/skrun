@@ -6,7 +6,16 @@ model:
   name: gemini-2.5-flash
 
 tools:
-  - extract
+  - name: extract
+    description: Extract text content from a PDF (returns extracted_text, pages, characters)
+    input_schema:
+      type: object
+      properties:
+        content:
+          type: string
+          description: The PDF content or text to extract
+      required: [content]
+      additionalProperties: false
 
 inputs:
   - name: task

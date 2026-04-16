@@ -1,6 +1,7 @@
 import type { ToolCallRequest, ToolCallResult } from "../llm/providers/types.js";
 import type { LLMRouter } from "../llm/router.js";
-import { AuditLogger } from "../security/audit.js";
+import { createLogger } from "../logger.js";
+import type { Logger } from "../logger.js";
 import { checkCost } from "../security/cost-checker.js";
 import { parseTimeout, withTimeout } from "../security/timeout.js";
 import type { StateStore } from "../state/store.js";
@@ -9,13 +10,16 @@ import type { RunEvent, RunRequest, RunResult } from "../types.js";
 import type { RuntimeAdapter } from "./adapter.js";
 
 export class LocalAdapter implements RuntimeAdapter {
-  private audit = new AuditLogger();
+  private logger: Logger;
 
   constructor(
     private router: LLMRouter,
     private tools: ToolRegistry,
     private state: StateStore,
-  ) {}
+    logger?: Logger,
+  ) {
+    this.logger = logger ?? createLogger("runtime");
+  }
 
   async execute(request: RunRequest): Promise<RunResult> {
     let lastResult: RunResult | undefined;
@@ -42,7 +46,6 @@ export class LocalAdapter implements RuntimeAdapter {
 
     if (lastResult) return lastResult;
 
-    // If we got a run_error event, return a failed result
     const errorEvent = lastError as Extract<RunEvent, { type: "run_error" }> | undefined;
     return {
       runId: request.runId,
@@ -59,48 +62,49 @@ export class LocalAdapter implements RuntimeAdapter {
     const timeoutMs = parseTimeout(config.runtime.timeout);
     const start = Date.now();
 
-    // Emit run_start
     yield {
       type: "run_start",
       run_id: request.runId,
       timestamp: new Date().toISOString(),
       agent: config.name,
+      agent_version: request.agent_version ?? "unknown",
     };
 
-    this.audit.log({
-      runId: request.runId,
-      agentName: config.name,
-      timestamp: new Date().toISOString(),
-      action: "run_start",
-      details: { input: request.input },
-    });
+    this.logger.info(
+      {
+        event: "run_start",
+        run_id: request.runId,
+        agent: config.name,
+        agent_version: request.agent_version,
+      },
+      "Agent run started",
+    );
 
     try {
-      // Wrap the inner execution with timeout
       const { events, result } = await withTimeout(
         this.executeInnerStream(request, start),
         timeoutMs,
       );
 
-      // Yield all collected intermediate events (tool_call, tool_result, llm_complete)
       for (const event of events) {
         yield event;
       }
 
-      // Yield run_complete
       yield result;
     } catch (err) {
       const durationMs = Date.now() - start;
       const isTimeout = (err as Error).name === "TimeoutError";
       const action = isTimeout ? "timeout" : "run_failed";
 
-      this.audit.log({
-        runId: request.runId,
-        agentName: config.name,
-        timestamp: new Date().toISOString(),
-        action,
-        details: { error: err instanceof Error ? err.message : String(err) },
-      });
+      this.logger.error(
+        {
+          event: action,
+          run_id: request.runId,
+          agent: config.name,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        `Agent run ${action}`,
+      );
 
       yield {
         type: "run_error",
@@ -121,19 +125,16 @@ export class LocalAdapter implements RuntimeAdapter {
     const config = request.agentConfig;
     const events: RunEvent[] = [];
 
-    // 1. Read state
     let currentState: Record<string, unknown> | null = null;
     if (config.state.type === "kv") {
       currentState = await this.state.get(config.name);
     }
 
-    // 2. Build system prompt
     const systemPrompt =
       config.context_mode === "persistent" && request.agentsMdContent
         ? request.agentsMdContent
         : request.skillContent;
 
-    // 3. Build user message
     let userMessage = `Input: ${JSON.stringify(request.input)}`;
     if (currentState) {
       userMessage += `\n\nPrevious state: ${JSON.stringify(currentState)}`;
@@ -143,10 +144,10 @@ export class LocalAdapter implements RuntimeAdapter {
       userMessage += `\nAlso include a "_state" field with any state to persist for future runs.`;
     }
 
-    // 4. Get tools
     const toolDefs = await this.tools.listTools();
-    console.log(
-      `[LocalAdapter] ${config.name} — ${toolDefs.length} tools available: ${toolDefs.map((t) => t.name).join(", ") || "(none)"}`,
+    this.logger.info(
+      { event: "tools_loaded", agent: config.name, tools: toolDefs.map((t) => t.name) },
+      `${toolDefs.length} tools available`,
     );
     const llmTools = toolDefs.map((t) => ({
       name: t.name,
@@ -154,9 +155,7 @@ export class LocalAdapter implements RuntimeAdapter {
       parameters: t.parameters,
     }));
 
-    // 5. Call LLM with tool callback that collects events
     const onToolCall = async (call: ToolCallRequest): Promise<ToolCallResult> => {
-      // Emit tool_call event
       events.push({
         type: "tool_call",
         run_id: request.runId,
@@ -167,11 +166,11 @@ export class LocalAdapter implements RuntimeAdapter {
 
       const result = await this.tools.callTool(call.name, call.args);
 
-      console.log(
-        `[ToolCall] ${config.name} → ${call.name}(${JSON.stringify(call.args)}) = ${result.content}${result.isError ? " [ERROR]" : ""}`,
+      this.logger.info(
+        { event: "tool_result", agent: config.name, tool: call.name, isError: result.isError },
+        `Tool ${call.name} ${result.isError ? "failed" : "completed"}`,
       );
 
-      // Emit tool_result event
       events.push({
         type: "tool_result",
         run_id: request.runId,
@@ -179,19 +178,6 @@ export class LocalAdapter implements RuntimeAdapter {
         tool: call.name,
         result: result.content,
         is_error: result.isError ?? false,
-      });
-
-      this.audit.log({
-        runId: request.runId,
-        agentName: config.name,
-        timestamp: new Date().toISOString(),
-        action: "tool_call",
-        details: {
-          tool: call.name,
-          args: call.args,
-          result: result.content,
-          isError: result.isError,
-        },
       });
 
       return { name: call.name, result: result.content, id: call.id };
@@ -207,7 +193,6 @@ export class LocalAdapter implements RuntimeAdapter {
       request.callerKeys,
     );
 
-    // Emit llm_complete event
     events.push({
       type: "llm_complete",
       run_id: request.runId,
@@ -217,20 +202,18 @@ export class LocalAdapter implements RuntimeAdapter {
       tokens: llmResponse.usage.totalTokens,
     });
 
-    this.audit.log({
-      runId: request.runId,
-      agentName: config.name,
-      timestamp: new Date().toISOString(),
-      action: "llm_call",
-      details: {
+    this.logger.info(
+      {
+        event: "llm_call",
+        agent: config.name,
         provider: llmResponse.provider,
         model: llmResponse.model,
         tokens: llmResponse.usage.totalTokens,
         cost: llmResponse.estimatedCost,
       },
-    });
+      "LLM call completed",
+    );
 
-    // 6. Parse output
     let output: Record<string, unknown> = {};
     let newState: Record<string, unknown> | undefined;
 
@@ -247,38 +230,36 @@ export class LocalAdapter implements RuntimeAdapter {
         output = { result: llmResponse.content };
       }
     } catch (_parseErr) {
-      console.warn(
-        `[LocalAdapter] Failed to parse JSON from LLM response for ${config.name}. Falling back to raw text.`,
+      this.logger.warn(
+        { event: "json_parse_fallback", agent: config.name },
+        "Failed to parse JSON from LLM response, falling back to raw text",
       );
       output = { result: llmResponse.content };
     }
 
-    // 7. Save state
     if (config.state.type === "kv" && newState) {
       await this.state.set(config.name, newState);
     }
 
-    // 8. Check cost
     const costResult = checkCost(llmResponse.estimatedCost, config.runtime.max_cost);
     if (costResult.exceeded) {
-      this.audit.log({
-        runId: request.runId,
-        agentName: config.name,
-        timestamp: new Date().toISOString(),
-        action: "cost_exceeded",
-        details: { estimated: costResult.estimated, maxCost: config.runtime.max_cost },
-      });
+      this.logger.warn(
+        {
+          event: "cost_exceeded",
+          agent: config.name,
+          estimated: costResult.estimated,
+          maxCost: config.runtime.max_cost,
+        },
+        "Run cost exceeded max_cost",
+      );
     }
 
     const durationMs = Date.now() - start;
 
-    this.audit.log({
-      runId: request.runId,
-      agentName: config.name,
-      timestamp: new Date().toISOString(),
-      action: "run_complete",
-      details: { durationMs, cost: llmResponse.estimatedCost },
-    });
+    this.logger.info(
+      { event: "run_complete", agent: config.name, durationMs, cost: llmResponse.estimatedCost },
+      "Agent run completed",
+    );
 
     const completeEvent: RunEvent = {
       type: "run_complete",

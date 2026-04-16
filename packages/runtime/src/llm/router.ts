@@ -1,4 +1,6 @@
 import type { ModelConfig } from "@skrun-dev/schema";
+import { createLogger } from "../logger.js";
+import type { Logger } from "../logger.js";
 import { estimateCost } from "./cost.js";
 import { AnthropicProvider } from "./providers/anthropic.js";
 import { GoogleProvider } from "./providers/google.js";
@@ -31,8 +33,10 @@ export type ToolCallHandler = (call: ToolCallRequest) => Promise<ToolCallResult>
 
 export class LLMRouter {
   private providers = new Map<string, LLMProvider>();
+  private logger: Logger;
 
-  constructor() {
+  constructor(logger?: Logger) {
+    this.logger = logger ?? createLogger("llm");
     // Register available providers based on env keys
     if (process.env.ANTHROPIC_API_KEY) {
       this.providers.set("anthropic", new AnthropicProvider());
@@ -96,8 +100,14 @@ export class LLMRouter {
     } catch (primaryError) {
       // Try fallback
       if (modelConfig.fallback) {
-        console.warn(
-          `[LLMRouter] Primary ${modelConfig.provider}/${modelConfig.name} failed: ${primaryError instanceof Error ? primaryError.message : primaryError}. Trying fallback...`,
+        this.logger.warn(
+          {
+            event: "primary_failed",
+            provider: modelConfig.provider,
+            model: modelConfig.name,
+            error: primaryError instanceof Error ? primaryError.message : String(primaryError),
+          },
+          "Primary LLM failed, trying fallback",
         );
 
         const result = await this.callWithToolLoop(
@@ -176,8 +186,9 @@ export class LLMRouter {
     }
 
     // Max iterations reached
-    console.warn(
-      `[LLMRouter] Max tool iterations (${MAX_TOOL_ITERATIONS}) reached for ${provider}/${model}. Returning last available content.`,
+    this.logger.warn(
+      { event: "max_iterations", provider, model, maxIterations: MAX_TOOL_ITERATIONS },
+      "Max tool iterations reached",
     );
     return {
       content:

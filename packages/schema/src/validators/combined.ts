@@ -128,8 +128,8 @@ export async function validateAgent(dir: string): Promise<ValidationResult> {
   const allowedTools = skill.frontmatter["allowed-tools"];
   if (allowedTools && agentConfig.config.tools.length > 0) {
     const skillTools = allowedTools.split(/\s+/).filter(Boolean);
-    const agentTools = agentConfig.config.tools;
-    const extraTools = agentTools.filter((t) => !skillTools.some((st) => st.includes(t)));
+    const agentToolNames = agentConfig.config.tools.map((t) => t.name);
+    const extraTools = agentToolNames.filter((t) => !skillTools.some((st) => st.includes(t)));
     if (extraTools.length > 0) {
       warnings.push({
         code: "TOOLS_NOT_IN_SKILL",

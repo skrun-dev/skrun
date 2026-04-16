@@ -35,7 +35,10 @@ export { MemoryStateStore } from "./state/memory.js";
 // Security
 export { withTimeout, parseTimeout, TimeoutError } from "./security/timeout.js";
 export { checkCost } from "./security/cost-checker.js";
-export { AuditLogger } from "./security/audit.js";
+
+// Logger
+export { createLogger } from "./logger.js";
+export type { Logger } from "./logger.js";
 
 // Utils
 export { redactCallerKeys, redactSecretsFromString, CALLER_KEY_FIELDS } from "./utils/redact.js";

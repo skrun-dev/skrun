@@ -8,6 +8,7 @@ import { RuntimeConfigSchema } from "./runtime-config.js";
 import { SkillFrontmatterSchema } from "./skill-frontmatter.js";
 import { StateConfigSchema } from "./state-config.js";
 import { TestCaseSchema } from "./test-case.js";
+import { ToolConfigSchema } from "./tool-config.js";
 
 describe("ModelConfigSchema", () => {
   it("should validate a valid model config", () => {
@@ -266,7 +267,22 @@ describe("AgentConfigSchema", () => {
   it("should validate a full config", () => {
     const result = AgentConfigSchema.parse({
       ...validConfig,
-      tools: ["web_search", "browser"],
+      tools: [
+        {
+          name: "web_search",
+          description: "Search the web",
+          input_schema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+        },
+        {
+          name: "browser",
+          description: "Open URL",
+          input_schema: {
+            type: "object",
+            properties: { url: { type: "string" } },
+            required: ["url"],
+          },
+        },
+      ],
       mcp_servers: [{ name: "gsc", url: "https://mcp.gsc.io/sse", auth: "oauth2" }],
       permissions: {
         network: ["googleapis.com"],
@@ -303,5 +319,87 @@ describe("AgentConfigSchema", () => {
 
   it("should reject empty outputs", () => {
     expect(() => AgentConfigSchema.parse({ ...validConfig, outputs: [] })).toThrow();
+  });
+
+  it("should reject legacy tools:[string] with helpful message", () => {
+    const result = AgentConfigSchema.safeParse({ ...validConfig, tools: ["pdf-extract"] });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const joined = result.error.issues.map((i) => i.message).join(" | ");
+      expect(joined).toMatch(/must be an object/i);
+      expect(joined).toMatch(/docs\/agent-yaml\.md/);
+      const firstIssue = result.error.issues[0];
+      expect(firstIssue.path).toEqual(["tools", 0]);
+    }
+  });
+
+  it("should accept an empty tools array", () => {
+    const result = AgentConfigSchema.parse({ ...validConfig, tools: [] });
+    expect(result.tools).toEqual([]);
+  });
+});
+
+describe("ToolConfigSchema", () => {
+  const validTool = {
+    name: "pdf-extract",
+    description: "Extract text from a PDF file.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  };
+
+  it("should validate a full ToolConfig", () => {
+    const result = ToolConfigSchema.parse(validTool);
+    expect(result.name).toBe("pdf-extract");
+    expect(result.description).toBe("Extract text from a PDF file.");
+    expect(result.input_schema.type).toBe("object");
+    expect(result.input_schema.required).toEqual(["path"]);
+  });
+
+  it("should reject missing name", () => {
+    const { name, ...without } = validTool;
+    void name;
+    const result = ToolConfigSchema.safeParse(without);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((i) => i.path[0] === "name")).toBe(true);
+    }
+  });
+
+  it("should reject missing input_schema", () => {
+    const { input_schema, ...without } = validTool;
+    void input_schema;
+    const result = ToolConfigSchema.safeParse(without);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((i) => i.path[0] === "input_schema")).toBe(true);
+    }
+  });
+
+  it("should reject invalid name format", () => {
+    const result = ToolConfigSchema.safeParse({ ...validTool, name: "bad name!" });
+    expect(result.success).toBe(false);
+  });
+
+  it("should preserve extra JSON Schema keywords via passthrough", () => {
+    const result = ToolConfigSchema.parse({
+      ...validTool,
+      input_schema: {
+        type: "object",
+        properties: {
+          count: { type: "integer", minimum: 1, maximum: 100, default: 10 },
+        },
+        required: ["count"],
+        additionalProperties: false,
+      },
+    });
+    const count = result.input_schema.properties.count as { minimum: number; default: number };
+    expect(count.minimum).toBe(1);
+    expect(count.default).toBe(10);
   });
 });

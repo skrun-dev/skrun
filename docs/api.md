@@ -60,6 +60,7 @@ Execute an agent and return the result. Supports three modes:
   "input": {
     "field_name": "value"
   },
+  "version": "1.2.0",
   "webhook_url": "https://your-app.com/callback"
 }
 ```
@@ -67,6 +68,7 @@ Execute an agent and return the result. Supports three modes:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `input` | Yes | Input fields matching the agent's `agent.yaml` |
+| `version` | No | Pin a specific agent version (**strict semver**, e.g. `"1.2.0"`). Omit to target latest. Ranges (`^`, `~`, `*`) and keywords (`"latest"`, `"HEAD"`) are not supported — omit the field for latest. |
 | `webhook_url` | No | URL to receive the result when execution completes (activates async mode) |
 
 **Note**: `Accept: text/event-stream` and `webhook_url` are mutually exclusive. If both are present, the server returns `400`.
@@ -77,6 +79,7 @@ Execute an agent and return the result. Supports three modes:
 {
   "run_id": "uuid",
   "status": "completed",
+  "agent_version": "1.2.0",
   "output": {
     "field_name": "value"
   },
@@ -96,6 +99,7 @@ Execute an agent and return the result. Supports three modes:
 |-------|------|-------------|
 | `run_id` | string | Unique run identifier |
 | `status` | `"completed"` or `"failed"` | Execution result |
+| `agent_version` | string | Resolved agent version (semver) that was executed. Always present, whether pinned or resolved-to-latest. |
 | `output` | object | Agent output fields (as defined in agent.yaml) |
 | `usage.prompt_tokens` | number | Tokens sent to the LLM |
 | `usage.completion_tokens` | number | Tokens received from the LLM |
@@ -104,6 +108,24 @@ Execute an agent and return the result. Supports three modes:
 | `cost.estimated` | number | Estimated cost in USD |
 | `duration_ms` | number | Total execution time in milliseconds |
 | `error` | string | Error message (only when `status` is `"failed"`) |
+
+**Version-related errors**
+
+| Status | Code | When |
+|--------|------|------|
+| `400` | `INVALID_VERSION_FORMAT` | `version` is not strict semver (e.g. `"1.0"`, `"^1.0.0"`, `"latest"`, `""`) |
+| `404` | `VERSION_NOT_FOUND` | Pinned version does not exist. Response body includes `available: string[]` — up to 10 most recent versions (newest first) for quick recovery |
+
+Example 404:
+```json
+{
+  "error": {
+    "code": "VERSION_NOT_FOUND",
+    "message": "Version 9.9.9 not found for acme/seo-audit",
+    "available": ["1.2.0", "1.1.0", "1.0.0"]
+  }
+}
+```
 
 **Rate limit**: 60 requests per minute per IP.
 
@@ -125,7 +147,7 @@ curl -N -X POST http://localhost:4000/api/agents/dev/my-agent/run \
 
 | Event | Description | Data fields |
 |-------|-------------|-------------|
-| `run_start` | Agent execution started | `run_id`, `agent`, `timestamp` |
+| `run_start` | Agent execution started | `run_id`, `agent`, `agent_version`, `timestamp` |
 | `tool_call` | Agent is calling a tool | `run_id`, `tool`, `args`, `timestamp` |
 | `tool_result` | Tool returned a result | `run_id`, `tool`, `result`, `is_error`, `timestamp` |
 | `llm_complete` | LLM finished generating | `run_id`, `provider`, `model`, `tokens`, `timestamp` |
@@ -153,7 +175,8 @@ curl -X POST http://localhost:4000/api/agents/dev/my-agent/run \
 
 ```json
 {
-  "run_id": "uuid"
+  "run_id": "uuid",
+  "agent_version": "1.2.0"
 }
 ```
 
@@ -163,7 +186,7 @@ The server executes the agent in the background and POSTs the full result to `we
 
 - Method: `POST`
 - Content-Type: `application/json`
-- Body: same format as the sync response (run_id, status, output, usage, cost, duration_ms)
+- Body: same format as the sync response (includes `agent_version`, `run_id`, `status`, `output`, `usage`, `cost`, `duration_ms`)
 - Header `X-Skrun-Signature`: `sha256=<hmac>` — HMAC-SHA256 of the body using the server's signing key
 - Retries: up to 3 times with exponential backoff (1s, 4s, 16s) on non-2xx responses
 
@@ -409,6 +432,49 @@ Warnings appear in the `warnings` array of POST /run responses (not errors — t
 | `agent_not_verified_scripts_disabled` | Agent has `scripts/` but is not verified — scripts were skipped. Agent ran with LLM + MCP only. |
 | `TIMEOUT` | 504 | Agent execution timed out |
 | `EXECUTION_FAILED` | 502 | Agent execution failed |
+
+## Structured logging
+
+Skrun emits **structured JSON logs to stdout** via [pino](https://getpino.io). Every log line is a valid JSON object that can be piped directly to Axiom, Datadog, Grafana Loki, ELK, CloudWatch Logs, or any log backend that accepts JSON.
+
+**Example log line** (formatted for readability):
+
+```json
+{
+  "level": 30,
+  "time": 1713225600000,
+  "name": "skrun:api",
+  "run_id": "a1b2c3d4-...",
+  "agent": "dev/code-review",
+  "agent_version": "1.2.0",
+  "event": "run_complete",
+  "msg": "Agent run completed",
+  "durationMs": 3200,
+  "cost": 0.00025
+}
+```
+
+**`LOG_LEVEL` env var** controls verbosity (default: `info`):
+
+| Level | What it shows |
+|-------|---------------|
+| `debug` | Everything — verbose internal state |
+| `info` | Run lifecycle, tool calls, LLM calls (default) |
+| `warn` | Fallback triggers, cost exceeded, parse failures |
+| `error` | Execution failures, webhook exhaustion |
+
+```bash
+# Suppress info logs in production (only warn + error)
+LOG_LEVEL=warn pnpm dev:registry
+
+# Pipe to a log backend
+pnpm dev:registry | npx pino-pretty   # human-readable dev output
+pnpm dev:registry > /var/log/skrun.jsonl   # file for ingestion
+```
+
+**Run context**: every log entry emitted during a `POST /run` includes `run_id`, `agent`, and `agent_version` automatically (via pino child logger bindings).
+
+---
 
 ## Rate limiting
 

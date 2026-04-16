@@ -45,7 +45,7 @@ export class SkrunClient {
     const res = await this.request(`/api/agents/${namespace}/${name}/run`, {
       method: "POST",
       headers: this.buildHeaders(options),
-      body: JSON.stringify({ input }),
+      body: JSON.stringify(this.buildRunBody(input, options)),
       timeout: options?.timeout,
     });
     return (await res.json()) as SdkRunResult;
@@ -64,7 +64,7 @@ export class SkrunClient {
     const res = await this.request(`/api/agents/${namespace}/${name}/run`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ input }),
+      body: JSON.stringify(this.buildRunBody(input, options)),
       timeout: options?.timeout,
     });
 
@@ -82,7 +82,7 @@ export class SkrunClient {
     const res = await this.request(`/api/agents/${namespace}/${name}/run`, {
       method: "POST",
       headers: this.buildHeaders(options),
-      body: JSON.stringify({ input, webhook_url: webhookUrl }),
+      body: JSON.stringify(this.buildRunBody(input, options, webhookUrl)),
       timeout: options?.timeout,
     });
     return (await res.json()) as AsyncRunResult;
@@ -175,6 +175,17 @@ export class SkrunClient {
       throw new Error("Agent must be 'namespace/name' format");
     }
     return { namespace: parts[0], name: parts[1] };
+  }
+
+  private buildRunBody(
+    input: Record<string, unknown>,
+    options?: RunOptions,
+    webhookUrl?: string,
+  ): Record<string, unknown> {
+    const body: Record<string, unknown> = { input };
+    if (options?.version) body.version = options.version;
+    if (webhookUrl) body.webhook_url = webhookUrl;
+    return body;
   }
 
   private buildHeaders(options?: RunOptions): Record<string, string> {

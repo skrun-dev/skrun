@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { basename, extname, join } from "node:path";
+import type { ToolConfig } from "@skrun-dev/schema";
+import Ajv, { type ValidateFunction } from "ajv";
 import type { ToolDefinition, ToolProvider, ToolResult } from "./types.js";
 
 const SCRIPT_TIMEOUT = 30_000; // 30 seconds
@@ -8,8 +10,19 @@ const SUPPORTED_EXTENSIONS = new Set([".ts", ".js", ".py"]);
 
 export class ScriptToolProvider implements ToolProvider {
   private scripts = new Map<string, { path: string; ext: string }>();
+  private toolConfigs = new Map<string, ToolConfig>();
+  private validators = new Map<string, ValidateFunction>();
+  private ajv: Ajv;
 
-  constructor(private scriptsDir: string) {
+  constructor(
+    private scriptsDir: string,
+    toolConfigs: ToolConfig[] = [],
+  ) {
+    this.ajv = new Ajv({ allErrors: true, strict: false });
+    for (const cfg of toolConfigs) {
+      this.toolConfigs.set(cfg.name, cfg);
+      this.validators.set(cfg.name, this.ajv.compile(cfg.input_schema));
+    }
     this.scanScripts();
   }
 
@@ -26,22 +39,33 @@ export class ScriptToolProvider implements ToolProvider {
   }
 
   async listTools(): Promise<ToolDefinition[]> {
-    return [...this.scripts.entries()].map(([name]) => ({
-      name,
-      description: `Execute ${name} script`,
-      parameters: {
-        type: "object",
-        properties: {
-          args: { type: "string", description: "JSON arguments for the script" },
-        },
-      },
+    return [...this.toolConfigs.values()].map((cfg) => ({
+      name: cfg.name,
+      description: cfg.description,
+      parameters: cfg.input_schema as Record<string, unknown>,
     }));
   }
 
   async callTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+    const cfg = this.toolConfigs.get(name);
+    if (!cfg) {
+      return { content: `Tool "${name}" not declared in agent.yaml`, isError: true };
+    }
+
+    const validate = this.validators.get(name);
+    if (validate && !validate(args)) {
+      return {
+        content: `Invalid arguments for tool '${name}': ${ajvErrorsToString(validate.errors)}`,
+        isError: true,
+      };
+    }
+
     const script = this.scripts.get(name);
     if (!script) {
-      return { content: `Script "${name}" not found`, isError: true };
+      return {
+        content: `Script "${name}" declared in agent.yaml not found in scripts/`,
+        isError: true,
+      };
     }
 
     const command = script.ext === ".py" ? "python3" : "node";
@@ -72,4 +96,14 @@ export class ScriptToolProvider implements ToolProvider {
   async disconnect(): Promise<void> {
     // Nothing to disconnect
   }
+}
+
+function ajvErrorsToString(errors: ValidateFunction["errors"]): string {
+  if (!errors || errors.length === 0) return "validation failed";
+  return errors
+    .map((err) => {
+      const path = err.instancePath || "(root)";
+      return `${path} ${err.message}`;
+    })
+    .join("; ");
 }

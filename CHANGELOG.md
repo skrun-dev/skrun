@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-04-16
+
+### Changed
+- **BREAKING — `tools:` in `agent.yaml` must now be objects.** The legacy string-array form (`tools: [pdf-extract]`) is rejected with a migration message. Each tool now requires `name`, `description`, and an `input_schema` ([JSON Schema draft-07](https://json-schema.org/draft-07/)). The LLM receives the declared schema as the tool spec instead of a stub, and arguments are validated via Ajv before the script runs (invalid args → ToolResult.isError so the LLM can self-correct). See `docs/agent-yaml.md#tools` for the new shape and migration tip.
+
+### Added
+- `ToolConfigSchema` and `InputSchemaSchema` exported from `@skrun-dev/schema`
+- Ajv dependency in `@skrun-dev/runtime` for per-tool schema validation (compiled once per tool, cached)
+- **Agent version pinning on `POST /run`** — optional `version` field in the request body targets a specific agent version (strict semver, e.g. `"1.2.0"`). Omit for latest. Ranges (`^`, `~`) and keywords (`"latest"`) are rejected with `400 INVALID_VERSION_FORMAT`. Non-existent version returns `404 VERSION_NOT_FOUND` with an `available: string[]` list (up to 10 most recent, newest first) for recovery.
+- `agent_version` is now **always echoed** in every run response: sync 200, SSE `run_start` event, webhook 202 accept, and webhook callback payload.
+- SDK `@skrun-dev/sdk`: `run()`, `stream()`, `runAsync()` accept `{ version?: string }` in their options. `SdkRunResult.agent_version` and `AsyncRunResult.agent_version` are now required fields. `RunStartEvent.agent_version` exposes the resolved version.
+- OpenAPI schema: request body adds optional `version`; `RunResult` and `AsyncRunResult` require `agent_version`; new `VersionNotFoundResponse` schema; 404 on `POST /run` uses `oneOf(ErrorResponse, VersionNotFoundResponse)`.
+- **Structured JSON logging** via pino in `@skrun-dev/runtime` and `@skrun-dev/api`. Every log line is valid JSON with `level`, `time`, `name`, `msg`, and run context (`run_id`, `agent`, `agent_version`). Replaces all ad-hoc `console.log/warn/error` + the Phase 1 `AuditLogger`. `LOG_LEVEL` env var (debug/info/warn/error, default: info) controls verbosity. `createLogger` exported from `@skrun-dev/runtime` for operators embedding the runtime.
+- 25+ new tests total: 13 for tool input_schema (7 schema, 6 runtime) + 12 for version pinning (8 api, 4 sdk, 6 openapi, 2 e2e integration) + 4 for structured logs (logger output, child bindings, LOG_LEVEL filtering, callerKeys redaction).
+
 ## [0.3.0] - 2026-04-15
 
 ### Added

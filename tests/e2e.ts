@@ -164,7 +164,17 @@ async function testAgent(
     // Run
     const res = await postRun("dev", name, input);
     const output = res.output as Record<string, unknown>;
-    const error = validate(res);
+    let error = validate(res);
+
+    // #7 assertion — agent_version must always be echoed in sync responses
+    if (!error) {
+      const agentVersion = res.agent_version as string | undefined;
+      if (!agentVersion) {
+        error = "Missing agent_version in response (feature #7 regression)";
+      } else if (!/^\d+\.\d+\.\d+$/.test(agentVersion)) {
+        error = `agent_version "${agentVersion}" is not strict semver`;
+      }
+    }
 
     results.push({
       agent: name,
@@ -173,7 +183,8 @@ async function testAgent(
       duration: (res.duration_ms as number) ?? 0,
       cost: ((res.cost as Record<string, number>)?.estimated as number) ?? 0,
       detail:
-        error ?? `status=${res.status}, output keys=[${Object.keys(output ?? {}).join(", ")}]`,
+        error ??
+        `status=${res.status}, version=${res.agent_version as string}, output keys=[${Object.keys(output ?? {}).join(", ")}]`,
     });
   } catch (err) {
     results.push({
@@ -690,14 +701,18 @@ console.log("Testing SDK run() on real agent...");
 {
   try {
     const result = await sdkClient.run("dev/code-review", { code: "const y = 2;" });
+    const hasVersion = !!result.agent_version && /^\d+\.\d+\.\d+$/.test(result.agent_version);
     results.push({
       agent: "sdk",
-      feature: "SDK run() → completed with output",
+      feature: "SDK run() → completed with output + agent_version",
       passed:
-        result.status === "completed" && result.output !== undefined && result.usage !== undefined,
+        result.status === "completed" &&
+        result.output !== undefined &&
+        result.usage !== undefined &&
+        hasVersion,
       duration: result.duration_ms ?? 0,
       cost: result.cost?.estimated ?? 0,
-      detail: `status=${result.status}, keys=[${Object.keys(result.output).join(",")}]`,
+      detail: `status=${result.status}, version=${result.agent_version}, keys=[${Object.keys(result.output).join(",")}]`,
     });
   } catch (err) {
     results.push({
@@ -757,6 +772,115 @@ console.log("Testing SDK list() on registry...");
     results.push({
       agent: "sdk",
       feature: "SDK list() → returns agents",
+      passed: false,
+      duration: 0,
+      cost: 0,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+// --- Phase 3: Version pinning (#7) ---
+
+console.log("Testing version pinning (SDK run({version}) against latest)...");
+{
+  try {
+    // Discover the current latest version of dev/code-review
+    const versions = await sdkClient.getVersions("dev/code-review");
+    const pinnedVersion = versions[versions.length - 1]; // latest pushed
+
+    const result = await sdkClient.run(
+      "dev/code-review",
+      { code: "const z = 3;" },
+      { version: pinnedVersion },
+    );
+
+    const pinMatch = result.agent_version === pinnedVersion;
+    results.push({
+      agent: "version-pinning",
+      feature: "SDK run({version}) → agent_version echoes pinned version",
+      passed: result.status === "completed" && pinMatch,
+      duration: result.duration_ms ?? 0,
+      cost: result.cost?.estimated ?? 0,
+      detail: `pinned=${pinnedVersion}, echoed=${result.agent_version}, match=${pinMatch}`,
+    });
+  } catch (err) {
+    results.push({
+      agent: "version-pinning",
+      feature: "SDK run({version}) → agent_version echoes pinned version",
+      passed: false,
+      duration: 0,
+      cost: 0,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+console.log("Testing version pinning — 404 VERSION_NOT_FOUND with `available`...");
+{
+  try {
+    // Direct fetch to inspect the 404 body
+    const res = await fetch(`${REGISTRY}/api/agents/dev/code-review/run`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ input: { code: "x" }, version: "99.99.99" }),
+    });
+    const body = (await res.json()) as {
+      error?: { code?: string; available?: string[] };
+    };
+    const passed =
+      res.status === 404 &&
+      body.error?.code === "VERSION_NOT_FOUND" &&
+      Array.isArray(body.error?.available) &&
+      body.error.available.length > 0;
+    results.push({
+      agent: "version-pinning",
+      feature: "POST /run with unknown version → 404 VERSION_NOT_FOUND + available[]",
+      passed,
+      duration: 0,
+      cost: 0,
+      detail: `status=${res.status}, code=${body.error?.code}, available=[${body.error?.available?.join(",")}]`,
+    });
+  } catch (err) {
+    results.push({
+      agent: "version-pinning",
+      feature: "POST /run with unknown version → 404 VERSION_NOT_FOUND + available[]",
+      passed: false,
+      duration: 0,
+      cost: 0,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+console.log("Testing version pinning — 400 INVALID_VERSION_FORMAT on semver range...");
+{
+  try {
+    const res = await fetch(`${REGISTRY}/api/agents/dev/code-review/run`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ input: { code: "x" }, version: "^1.0.0" }),
+    });
+    const body = (await res.json()) as { error?: { code?: string; message?: string } };
+    const passed = res.status === 400 && body.error?.code === "INVALID_VERSION_FORMAT";
+    results.push({
+      agent: "version-pinning",
+      feature: 'POST /run with "^1.0.0" → 400 INVALID_VERSION_FORMAT',
+      passed,
+      duration: 0,
+      cost: 0,
+      detail: `status=${res.status}, code=${body.error?.code}`,
+    });
+  } catch (err) {
+    results.push({
+      agent: "version-pinning",
+      feature: 'POST /run with "^1.0.0" → 400 INVALID_VERSION_FORMAT',
       passed: false,
       duration: 0,
       cost: 0,

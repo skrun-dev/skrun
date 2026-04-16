@@ -1,4 +1,6 @@
 import type { McpServer } from "@skrun-dev/schema";
+import { createLogger } from "../logger.js";
+import type { Logger } from "../logger.js";
 import type { ToolDefinition, ToolProvider, ToolResult } from "./types.js";
 
 // Block list for SSRF protection — internal/private IP ranges (remote only)
@@ -33,10 +35,16 @@ function isBlockedUrl(url: string): boolean {
 export class McpToolProvider implements ToolProvider {
   private tools: ToolDefinition[] = [];
   private connected = false;
+  private logger: Logger;
   // biome-ignore lint/suspicious/noExplicitAny: MCP SDK Client type not easily importable at top level
   private client: any = null;
 
-  constructor(private config: McpServer) {}
+  constructor(
+    private config: McpServer,
+    logger?: Logger,
+  ) {
+    this.logger = logger ?? createLogger("mcp");
+  }
 
   private getTransportMode(): "stdio" | "sse" | "streamable-http" {
     if (this.config.transport === "stdio") return "stdio";
@@ -75,8 +83,15 @@ export class McpToolProvider implements ToolProvider {
       this.connected = true;
     } catch (err) {
       const location = mode === "stdio" ? `command "${this.config.command}"` : `${this.config.url}`;
-      console.warn(
-        `[McpToolProvider] Failed to connect to "${this.config.name}" via ${mode} (${location}): ${err instanceof Error ? err.message : err}`,
+      this.logger.warn(
+        {
+          event: "mcp_connect_failed",
+          server: this.config.name,
+          transport: mode,
+          location,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        `MCP connection failed for "${this.config.name}"`,
       );
       this.tools = [];
     }

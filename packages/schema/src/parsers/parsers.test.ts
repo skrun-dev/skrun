@@ -104,7 +104,7 @@ describe("parseAgentYaml", () => {
     expect(result.config.version).toBe("1.0.0");
     expect(result.config.model.provider).toBe("anthropic");
     expect(result.config.model.fallback?.provider).toBe("openai");
-    expect(result.config.tools).toContain("web_search");
+    expect(result.config.tools.map((t) => t.name)).toContain("web_search");
     expect(result.config.inputs).toHaveLength(1);
     expect(result.config.outputs).toHaveLength(2);
     expect(result.config.permissions.network).toContain("googleapis.com");

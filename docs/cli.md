@@ -166,11 +166,16 @@ npx eslint /tmp/code.js --format json 2>/dev/null
 EOF
 chmod +x scripts/eslint-check.sh
 
-# 2. Declare them in agent.yaml
+# 2. Declare them in agent.yaml (filename matches the tool name)
 #    tools:
-#      - name: eslint_check
-#        script: scripts/eslint-check.sh
+#      - name: eslint-check
 #        description: "Run ESLint on JavaScript code"
+#        input_schema:
+#          type: object
+#          properties:
+#            code: { type: string }
+#          required: [code]
+#          additionalProperties: false
 
 # 3. Build, test, deploy
 skrun dev          # Iterate on SKILL.md prompt

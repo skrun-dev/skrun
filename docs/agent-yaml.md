@@ -65,26 +65,42 @@ Set the API key via `X-LLM-API-Key` header or the `OPENAI_API_KEY` env var (it's
 ### `tools` (optional)
 - **Type**: array of objects
 - **Default**: `[]`
-- **Description**: CLI tools the agent can call during execution. Each tool maps to a script in the `scripts/` directory.
+- **Description**: Local script tools the agent can call during execution. Each tool maps to a file in the `scripts/` directory (filename without extension matches the declared `name`).
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | Yes | Tool name (used by the LLM to call it) |
-| `script` | string | Yes | Path to the script, relative to agent root (e.g., `scripts/lint.sh`) |
-| `description` | string | Yes | What the tool does (passed to the LLM so it knows when to use it) |
+| `name` | string | Yes | Tool identifier. Must match a script file in `scripts/` (e.g., `pdf-extract` → `scripts/pdf-extract.js`). Regex: `/^[a-zA-Z_][a-zA-Z0-9_-]*$/`. |
+| `description` | string | Yes | What the tool does. Passed to the LLM so it knows when and how to use it. |
+| `input_schema` | object | Yes | [JSON Schema draft-07](https://json-schema.org/draft-07/) describing the tool's input parameters. Validated before the script runs. |
 
-**How it works**: you create a `scripts/` directory, write your tools (shell, JS, Python — anything executable), and declare them in `tools`. At runtime, the LLM decides when to call each tool based on its description. Skrun executes the script and returns the result to the LLM.
+**How it works**: you create a `scripts/` directory, write your tools (Node.js, TypeScript, or Python — read JSON args from stdin, write result to stdout), and declare them in `tools`. At runtime, Skrun passes `input_schema` to the LLM as the tool spec. When the LLM calls the tool, Skrun validates the arguments against the schema (via Ajv) **before** spawning the script. Invalid arguments return an error to the LLM (which can self-correct) and do NOT execute the script.
 
 **Example:**
 
 ```yaml
 tools:
-  - name: eslint_check
-    script: scripts/eslint-check.sh
-    description: "Run ESLint on JavaScript code and return issues as JSON"
-  - name: count_lines
-    script: scripts/count-lines.sh
-    description: "Count lines of code in a file"
+  - name: pdf-extract
+    description: "Extract text content from a PDF file."
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+          description: "Absolute path to the PDF file."
+        max_pages:
+          type: integer
+          minimum: 1
+          default: 10
+      required: [path]
+      additionalProperties: false
+  - name: count-lines
+    description: "Count lines of code in a file."
+    input_schema:
+      type: object
+      properties:
+        path: { type: string }
+      required: [path]
+      additionalProperties: false
 ```
 
 ```
@@ -92,11 +108,15 @@ my-agent/
 ├── SKILL.md
 ├── agent.yaml
 └── scripts/
-    ├── eslint-check.sh
-    └── count-lines.sh
+    ├── pdf-extract.js
+    └── count-lines.js
 ```
 
 Scripts are bundled into the `.agent` archive at build time and available on the filesystem at runtime.
+
+> **Breaking change (v0.4.0)**: `tools: ["pdf-extract"]` (string array) is no longer accepted. Wrap each entry in the object form above. This change brings Skrun tool declarations in line with the JSON Schema standard that every LLM provider (Anthropic, OpenAI, Google, Mistral, Groq) expects.
+
+> **Note on MCP**: MCP servers expose their own schemas via the protocol (`tools/list`). Do NOT declare MCP tools in `tools:` — only local scripts. See `mcp_servers` below.
 
 > **Note**: On multi-user instances, `scripts/` only execute for **verified agents**. Non-verified agents can still run (LLM + MCP), but scripts are skipped. Operators verify agents via `PATCH /api/agents/:ns/:name/verify` (see [API reference](api.md#verify-an-agent)). In dev mode (`dev-token`), verification is bypassed — all scripts execute locally.
 
@@ -226,7 +246,15 @@ model:
     name: gpt-4o
 
 tools:
-  - web_search
+  - name: web_search
+    description: Search the web and return the top results
+    input_schema:
+      type: object
+      properties:
+        query: { type: string }
+        max_results: { type: integer, minimum: 1, default: 5 }
+      required: [query]
+      additionalProperties: false
 
 mcp_servers:
   - name: search-console

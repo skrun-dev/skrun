@@ -18,6 +18,8 @@ export {
   SkillFrontmatterSchema,
   StateConfigSchema,
   TestCaseSchema,
+  ToolConfigSchema,
+  InputSchemaSchema,
 } from "./schemas/index.js";
 
 export type {
@@ -32,6 +34,8 @@ export type {
   SkillFrontmatter,
   StateConfig,
   TestCase,
+  ToolConfig,
+  InputSchema,
 } from "./schemas/index.js";
 
 // Parsers

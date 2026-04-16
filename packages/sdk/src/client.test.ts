@@ -231,6 +231,77 @@ describe("SkrunClient", () => {
     }
   });
 
+  // --- Version pinning ---
+
+  it("run({ version }) sends version in body", async () => {
+    globalThis.fetch = mockFetchJson({
+      run_id: "abc",
+      status: "completed",
+      agent_version: "1.2.0",
+      output: {},
+    });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+
+    await client.run("dev/agent", { x: 1 }, { version: "1.2.0" });
+
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ input: { x: 1 }, version: "1.2.0" });
+  });
+
+  it("stream({ version }) sends version in body", async () => {
+    // Minimal SSE response: one run_start event then stream ends cleanly.
+    const sseBody = `event: run_start\ndata: {"type":"run_start","run_id":"x","timestamp":"t","agent":"dev/agent","agent_version":"1.0.0"}\n\n`;
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(sseBody, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+
+    // Consume the generator (ignore parse errors — we assert on the fetch body).
+    try {
+      for await (const _evt of client.stream("dev/agent", { x: 1 }, { version: "1.0.0" })) {
+        // drain
+      }
+    } catch {
+      // SSE parser may throw on end-of-stream; we only care about the request body.
+    }
+
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ input: { x: 1 }, version: "1.0.0" });
+  });
+
+  it("runAsync(..., { version }) sends both webhook_url and version", async () => {
+    globalThis.fetch = mockFetchJson({ run_id: "abc", agent_version: "1.0.0" }, 202);
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+
+    await client.runAsync("dev/agent", { x: 1 }, "https://example.com/hook", { version: "1.0.0" });
+
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({
+      input: { x: 1 },
+      version: "1.0.0",
+      webhook_url: "https://example.com/hook",
+    });
+  });
+
+  it("run() without version option does NOT include version in body", async () => {
+    globalThis.fetch = mockFetchJson({
+      run_id: "abc",
+      status: "completed",
+      agent_version: "1.2.0",
+      output: {},
+    });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+
+    await client.run("dev/agent", { x: 1 });
+
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ input: { x: 1 } });
+    expect(JSON.parse(init.body).version).toBeUndefined();
+  });
+
   // --- Zero dependencies ---
 
   it("package.json has no runtime dependencies", async () => {

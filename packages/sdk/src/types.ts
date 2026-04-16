@@ -17,6 +17,8 @@ export interface RunOptions {
   llmKeys?: Record<string, string>;
   /** Request timeout in milliseconds (overrides client default) */
   timeout?: number;
+  /** Pin a specific agent version (strict semver, e.g. "1.2.0"). Omit to target latest. */
+  version?: string;
 }
 
 // --- API response types (snake_case to match JSON) ---
@@ -24,6 +26,8 @@ export interface RunOptions {
 export interface SdkRunResult {
   run_id: string;
   status: "completed" | "failed";
+  /** Resolved agent version (semver) that was executed. */
+  agent_version: string;
   output: Record<string, unknown>;
   usage: {
     prompt_tokens: number;
@@ -38,6 +42,8 @@ export interface SdkRunResult {
 
 export interface AsyncRunResult {
   run_id: string;
+  /** Resolved agent version (semver) that will be executed. */
+  agent_version: string;
 }
 
 export interface AgentMetadata {
@@ -77,6 +83,8 @@ interface BaseRunEvent {
 export interface RunStartEvent extends BaseRunEvent {
   type: "run_start";
   agent: string;
+  /** Resolved version of the agent being executed. */
+  agent_version: string;
 }
 
 export interface ToolCallEvent extends BaseRunEvent {

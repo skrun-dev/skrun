@@ -7,6 +7,7 @@ import {
   MemoryStateStore,
   ScriptToolProvider,
   ToolRegistry,
+  createLogger,
   redactSecretsFromString,
 } from "@skrun-dev/runtime";
 import type { RunEvent, StateStore } from "@skrun-dev/runtime";
@@ -21,6 +22,20 @@ import { formatSSEEvent } from "../utils/sse.js";
 // Shared state store (persists across runs for the same server instance)
 const globalStateStore = new MemoryStateStore();
 const globalRouter = new LLMRouter();
+const logger = createLogger("api");
+
+const SEMVER_STRICT = /^\d+\.\d+\.\d+$/;
+
+function hintForBadVersion(raw: string): string {
+  if (raw === "") return ". An empty string is not accepted — omit the field to target latest.";
+  if (raw === "latest" || raw === "HEAD") {
+    return `. The "${raw}" keyword is not supported — omit the field to target latest.`;
+  }
+  if (/[\^~*]/.test(raw)) {
+    return '. Semver ranges (^, ~, *) are not supported — pass an exact version like "1.0.0".';
+  }
+  return "";
+}
 
 export function createRunRoutes(service: RegistryService, stateStore?: StateStore): Hono {
   const router = new Hono();
@@ -37,10 +52,38 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
     // 1. Parse request body
     let input: Record<string, unknown>;
     let webhookUrl: string | undefined;
+    let requestedVersion: string | undefined;
     try {
       const body = await c.req.json();
       input = body.input ?? body;
       webhookUrl = body.webhook_url;
+      // `version` is optional: undefined or null = latest; string = strict semver.
+      if (body.version !== undefined && body.version !== null) {
+        if (typeof body.version !== "string") {
+          return c.json(
+            {
+              error: {
+                code: "INVALID_VERSION_FORMAT",
+                message: `version must be a string in strict semver format (e.g. "1.0.0"). Got: ${typeof body.version}`,
+              },
+            },
+            400,
+          );
+        }
+        if (!SEMVER_STRICT.test(body.version)) {
+          const hint = hintForBadVersion(body.version);
+          return c.json(
+            {
+              error: {
+                code: "INVALID_VERSION_FORMAT",
+                message: `version must be strict semver (e.g. "1.0.0"). Got: "${body.version}"${hint}`,
+              },
+            },
+            400,
+          );
+        }
+        requestedVersion = body.version;
+      }
     } catch {
       return c.json({ error: { code: "INVALID_REQUEST", message: "Invalid JSON body" } }, 400);
     }
@@ -143,13 +186,33 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
       }
     }
 
-    // 3. Load agent from registry
+    // 3. Load agent from registry (optionally pinned to `requestedVersion`)
     let bundleBuffer: Buffer;
+    let resolvedVersion: string;
     try {
-      const result = await service.pull(namespace, name);
+      const result = await service.pull(namespace, name, requestedVersion);
       bundleBuffer = result.buffer;
+      resolvedVersion = result.version;
     } catch (err) {
       if (err instanceof RegistryError) {
+        // Enrich VERSION_NOT_FOUND with up to 10 most recent versions so the
+        // caller can recover without a separate round-trip.
+        if (err.code === "VERSION_NOT_FOUND") {
+          let available: string[] = [];
+          try {
+            const all = await service.getVersions(namespace, name);
+            available = all
+              .map((v) => v.version)
+              .slice(-10)
+              .reverse();
+          } catch {
+            // Swallow — don't mask the original 404 if listing itself fails.
+          }
+          return c.json(
+            { error: { code: err.code, message: err.message, available } },
+            err.status as 400 | 404 | 409 | 500,
+          );
+        }
         return c.json(
           { error: { code: err.code, message: err.message } },
           err.status as 400 | 404 | 409 | 500,
@@ -253,7 +316,7 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
         }
 
         if (isVerified || isDevToken) {
-          const scriptProvider = new ScriptToolProvider(scriptsDir);
+          const scriptProvider = new ScriptToolProvider(scriptsDir, agentConfig.tools);
           await toolRegistry.addProvider(scriptProvider);
         } else {
           warnings.push("agent_not_verified_scripts_disabled");
@@ -266,9 +329,22 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
       await toolRegistry.addProvider(mcpProvider);
     }
 
-    // 8. Create adapter
-    const adapter = new LocalAdapter(globalRouter, toolRegistry, state);
-    const runRequest = { agentConfig, skillContent, agentsMdContent, input, runId, callerKeys };
+    // 8. Create adapter with request-scoped child logger
+    const log = logger.child({
+      run_id: runId,
+      agent: `${namespace}/${name}`,
+      agent_version: resolvedVersion,
+    });
+    const adapter = new LocalAdapter(globalRouter, toolRegistry, state, log);
+    const runRequest = {
+      agentConfig,
+      skillContent,
+      agentsMdContent,
+      input,
+      runId,
+      callerKeys,
+      agent_version: resolvedVersion,
+    };
 
     // --- Sanitize helper: strip caller keys from event error messages ---
     const sanitizeEvent = (event: RunEvent): RunEvent => {
@@ -312,6 +388,7 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
               finalResult = {
                 run_id: runId,
                 status: "completed",
+                agent_version: resolvedVersion,
                 output: event.output,
                 usage: event.usage,
                 ...(warnings.length > 0 && { warnings }),
@@ -323,23 +400,27 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
               finalResult = {
                 run_id: runId,
                 status: "failed",
+                agent_version: resolvedVersion,
                 error: (sanitized as Extract<RunEvent, { type: "run_error" }>).error,
               };
             }
           }
           if (finalResult) {
             const { deliverWebhook } = await import("../utils/webhook.js");
-            await deliverWebhook(targetUrl, finalResult);
+            await deliverWebhook(targetUrl, finalResult, undefined, log);
           }
         } catch (err) {
-          console.error(`[Webhook] Background execution failed for ${namespace}/${name}:`, err);
+          log.error(
+            { event: "webhook_bg_error", error: err instanceof Error ? err.message : String(err) },
+            "Background execution failed",
+          );
         } finally {
           await toolRegistry.disconnectAll();
           cleanupBundle();
         }
       })();
 
-      return c.json({ run_id: runId }, 202);
+      return c.json({ run_id: runId, agent_version: resolvedVersion }, 202);
     }
 
     // ==================== SYNC MODE (default) ====================
@@ -352,6 +433,7 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
       return c.json({
         run_id: result.runId,
         status: result.status,
+        agent_version: resolvedVersion,
         output: result.output,
         usage: {
           prompt_tokens: result.usage.promptTokens,

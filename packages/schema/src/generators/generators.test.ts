@@ -27,7 +27,23 @@ describe("generateAgentYaml", () => {
     const result = generateAgentYaml(mockSkill);
     expect(result.config.version).toBe("1.0.0");
     expect(result.config.context_mode).toBe("skill");
-    expect(result.config.tools).toEqual(["Bash(git:*)", "Read", "Write"]);
+    expect(result.config.tools).toEqual([
+      {
+        name: "Bash",
+        description: "Execute Bash script",
+        input_schema: { type: "object", properties: {}, additionalProperties: true },
+      },
+      {
+        name: "Read",
+        description: "Execute Read script",
+        input_schema: { type: "object", properties: {}, additionalProperties: true },
+      },
+      {
+        name: "Write",
+        description: "Execute Write script",
+        input_schema: { type: "object", properties: {}, additionalProperties: true },
+      },
+    ]);
     expect(result.config.runtime?.timeout).toBe("300s");
     expect(result.config.runtime?.sandbox).toBe("strict");
     expect(result.config.state?.type).toBe("kv");

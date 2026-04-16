@@ -41,6 +41,12 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
           properties: {
             run_id: { type: "string", format: "uuid" },
             status: { type: "string", enum: ["completed", "failed"] },
+            agent_version: {
+              type: "string",
+              pattern: "^\\d+\\.\\d+\\.\\d+$",
+              description: "Resolved agent version (semver) that was executed.",
+              example: "1.2.0",
+            },
             output: { type: "object", additionalProperties: true },
             usage: {
               type: "object",
@@ -58,14 +64,44 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
             duration_ms: { type: "integer" },
             error: { type: "string" },
           },
-          required: ["run_id", "status", "output", "usage", "cost", "duration_ms"],
+          required: ["run_id", "status", "agent_version", "output", "usage", "cost", "duration_ms"],
         },
         AsyncRunResult: {
           type: "object",
           properties: {
             run_id: { type: "string", format: "uuid" },
+            agent_version: {
+              type: "string",
+              pattern: "^\\d+\\.\\d+\\.\\d+$",
+              description: "Resolved agent version (semver) that will be executed.",
+              example: "1.2.0",
+            },
           },
-          required: ["run_id"],
+          required: ["run_id", "agent_version"],
+        },
+        VersionNotFoundResponse: {
+          type: "object",
+          description: "Returned when a pinned version does not exist.",
+          properties: {
+            error: {
+              type: "object",
+              properties: {
+                code: { type: "string", example: "VERSION_NOT_FOUND" },
+                message: {
+                  type: "string",
+                  example: "Version 9.9.9 not found for acme/seo-audit",
+                },
+                available: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Up to 10 most recent versions, newest first.",
+                  example: ["1.2.0", "1.1.0", "1.0.0"],
+                },
+              },
+              required: ["code", "message", "available"],
+            },
+          },
+          required: ["error"],
         },
         AgentMetadata: {
           type: "object",
@@ -101,7 +137,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
         RunEvent: {
           type: "object",
           description:
-            "SSE event (one of: run_start, tool_call, tool_result, llm_complete, run_complete, run_error)",
+            "SSE event (one of: run_start, tool_call, tool_result, llm_complete, run_complete, run_error). The `run_start` event additionally carries `agent` and `agent_version`.",
           properties: {
             type: {
               type: "string",
@@ -116,6 +152,16 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
             },
             run_id: { type: "string" },
             timestamp: { type: "string", format: "date-time" },
+            agent: {
+              type: "string",
+              description: "Present on run_start events only. Agent identifier (namespace/name).",
+            },
+            agent_version: {
+              type: "string",
+              pattern: "^\\d+\\.\\d+\\.\\d+$",
+              description: "Present on run_start events only. Resolved version being executed.",
+              example: "1.2.0",
+            },
           },
           required: ["type", "run_id", "timestamp"],
         },
@@ -169,6 +215,13 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                       format: "uri",
                       description: "URL for async webhook delivery (activates async mode)",
                     },
+                    version: {
+                      type: "string",
+                      pattern: "^\\d+\\.\\d+\\.\\d+$",
+                      description:
+                        "Pin a specific agent version (strict semver). Omit to target latest. Ranges (^, ~) and keywords (latest) are not supported.",
+                      example: "1.2.0",
+                    },
                   },
                   required: ["input"],
                 },
@@ -206,9 +259,17 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
               },
             },
             "404": {
-              description: "Agent not found",
+              description:
+                "Agent not found, or pinned version not found. If the agent exists but the requested `version` does not, the body conforms to VersionNotFoundResponse and includes `available: string[]` (up to 10 most recent, newest first).",
               content: {
-                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+                "application/json": {
+                  schema: {
+                    oneOf: [
+                      { $ref: "#/components/schemas/ErrorResponse" },
+                      { $ref: "#/components/schemas/VersionNotFoundResponse" },
+                    ],
+                  },
+                },
               },
             },
             "429": {
