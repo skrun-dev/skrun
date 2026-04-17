@@ -1,6 +1,6 @@
 # agent.yaml Specification
 
-The `agent.yaml` file is Skrun's extension to the Agent Skills standard. It declares runtime configuration, I/O contracts, permissions, state, and tests for a deployable agent.
+The `agent.yaml` file is Skrun's extension to the Agent Skills standard. It declares runtime configuration, I/O contracts, environment, state, and tests for a deployable agent.
 
 ## Fields
 
@@ -190,23 +190,41 @@ mcp_servers:
 | `type` | enum | Yes | `string`, `number`, `boolean`, `object`, `array` |
 | `description` | string | No | Human-readable description |
 
-### `permissions` (optional)
-- **Default**: `{ network: [], filesystem: "read-only", secrets: [] }`
+### `environment` (optional)
+
+Defines how and where the agent runs — networking, filesystem access, execution constraints. All fields have defaults; the entire section can be omitted.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `network` | string[] | `[]` | Allowed domains (e.g., `["googleapis.com", "*.example.com"]`) |
+| `networking.allowed_hosts` | string[] | `[]` | Outbound host allowlist (see below) |
 | `filesystem` | enum | `read-only` | `none`, `read-only`, `read-write` |
 | `secrets` | string[] | `[]` | Required secret names (injected as env vars) |
-
-### `runtime` (optional)
-- **Default**: `{ timeout: "300s", sandbox: "strict" }`
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
 | `timeout` | string | `300s` | Max execution time (format: `Ns`) |
 | `max_cost` | number | - | Cost cap per run in USD |
 | `sandbox` | enum | `strict` | `strict` or `permissive` |
+
+**Networking modes** (inferred from `allowed_hosts`):
+
+| `allowed_hosts` | Mode | Behavior |
+|----------------|------|----------|
+| `[]` (default) | Blocked | All outbound blocked. Remote MCP connections refused. |
+| `["api.github.com", "*.slack.com"]` | Allowlist | Only matching hosts. Glob `*` matches subdomains (`*.github.com` matches `api.github.com` but not `github.com`). |
+| `["*"]` | Unrestricted | All non-private hosts allowed. |
+
+Private/internal IPs (127.*, 10.*, 192.168.*, localhost, etc.) are **always blocked**, even in unrestricted mode.
+
+Enforcement: MCP remote connections are checked before connect. Tool scripts receive `SKRUN_ALLOWED_HOSTS` env var (advisory — real TCP enforcement comes with container-based execution).
+
+**Script environment variables**: tool scripts receive the following env vars automatically:
+
+| Env var | Value | Purpose |
+|---------|-------|---------|
+| `SKRUN_ALLOWED_HOSTS` | Comma-separated allowed hosts | Network allowlist (advisory) |
+| `SKRUN_OUTPUT_DIR` | Path to output directory | Write files here to produce deliverables (see [Files API](api.md#files-api)) |
+
+**Per-run override**: callers can override any environment field in the POST /run request body (see [API docs](api.md#post-run)).
+
+> **Migration from v0.4.0**: `permissions` and `runtime` top-level fields were replaced by `environment` in v0.5.0. See [CHANGELOG](../CHANGELOG.md) for the migration guide.
 
 ### `context_mode` (optional)
 - **Type**: enum
@@ -273,12 +291,11 @@ outputs:
   - name: score
     type: number
 
-permissions:
-  network: ["googleapis.com", "*.target-site"]
+environment:
+  networking:
+    allowed_hosts: ["googleapis.com", "*.target-site"]
   filesystem: read-only
   secrets: [GSC_API_KEY]
-
-runtime:
   timeout: 300s
   max_cost: 0.50
   sandbox: strict

@@ -14,10 +14,17 @@ export class ScriptToolProvider implements ToolProvider {
   private validators = new Map<string, ValidateFunction>();
   private ajv: Ajv;
 
+  private allowedHosts: string[];
+  private outputDir: string;
+
   constructor(
     private scriptsDir: string,
     toolConfigs: ToolConfig[] = [],
+    allowedHosts: string[] = [],
+    outputDir = "",
   ) {
+    this.allowedHosts = allowedHosts;
+    this.outputDir = outputDir;
     this.ajv = new Ajv({ allErrors: true, strict: false });
     for (const cfg of toolConfigs) {
       this.toolConfigs.set(cfg.name, cfg);
@@ -75,7 +82,14 @@ export class ScriptToolProvider implements ToolProvider {
       const child = execFile(
         command,
         cmdArgs,
-        { timeout: SCRIPT_TIMEOUT },
+        {
+          timeout: SCRIPT_TIMEOUT,
+          env: {
+            ...process.env,
+            SKRUN_ALLOWED_HOSTS: this.allowedHosts.join(","),
+            SKRUN_OUTPUT_DIR: this.outputDir,
+          },
+        },
         (error, stdout, stderr) => {
           if (error) {
             resolve({ content: stderr || error.message, isError: true });

@@ -107,8 +107,8 @@ describe("parseAgentYaml", () => {
     expect(result.config.tools.map((t) => t.name)).toContain("web_search");
     expect(result.config.inputs).toHaveLength(1);
     expect(result.config.outputs).toHaveLength(2);
-    expect(result.config.permissions.network).toContain("googleapis.com");
-    expect(result.config.runtime.max_cost).toBe(0.5);
+    expect(result.config.environment.networking.allowed_hosts).toContain("googleapis.com");
+    expect(result.config.environment.max_cost).toBe(0.5);
     expect(result.config.state.type).toBe("kv");
     expect(result.config.tests).toHaveLength(1);
     expect(result.raw).toContain("acme/seo-audit");
@@ -130,9 +130,9 @@ outputs:
 `;
     const result = parseAgentYaml(yaml);
     expect(result.config.tools).toEqual([]);
-    expect(result.config.permissions.filesystem).toBe("read-only");
-    expect(result.config.runtime.timeout).toBe("300s");
-    expect(result.config.runtime.sandbox).toBe("strict");
+    expect(result.config.environment.filesystem).toBe("read-only");
+    expect(result.config.environment.timeout).toBe("300s");
+    expect(result.config.environment.sandbox).toBe("strict");
     expect(result.config.state.type).toBe("kv");
     expect(result.config.state.ttl).toBe("30d");
     expect(result.config.context_mode).toBe("skill");

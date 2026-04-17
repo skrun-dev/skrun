@@ -2,6 +2,7 @@
 
 // Types
 export type {
+  FileInfo,
   RunRequest,
   RunResult,
   RunEvent,
@@ -12,6 +13,10 @@ export type {
   RunCompleteEvent,
   RunErrorEvent,
 } from "./types.js";
+
+// Files
+export { collectOutputFiles } from "./files/output-collector.js";
+export type { CollectOptions } from "./files/output-collector.js";
 
 // Adapter
 export type { RuntimeAdapter } from "./adapter/adapter.js";
@@ -35,10 +40,15 @@ export { MemoryStateStore } from "./state/memory.js";
 // Security
 export { withTimeout, parseTimeout, TimeoutError } from "./security/timeout.js";
 export { checkCost } from "./security/cost-checker.js";
+export { isHostAllowed } from "./security/network.js";
 
 // Logger
 export { createLogger } from "./logger.js";
 export type { Logger } from "./logger.js";
+
+// Cache
+export { TTLCache } from "./cache/ttl-cache.js";
+export type { TTLCacheOptions } from "./cache/ttl-cache.js";
 
 // Utils
 export { redactCallerKeys, redactSecretsFromString, CALLER_KEY_FIELDS } from "./utils/redact.js";

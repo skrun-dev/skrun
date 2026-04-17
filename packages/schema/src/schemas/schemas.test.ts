@@ -1,10 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { AgentConfigSchema } from "./agent-config.js";
+import { EnvironmentConfigSchema } from "./environment-config.js";
 import { InputFieldSchema, OutputFieldSchema } from "./inputs-outputs.js";
 import { McpServerSchema } from "./mcp-server.js";
 import { ModelConfigSchema } from "./model-config.js";
-import { PermissionsSchema } from "./permissions.js";
-import { RuntimeConfigSchema } from "./runtime-config.js";
 import { SkillFrontmatterSchema } from "./skill-frontmatter.js";
 import { StateConfigSchema } from "./state-config.js";
 import { TestCaseSchema } from "./test-case.js";
@@ -39,22 +38,50 @@ describe("ModelConfigSchema", () => {
   });
 });
 
-describe("PermissionsSchema", () => {
-  it("should apply defaults", () => {
-    const result = PermissionsSchema.parse({});
-    expect(result.network).toEqual([]);
+describe("EnvironmentConfigSchema", () => {
+  it("should apply all defaults (VT-2)", () => {
+    const result = EnvironmentConfigSchema.parse({});
+    expect(result.networking.allowed_hosts).toEqual([]);
     expect(result.filesystem).toBe("read-only");
     expect(result.secrets).toEqual([]);
+    expect(result.timeout).toBe("300s");
+    expect(result.sandbox).toBe("strict");
+    expect(result.max_cost).toBeUndefined();
   });
 
-  it("should accept valid values", () => {
-    const result = PermissionsSchema.parse({
-      network: ["googleapis.com", "*.example.com"],
+  it("should accept valid values (VT-1)", () => {
+    const result = EnvironmentConfigSchema.parse({
+      networking: { allowed_hosts: ["googleapis.com", "*.example.com"] },
       filesystem: "read-write",
       secrets: ["API_KEY"],
+      timeout: "600s",
+      max_cost: 5.0,
+      sandbox: "permissive",
     });
-    expect(result.network).toHaveLength(2);
+    expect(result.networking.allowed_hosts).toHaveLength(2);
     expect(result.filesystem).toBe("read-write");
+    expect(result.timeout).toBe("600s");
+    expect(result.max_cost).toBe(5.0);
+    expect(result.sandbox).toBe("permissive");
+  });
+
+  it("should reject invalid filesystem value (VT-3)", () => {
+    expect(() => EnvironmentConfigSchema.parse({ filesystem: "execute" })).toThrow();
+  });
+
+  it("should parse nested networking config (VT-4)", () => {
+    const result = EnvironmentConfigSchema.parse({
+      networking: { allowed_hosts: ["api.github.com"] },
+    });
+    expect(result.networking.allowed_hosts).toEqual(["api.github.com"]);
+  });
+
+  it("should reject invalid timeout format", () => {
+    expect(() => EnvironmentConfigSchema.parse({ timeout: "5m" })).toThrow();
+  });
+
+  it("should reject negative max_cost", () => {
+    expect(() => EnvironmentConfigSchema.parse({ max_cost: -1 })).toThrow();
   });
 });
 
@@ -75,23 +102,6 @@ describe("InputFieldSchema / OutputFieldSchema", () => {
 
   it("should reject invalid type", () => {
     expect(() => InputFieldSchema.parse({ name: "x", type: "invalid" })).toThrow();
-  });
-});
-
-describe("RuntimeConfigSchema", () => {
-  it("should apply defaults", () => {
-    const result = RuntimeConfigSchema.parse({});
-    expect(result.timeout).toBe("300s");
-    expect(result.sandbox).toBe("strict");
-    expect(result.max_cost).toBeUndefined();
-  });
-
-  it("should reject invalid timeout format", () => {
-    expect(() => RuntimeConfigSchema.parse({ timeout: "5m" })).toThrow();
-  });
-
-  it("should reject negative max_cost", () => {
-    expect(() => RuntimeConfigSchema.parse({ max_cost: -1 })).toThrow();
   });
 });
 
@@ -258,8 +268,8 @@ describe("AgentConfigSchema", () => {
     const result = AgentConfigSchema.parse(validConfig);
     expect(result.name).toBe("acme/seo-audit");
     expect(result.tools).toEqual([]);
-    expect(result.permissions.filesystem).toBe("read-only");
-    expect(result.runtime.timeout).toBe("300s");
+    expect(result.environment.filesystem).toBe("read-only");
+    expect(result.environment.timeout).toBe("300s");
     expect(result.state.type).toBe("kv");
     expect(result.context_mode).toBe("skill");
   });
@@ -284,12 +294,14 @@ describe("AgentConfigSchema", () => {
         },
       ],
       mcp_servers: [{ name: "gsc", url: "https://mcp.gsc.io/sse", auth: "oauth2" }],
-      permissions: {
-        network: ["googleapis.com"],
+      environment: {
+        networking: { allowed_hosts: ["googleapis.com"] },
         filesystem: "read-only",
         secrets: ["GSC_API_KEY"],
+        timeout: "300s",
+        max_cost: 0.5,
+        sandbox: "strict",
       },
-      runtime: { timeout: "300s", max_cost: 0.5, sandbox: "strict" },
       context_mode: "persistent",
       state: { type: "kv", ttl: "30d" },
       tests: [
@@ -336,6 +348,39 @@ describe("AgentConfigSchema", () => {
   it("should accept an empty tools array", () => {
     const result = AgentConfigSchema.parse({ ...validConfig, tools: [] });
     expect(result.tools).toEqual([]);
+  });
+
+  it("should parse config with environment section (VT-5)", () => {
+    const result = AgentConfigSchema.parse({
+      ...validConfig,
+      environment: {
+        networking: { allowed_hosts: ["api.github.com"] },
+        filesystem: "read-write",
+        timeout: "600s",
+      },
+    });
+    expect(result.environment.networking.allowed_hosts).toEqual(["api.github.com"]);
+    expect(result.environment.filesystem).toBe("read-write");
+    expect(result.environment.timeout).toBe("600s");
+    expect(result.environment.sandbox).toBe("strict");
+    expect((result as Record<string, unknown>).permissions).toBeUndefined();
+    expect((result as Record<string, unknown>).runtime).toBeUndefined();
+  });
+
+  it("should reject old permissions top-level key (VT-6)", () => {
+    const result = AgentConfigSchema.safeParse({
+      ...validConfig,
+      permissions: { network: [], filesystem: "read-only", secrets: [] },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("should reject old runtime top-level key (VT-7)", () => {
+    const result = AgentConfigSchema.safeParse({
+      ...validConfig,
+      runtime: { timeout: "300s", sandbox: "strict" },
+    });
+    expect(result.success).toBe(false);
   });
 });
 

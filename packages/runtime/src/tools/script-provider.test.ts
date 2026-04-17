@@ -76,6 +76,45 @@ describe("ScriptToolProvider", () => {
     expect(result.content).toMatch(/not declared in agent\.yaml/);
   });
 
+  it("passes SKRUN_ALLOWED_HOSTS env var to subprocess (VT-12)", async () => {
+    // Write a script that outputs the env var
+    writeFileSync(
+      join(scriptsDir, "check-env.js"),
+      `process.stdout.write(process.env.SKRUN_ALLOWED_HOSTS || "MISSING");`,
+      "utf-8",
+    );
+    const envTool: ToolConfig = {
+      name: "check-env",
+      description: "Check env var",
+      input_schema: { type: "object", properties: {}, additionalProperties: true },
+    };
+    const provider = new ScriptToolProvider(
+      scriptsDir,
+      [envTool],
+      ["api.github.com", "*.slack.com"],
+    );
+    const result = await provider.callTool("check-env", {});
+    expect(result.isError).toBe(false);
+    expect(result.content).toBe("api.github.com,*.slack.com");
+  });
+
+  it("passes empty SKRUN_ALLOWED_HOSTS when allowedHosts is empty", async () => {
+    writeFileSync(
+      join(scriptsDir, "check-env2.js"),
+      `process.stdout.write(process.env.SKRUN_ALLOWED_HOSTS ?? "UNDEFINED");`,
+      "utf-8",
+    );
+    const envTool: ToolConfig = {
+      name: "check-env2",
+      description: "Check env var empty",
+      input_schema: { type: "object", properties: {}, additionalProperties: true },
+    };
+    const provider = new ScriptToolProvider(scriptsDir, [envTool], []);
+    const result = await provider.callTool("check-env2", {});
+    expect(result.isError).toBe(false);
+    expect(result.content).toBe("");
+  });
+
   it("rejects a declared tool whose script file is missing", async () => {
     const ghost: ToolConfig = {
       name: "ghost",

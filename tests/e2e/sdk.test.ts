@@ -130,4 +130,25 @@ describe("E2E: SDK", () => {
       expect((e as SkrunApiError).code).toBe("BUNDLE_CORRUPT");
     }
   });
+
+  it("run() with environment option passes it in request body (VT-11)", async () => {
+    // Environment override is passed through to the API. Since the bundle is fake,
+    // we expect BUNDLE_CORRUPT (same as run() without env) — proving the env option
+    // doesn't break the request flow and reaches the server.
+    try {
+      await client.run(
+        "dev/sdk-test",
+        {},
+        {
+          environment: { timeout: "600s", max_cost: 10.0 },
+        },
+      );
+      expect.unreachable("should throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(SkrunApiError);
+      // If environment was rejected, we'd get 400 INVALID_ENVIRONMENT.
+      // Getting BUNDLE_CORRUPT means environment was accepted and we progressed further.
+      expect((e as SkrunApiError).code).toBe("BUNDLE_CORRUPT");
+    }
+  });
 });

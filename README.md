@@ -87,6 +87,8 @@ curl -X POST http://localhost:4000/api/agents/dev/my-skill/run \
 | ✅ **Agent verification** | Verified flag controls script execution — safe for third-party agents |
 | 📌 **Version pinning** | Pin a specific agent version per call (`version: "1.2.0"`) — stable integrations, reproducible runs, no silent drift |
 | 📊 **Structured logs** | JSON to stdout via pino — pipe to Axiom, Datadog, ELK. `LOG_LEVEL` env var controls verbosity |
+| 🌍 **Environment separation** | Agent behavior (model, tools) separated from runtime environment (networking, timeout, sandbox). Per-run overrides via POST /run body |
+| 📁 **Files API** | Agents produce files (PDF, images, data) — callers download via `GET /api/runs/:run_id/files/:filename` |
 
 ---
 
@@ -183,7 +185,7 @@ curl -X POST http://localhost:4000/api/agents/dev/code-review/run \
 ## 🧠 Key Concepts
 
 - **[Agent Skills](https://agentskills.io)** — SKILL.md standard, compatible with Claude Code, Copilot, Codex
-- **[agent.yaml](docs/agent-yaml.md)** — Runtime config: model, inputs/outputs, permissions, state, tests
+- **[agent.yaml](docs/agent-yaml.md)** — Runtime config: model, inputs/outputs, environment, state, tests
 - **[POST /run](docs/api.md)** — Every agent is an API. Typed inputs, structured outputs.
 
 ---

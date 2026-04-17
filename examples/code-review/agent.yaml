@@ -22,12 +22,11 @@ outputs:
     type: number
     description: Code quality score 0-100
 
-permissions:
-  network: []
+environment:
+  networking:
+    allowed_hosts: []
   filesystem: read-only
   secrets: []
-
-runtime:
   timeout: 60s
   sandbox: strict
 

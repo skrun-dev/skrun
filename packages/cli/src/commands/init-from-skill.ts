@@ -94,9 +94,9 @@ export async function initFromSkill(skillPath: string, opts: FromSkillOptions): 
     model: { provider, name: modelName },
     inputs: [{ name: inputName || "query", type: inputType || "string", required: true }],
     outputs: [{ name: "result", type: "string" }],
-    permissions: {
-      ...generated.config.permissions,
-      network,
+    environment: {
+      ...generated.config.environment,
+      networking: { allowed_hosts: network },
     },
   });
 

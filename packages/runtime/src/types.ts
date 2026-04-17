@@ -1,5 +1,10 @@
 import type { AgentConfig } from "@skrun-dev/schema";
 
+export interface FileInfo {
+  name: string;
+  size: number;
+}
+
 export interface RunRequest {
   agentConfig: AgentConfig;
   skillContent: string;
@@ -11,6 +16,8 @@ export interface RunRequest {
   callerKeys?: Record<string, string>;
   /** Resolved agent version (semver) actually being executed. Echoed in run_start and final results. */
   agent_version?: string;
+  /** Directory where tool scripts can write output files. Set by the runtime. */
+  outputDir?: string;
 }
 
 export interface RunResult {
@@ -26,6 +33,7 @@ export interface RunResult {
   };
   durationMs: number;
   error?: string;
+  files?: FileInfo[];
 }
 
 // --- Streaming event types ---
@@ -72,6 +80,7 @@ export interface RunCompleteEvent extends BaseRunEvent {
   };
   cost: { estimated: number };
   duration_ms: number;
+  files: FileInfo[];
 }
 
 export interface RunErrorEvent extends BaseRunEvent {

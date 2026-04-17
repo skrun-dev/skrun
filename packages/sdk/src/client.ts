@@ -184,6 +184,7 @@ export class SkrunClient {
   ): Record<string, unknown> {
     const body: Record<string, unknown> = { input };
     if (options?.version) body.version = options.version;
+    if (options?.environment) body.environment = options.environment;
     if (webhookUrl) body.webhook_url = webhookUrl;
     return body;
   }

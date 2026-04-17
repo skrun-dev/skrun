@@ -1,28 +1,8 @@
 import type { McpServer } from "@skrun-dev/schema";
 import { createLogger } from "../logger.js";
 import type { Logger } from "../logger.js";
+import { isHostAllowed } from "../security/network.js";
 import type { ToolDefinition, ToolProvider, ToolResult } from "./types.js";
-
-// Block list for SSRF protection — internal/private IP ranges (remote only)
-const BLOCKED_HOSTS = [
-  /^localhost$/i,
-  /^127\./,
-  /^10\./,
-  /^172\.(1[6-9]|2\d|3[01])\./,
-  /^192\.168\./,
-  /^169\.254\./,
-  /^0\./,
-  /^\[::1\]/,
-];
-
-function isBlockedUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return BLOCKED_HOSTS.some((pattern) => pattern.test(parsed.hostname));
-  } catch {
-    return true;
-  }
-}
 
 /**
  * MCP Tool Provider — connects to an MCP server and exposes its tools.
@@ -39,11 +19,15 @@ export class McpToolProvider implements ToolProvider {
   // biome-ignore lint/suspicious/noExplicitAny: MCP SDK Client type not easily importable at top level
   private client: any = null;
 
+  private allowedHosts: string[];
+
   constructor(
     private config: McpServer,
     logger?: Logger,
+    allowedHosts: string[] = [],
   ) {
     this.logger = logger ?? createLogger("mcp");
+    this.allowedHosts = allowedHosts;
   }
 
   private getTransportMode(): "stdio" | "sse" | "streamable-http" {
@@ -115,11 +99,12 @@ export class McpToolProvider implements ToolProvider {
   }
 
   private async connectSSE(): Promise<void> {
-    // SSRF protection for remote URLs
-    if (this.config.url && isBlockedUrl(this.config.url)) {
-      throw new Error(
-        `Blocked connection — URL "${this.config.url}" points to internal/private address`,
-      );
+    // Allowlist enforcement for remote URLs
+    if (this.config.url) {
+      const hostname = new URL(this.config.url).hostname;
+      if (!isHostAllowed(hostname, this.allowedHosts)) {
+        throw new Error(`Blocked connection — host "${hostname}" is not in allowed_hosts`);
+      }
     }
 
     const { SSEClientTransport } = await import("@modelcontextprotocol/sdk/client/sse.js");
@@ -129,11 +114,12 @@ export class McpToolProvider implements ToolProvider {
   }
 
   private async connectStreamableHTTP(): Promise<void> {
-    // SSRF protection for remote URLs
-    if (this.config.url && isBlockedUrl(this.config.url)) {
-      throw new Error(
-        `Blocked connection — URL "${this.config.url}" points to internal/private address`,
-      );
+    // Allowlist enforcement for remote URLs
+    if (this.config.url) {
+      const hostname = new URL(this.config.url).hostname;
+      if (!isHostAllowed(hostname, this.allowedHosts)) {
+        throw new Error(`Blocked connection — host "${hostname}" is not in allowed_hosts`);
+      }
     }
 
     const { StreamableHTTPClientTransport } = await import(
@@ -157,15 +143,53 @@ export class McpToolProvider implements ToolProvider {
     }
 
     try {
-      const result = await this.client.callTool({ name, arguments: args });
-      const content =
-        result.content
-          ?.map((c: { type: string; text?: string }) => (c.type === "text" ? c.text : ""))
-          .join("") ?? "";
-      return { content, isError: result.isError ?? false };
+      return await this.executeCallTool(name, args);
     } catch (err) {
-      return { content: err instanceof Error ? err.message : String(err), isError: true };
+      // Reconnect-on-error: if the call fails with a connection-like error, retry once
+      const msg = err instanceof Error ? err.message : String(err);
+      if (this.isConnectionError(msg)) {
+        this.logger.warn(
+          { event: "mcp_reconnect", server: this.config.name, error: msg },
+          `MCP connection lost, reconnecting "${this.config.name}"`,
+        );
+        try {
+          await this.disconnect();
+          await this.connect();
+          return await this.executeCallTool(name, args);
+        } catch (retryErr) {
+          return {
+            content: retryErr instanceof Error ? retryErr.message : String(retryErr),
+            isError: true,
+          };
+        }
+      }
+      return { content: msg, isError: true };
     }
+  }
+
+  private async executeCallTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+    const result = await this.client.callTool({ name, arguments: args });
+    const content =
+      result.content
+        ?.map((c: { type: string; text?: string }) => (c.type === "text" ? c.text : ""))
+        .join("") ?? "";
+    return { content, isError: result.isError ?? false };
+  }
+
+  private isConnectionError(msg: string): boolean {
+    const patterns = ["closed", "ECONNRESET", "EPIPE", "ECONNREFUSED", "not connected"];
+    return patterns.some((p) => msg.toLowerCase().includes(p.toLowerCase()));
+  }
+
+  /** Stable key for caching this MCP provider by its config. */
+  getConfigKey(): string {
+    return JSON.stringify({
+      name: this.config.name,
+      url: this.config.url,
+      command: this.config.command,
+      args: this.config.args,
+      transport: this.config.transport,
+    });
   }
 
   async disconnect(): Promise<void> {

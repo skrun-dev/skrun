@@ -35,12 +35,11 @@ outputs:
     type: number
     description: Number of pages
 
-permissions:
-  network: []
+environment:
+  networking:
+    allowed_hosts: []
   filesystem: read-only
   secrets: []
-
-runtime:
   timeout: 120s
   sandbox: strict
 

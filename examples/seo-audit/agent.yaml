@@ -29,13 +29,12 @@ outputs:
     type: string
     description: "improving, declining, stable, or first_audit"
 
-permissions:
-  network:
-    - "*"
+environment:
+  networking:
+    allowed_hosts:
+      - "*"
   filesystem: read-only
   secrets: []
-
-runtime:
   timeout: 300s
   max_cost: 0.50
   sandbox: strict

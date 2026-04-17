@@ -30,12 +30,11 @@ outputs:
     type: string
     description: The specific action for the recipient
 
-permissions:
-  network: []
+environment:
+  networking:
+    allowed_hosts: []
   filesystem: read-only
   secrets: []
-
-runtime:
   timeout: 60s
   sandbox: strict
 

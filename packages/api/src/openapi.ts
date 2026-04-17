@@ -7,7 +7,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
     openapi: "3.1.0",
     info: {
       title: "Skrun API",
-      version: "0.2.0",
+      version: "0.5.0",
       description: "Deploy any Agent Skill as an API. Multi-model, stateful, open source.",
       license: { name: "MIT", url: "https://github.com/skrun-dev/skrun/blob/main/LICENSE" },
     },
@@ -62,9 +62,27 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
               properties: { estimated: { type: "number" } },
             },
             duration_ms: { type: "integer" },
+            files: {
+              type: "array",
+              description: "Files produced by the agent during execution.",
+              items: { $ref: "#/components/schemas/FileInfo" },
+            },
             error: { type: "string" },
           },
           required: ["run_id", "status", "agent_version", "output", "usage", "cost", "duration_ms"],
+        },
+        FileInfo: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Filename", example: "report.pdf" },
+            size: { type: "integer", description: "File size in bytes", example: 524288 },
+            url: {
+              type: "string",
+              description: "Download URL (GET endpoint or presigned URL in cloud)",
+              example: "/api/runs/uuid/files/report.pdf",
+            },
+          },
+          required: ["name", "size", "url"],
         },
         AsyncRunResult: {
           type: "object",
@@ -221,6 +239,46 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                       description:
                         "Pin a specific agent version (strict semver). Omit to target latest. Ranges (^, ~) and keywords (latest) are not supported.",
                       example: "1.2.0",
+                    },
+                    environment: {
+                      type: "object",
+                      description:
+                        "Optional environment override. Fields are shallow-merged on top of the agent.yaml environment defaults. Omit to use agent defaults.",
+                      properties: {
+                        networking: {
+                          type: "object",
+                          properties: {
+                            allowed_hosts: {
+                              type: "array",
+                              items: { type: "string" },
+                              description: "Allowed outbound hosts",
+                            },
+                          },
+                        },
+                        filesystem: {
+                          type: "string",
+                          enum: ["none", "read-only", "read-write"],
+                        },
+                        secrets: {
+                          type: "array",
+                          items: { type: "string" },
+                          description: "Secret names available to the agent",
+                        },
+                        timeout: {
+                          type: "string",
+                          pattern: "^\\d+s$",
+                          description: 'Execution timeout (e.g., "300s")',
+                          example: "600s",
+                        },
+                        max_cost: {
+                          type: "number",
+                          description: "Maximum estimated cost cap",
+                        },
+                        sandbox: {
+                          type: "string",
+                          enum: ["strict", "permissive"],
+                        },
+                      },
                     },
                   },
                   required: ["input"],
@@ -531,6 +589,38 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
             },
             "404": {
               description: "Agent not found",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+      },
+      "/api/runs/{run_id}/files/{filename}": {
+        get: {
+          summary: "Download a file produced by an agent run",
+          operationId: "getRunFile",
+          description:
+            "Returns a file produced during agent execution. Files are available for a limited time after the run (default: 1 hour, configurable via FILES_RETENTION_S).",
+          security: [],
+          parameters: [
+            {
+              name: "run_id",
+              in: "path",
+              required: true,
+              schema: { type: "string", format: "uuid" },
+            },
+            { name: "filename", in: "path", required: true, schema: { type: "string" } },
+          ],
+          responses: {
+            "200": {
+              description: "File content",
+              content: {
+                "application/octet-stream": { schema: { type: "string", format: "binary" } },
+              },
+            },
+            "404": {
+              description: "Run or file not found",
               content: {
                 "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },

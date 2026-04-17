@@ -12,6 +12,16 @@ export interface SkrunClientOptions {
 /** Agent identifier: "namespace/name" string or { namespace, name } object */
 export type AgentIdentifier = string | { namespace: string; name: string };
 
+/** Partial environment override — all fields optional, shallow-merged on agent.yaml defaults. */
+export interface EnvironmentOverride {
+  networking?: { allowed_hosts?: string[] };
+  filesystem?: "none" | "read-only" | "read-write";
+  secrets?: string[];
+  timeout?: string;
+  max_cost?: number;
+  sandbox?: "strict" | "permissive";
+}
+
 export interface RunOptions {
   /** Caller-provided LLM API keys (provider → key). Maps to X-LLM-API-Key header. */
   llmKeys?: Record<string, string>;
@@ -19,6 +29,15 @@ export interface RunOptions {
   timeout?: number;
   /** Pin a specific agent version (strict semver, e.g. "1.2.0"). Omit to target latest. */
   version?: string;
+  /** Environment override — shallow-merged on top of agent.yaml environment defaults. */
+  environment?: EnvironmentOverride;
+}
+
+/** File produced by an agent during execution. */
+export interface SdkFileInfo {
+  name: string;
+  size: number;
+  url: string;
 }
 
 // --- API response types (snake_case to match JSON) ---
@@ -34,6 +53,8 @@ export interface SdkRunResult {
     completion_tokens: number;
     total_tokens: number;
   };
+  /** Files produced by the agent during execution. */
+  files?: SdkFileInfo[];
   warnings?: string[];
   cost: { estimated: number };
   duration_ms: number;
@@ -117,6 +138,7 @@ export interface RunCompleteEvent extends BaseRunEvent {
   };
   cost: { estimated: number };
   duration_ms: number;
+  files?: SdkFileInfo[];
 }
 
 export interface RunErrorEvent extends BaseRunEvent {

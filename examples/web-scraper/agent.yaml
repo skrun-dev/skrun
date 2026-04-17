@@ -35,13 +35,12 @@ outputs:
     type: object
     description: Structured data extracted from the page
 
-permissions:
-  network:
-    - "*"
+environment:
+  networking:
+    allowed_hosts:
+      - "*"
   filesystem: read-only
   secrets: []
-
-runtime:
   timeout: 120s
   sandbox: strict
 

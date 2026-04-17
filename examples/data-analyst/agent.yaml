@@ -30,12 +30,11 @@ outputs:
     type: string
     description: Recommended chart type and what to plot
 
-permissions:
-  network: []
+environment:
+  networking:
+    allowed_hosts: []
   filesystem: read-only
   secrets: []
-
-runtime:
   timeout: 120s
   sandbox: strict
 

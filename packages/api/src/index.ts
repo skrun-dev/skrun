@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 import type { MemoryDb } from "./db/memory.js";
 import { rateLimiter } from "./middleware/rate-limit.js";
 import { getOpenAPISchema } from "./openapi.js";
+import { createFilesRoutes } from "./routes/files.js";
 import { createRegistryRoutes } from "./routes/registry.js";
 import { createRunRoutes } from "./routes/run.js";
 import { RegistryService } from "./services/registry.js";
@@ -37,6 +38,7 @@ export function createApp(storage: StorageAdapter, db: MemoryDb) {
 
   app.route("/api", createRegistryRoutes(service));
   app.route("/api", createRunRoutes(service));
+  app.route("/api", createFilesRoutes());
 
   return app;
 }

@@ -44,8 +44,8 @@ describe("generateAgentYaml", () => {
         input_schema: { type: "object", properties: {}, additionalProperties: true },
       },
     ]);
-    expect(result.config.runtime?.timeout).toBe("300s");
-    expect(result.config.runtime?.sandbox).toBe("strict");
+    expect(result.config.environment?.timeout).toBe("300s");
+    expect(result.config.environment?.sandbox).toBe("strict");
     expect(result.config.state?.type).toBe("kv");
     expect(result.config.state?.ttl).toBe("30d");
   });
@@ -55,7 +55,7 @@ describe("generateAgentYaml", () => {
     expect(result.prompts).toHaveLength(3);
     expect(result.prompts[0].field).toBe("model");
     expect(result.prompts[1].field).toBe("inputs");
-    expect(result.prompts[2].field).toBe("permissions.network");
+    expect(result.prompts[2].field).toBe("environment.networking.allowed_hosts");
   });
 
   it("should handle skill without allowed-tools", () => {
@@ -94,7 +94,7 @@ describe("serializeAgentYaml", () => {
     expect(roundTripped.config.name).toBe(config.name);
     expect(roundTripped.config.version).toBe(config.version);
     expect(roundTripped.config.model.provider).toBe(config.model.provider);
-    expect(roundTripped.config.runtime.timeout).toBe(config.runtime.timeout);
+    expect(roundTripped.config.environment.timeout).toBe(config.environment.timeout);
   });
 
   it("should produce human-readable YAML", () => {

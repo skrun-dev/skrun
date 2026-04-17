@@ -61,6 +61,10 @@ Execute an agent and return the result. Supports three modes:
     "field_name": "value"
   },
   "version": "1.2.0",
+  "environment": {
+    "timeout": "600s",
+    "max_cost": 10.0
+  },
   "webhook_url": "https://your-app.com/callback"
 }
 ```
@@ -69,6 +73,7 @@ Execute an agent and return the result. Supports three modes:
 |-------|----------|-------------|
 | `input` | Yes | Input fields matching the agent's `agent.yaml` |
 | `version` | No | Pin a specific agent version (**strict semver**, e.g. `"1.2.0"`). Omit to target latest. Ranges (`^`, `~`, `*`) and keywords (`"latest"`, `"HEAD"`) are not supported — omit the field for latest. |
+| `environment` | No | Environment override — shallow-merged on top of agent.yaml defaults. Accepts any subset of: `networking.allowed_hosts`, `filesystem`, `secrets`, `timeout`, `max_cost`, `sandbox`. |
 | `webhook_url` | No | URL to receive the result when execution completes (activates async mode) |
 
 **Note**: `Accept: text/event-stream` and `webhook_url` are mutually exclusive. If both are present, the server returns `400`.
@@ -473,6 +478,44 @@ pnpm dev:registry > /var/log/skrun.jsonl   # file for ingestion
 ```
 
 **Run context**: every log entry emitted during a `POST /run` includes `run_id`, `agent`, and `agent_version` automatically (via pino child logger bindings).
+
+### Caching
+
+Repeated POST /run calls for the same agent+version reuse cached bundle extractions and MCP connections. Both caches are in-memory with TTL eviction.
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `BUNDLE_CACHE_TTL` | `600` (10 min) | Bundle extraction cache TTL in seconds |
+| `BUNDLE_CACHE_MAX` | `50` | Max cached bundle extractions |
+| `MCP_CACHE_TTL` | `600` (10 min) | MCP connection cache TTL in seconds |
+| `MCP_CACHE_MAX` | `20` | Max cached MCP connections |
+
+MCP connections automatically reconnect on error (retry once). Cached entries are cleaned up on eviction (temp dirs removed, MCP connections closed).
+
+---
+
+## Files API
+
+Agents produce files by writing to the `$SKRUN_OUTPUT_DIR` directory during execution (available to tool scripts and MCP stdio processes). After the run, produced files appear in the response `files` array and are downloadable via a dedicated endpoint.
+
+**Response format** (sync, SSE `run_complete`, webhook callback):
+```json
+{
+  "files": [
+    { "name": "report.pdf", "size": 524288, "url": "/api/runs/<run_id>/files/report.pdf" }
+  ]
+}
+```
+
+**Download**: `GET /api/runs/:run_id/files/:filename` — returns the file with correct Content-Type and Content-Disposition header. Returns 404 if the run or file doesn't exist, or if the retention period has expired.
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `FILES_MAX_SIZE_MB` | `10` | Max file size in MB (larger files excluded) |
+| `FILES_MAX_COUNT` | `20` | Max files per run |
+| `FILES_RETENTION_S` | `3600` (1 hour) | How long files are available for download |
+
+Agents without file output get `files: []` in the response (backward compatible).
 
 ---
 

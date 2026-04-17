@@ -72,6 +72,52 @@ describe("E2E: POST /run", () => {
     expect(body.error.available).toEqual(["1.2.0", "1.1.0", "1.0.0"]);
   });
 
+  // --- Environment override (#9) ---
+
+  it("400 INVALID_ENVIRONMENT when environment is not an object (VT-8)", async () => {
+    const res = await ctx.app.request("/api/agents/dev/test-agent/run", {
+      method: "POST",
+      headers: { ...devAuth, "Content-Type": "application/json" },
+      body: JSON.stringify({ input: {}, environment: "not-an-object" }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe("INVALID_ENVIRONMENT");
+  });
+
+  it("400 INVALID_ENVIRONMENT when environment is an array (VT-9)", async () => {
+    const res = await ctx.app.request("/api/agents/dev/test-agent/run", {
+      method: "POST",
+      headers: { ...devAuth, "Content-Type": "application/json" },
+      body: JSON.stringify({ input: {}, environment: ["bad"] }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe("INVALID_ENVIRONMENT");
+  });
+
+  it("accepts null environment (VT-10 — no override)", async () => {
+    // null environment should be treated as "no override" — request proceeds normally
+    const res = await ctx.app.request("/api/agents/dev/test-agent/run", {
+      method: "POST",
+      headers: { ...devAuth, "Content-Type": "application/json" },
+      body: JSON.stringify({ input: {}, environment: null }),
+    });
+    // Should not fail with INVALID_ENVIRONMENT — gets further (bundle extraction or similar)
+    expect(res.status).not.toBe(400);
+  });
+
+  // --- Files API (#12) ---
+
+  it("GET /runs/:run_id/files/:filename → 404 for unknown run", async () => {
+    const res = await ctx.app.request("/api/runs/nonexistent-run/files/test.txt", {
+      method: "GET",
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error.code).toBe("RUN_NOT_FOUND");
+  });
+
   it("400 INVALID_VERSION_FORMAT on semver-range request", async () => {
     const res = await ctx.app.request("/api/agents/dev/test-agent/run", {
       method: "POST",

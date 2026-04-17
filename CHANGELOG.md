@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-04-17
+
+### Breaking
+- **`permissions` and `runtime` replaced by `environment` in `agent.yaml`.** The two top-level fields are gone — use a unified `environment` section. Migration: `permissions.network` → `environment.networking.allowed_hosts`, `permissions.filesystem` → `environment.filesystem`, `permissions.secrets` → `environment.secrets`, `runtime.timeout` → `environment.timeout`, `runtime.max_cost` → `environment.max_cost`, `runtime.sandbox` → `environment.sandbox`. If all values are defaults, the entire section can be omitted.
+- `PermissionsSchema` and `RuntimeConfigSchema` removed from `@skrun-dev/schema`. Use `EnvironmentConfigSchema` instead.
+- `AgentConfigSchema` is now strict — unknown top-level keys (including the old `permissions` and `runtime`) are rejected.
+
+### Added
+- `EnvironmentConfigSchema` and `NetworkingConfigSchema` exported from `@skrun-dev/schema`
+- **POST /run accepts `environment` override** — optional object in the request body, shallow-merged on top of agent.yaml defaults. Allows per-run adjustments to timeout, max_cost, networking, sandbox, etc.
+- SDK `RunOptions.environment` — pass a partial environment override to `run()`, `stream()`, `runAsync()`
+- OpenAPI schema: POST /run request body documents the optional `environment` field
+- **In-memory bundle extraction cache** — repeated POST /run calls for the same agent+version skip re-extraction. Configurable via `BUNDLE_CACHE_TTL` (seconds, default 600) and `BUNDLE_CACHE_MAX` (entries, default 50) env vars.
+- **In-memory MCP connection cache** — MCP servers are connected once and reused across runs. Reconnect-on-error for dropped connections (retry once). Configurable via `MCP_CACHE_TTL` (seconds, default 600) and `MCP_CACHE_MAX` (entries, default 20) env vars.
+- Generic `TTLCache` class exported from `@skrun-dev/runtime` — LRU eviction + TTL expiration + onEvict callback
+- **`networking.allowed_hosts` enforcement** — MCP remote connections checked against the allowlist before connecting. Empty=all blocked (safe default), glob patterns (`*.github.com`), `["*"]`=unrestricted. Private IPs always blocked. Tool scripts receive `SKRUN_ALLOWED_HOSTS` env var. `isHostAllowed` exported from `@skrun-dev/runtime`.
+- **Files API** — agents produce files by writing to `$SKRUN_OUTPUT_DIR`. Run responses include `files: [{ name, size, url }]`. Download via `GET /api/runs/:run_id/files/:filename`. Configurable limits: `FILES_MAX_SIZE_MB` (default 10), `FILES_MAX_COUNT` (default 20), `FILES_RETENTION_S` (default 3600). SDK `SdkRunResult.files` exposes file metadata.
+
 ## [0.4.0] - 2026-04-16
 
 ### Changed

@@ -81,4 +81,80 @@ describe("McpToolProvider — stdio transport", () => {
     // biome-ignore lint/suspicious/noExplicitAny: testing private method
     expect((sseProvider as any).getTransportMode()).toBe("sse");
   });
+
+  it("getConfigKey returns stable key for same config (VT-8)", () => {
+    const config = {
+      name: "test",
+      url: "https://example.com/mcp",
+      transport: "streamable-http" as const,
+      auth: "none" as const,
+    };
+    const p1 = new McpToolProvider(config);
+    const p2 = new McpToolProvider(config);
+    expect(p1.getConfigKey()).toBe(p2.getConfigKey());
+    expect(p1.getConfigKey()).toContain("example.com");
+  });
+
+  it("reconnect-on-error retries after connection drop (VT-9)", async () => {
+    const provider = new McpToolProvider({
+      name: "test-stdio",
+      transport: "stdio",
+      command: "node",
+      args: [MOCK_SERVER],
+      auth: "none",
+    });
+
+    await provider.listTools(); // connect
+
+    // Simulate connection drop by forcibly disconnecting the client
+    // biome-ignore lint/suspicious/noExplicitAny: testing reconnect behavior
+    const client = (provider as any).client;
+    await client.close();
+
+    // callTool should detect the connection error, reconnect, and succeed on retry
+    const result = await provider.callTool("echo", { text: "after-reconnect" });
+    expect(result.isError).toBe(false);
+    expect(result.content).toContain("after-reconnect");
+
+    await provider.disconnect();
+  });
+
+  it("blocks remote MCP connection when host not in allowedHosts (VT-11)", async () => {
+    const provider = new McpToolProvider(
+      {
+        name: "blocked-remote",
+        url: "https://mcp.blocked.com/sse",
+        transport: "sse",
+        auth: "none",
+      },
+      undefined,
+      ["other.com"], // allowedHosts does NOT include mcp.blocked.com
+    );
+
+    // listTools triggers connect — should fail gracefully (tools=[])
+    const tools = await provider.listTools();
+    expect(tools).toEqual([]);
+
+    await provider.disconnect();
+  });
+
+  it("stdio transport is not affected by allowedHosts", async () => {
+    // allowedHosts=[] (all blocked) should NOT block stdio (local process)
+    const provider = new McpToolProvider(
+      {
+        name: "test-stdio-allowed",
+        transport: "stdio",
+        command: "node",
+        args: [MOCK_SERVER],
+        auth: "none",
+      },
+      undefined,
+      [], // empty = all blocked, but stdio is local — should still work
+    );
+
+    const tools = await provider.listTools();
+    expect(tools.length).toBeGreaterThan(0);
+
+    await provider.disconnect();
+  });
 });

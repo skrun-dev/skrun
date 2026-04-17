@@ -6,14 +6,17 @@ import {
   McpToolProvider,
   MemoryStateStore,
   ScriptToolProvider,
+  TTLCache,
   ToolRegistry,
   createLogger,
   redactSecretsFromString,
 } from "@skrun-dev/runtime";
-import type { RunEvent, StateStore } from "@skrun-dev/runtime";
+import type { FileInfo, RunEvent, StateStore } from "@skrun-dev/runtime";
 import { parseAgentYaml } from "@skrun-dev/schema";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import { bundleCache, getOrExtract } from "../cache/bundle-cache.js";
+import { registerOutput } from "../cache/output-cache.js";
 import { authMiddleware } from "../middleware/auth.js";
 import type { RegistryService } from "../services/registry.js";
 import { RegistryError } from "../services/registry.js";
@@ -23,6 +26,23 @@ import { formatSSEEvent } from "../utils/sse.js";
 const globalStateStore = new MemoryStateStore();
 const globalRouter = new LLMRouter();
 const logger = createLogger("api");
+
+// MCP connection cache — reuse connected providers across runs
+const DEFAULT_MCP_TTL_S = 600;
+const DEFAULT_MCP_MAX = 20;
+function readEnvInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isNaN(parsed) || parsed <= 0 ? fallback : parsed;
+}
+const mcpCache = new TTLCache<string, McpToolProvider>({
+  ttlMs: readEnvInt("MCP_CACHE_TTL", DEFAULT_MCP_TTL_S) * 1000,
+  maxEntries: readEnvInt("MCP_CACHE_MAX", DEFAULT_MCP_MAX),
+  onEvict: (_key, provider) => {
+    provider.disconnect().catch(() => {});
+  },
+});
 
 const SEMVER_STRICT = /^\d+\.\d+\.\d+$/;
 
@@ -53,6 +73,7 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
     let input: Record<string, unknown>;
     let webhookUrl: string | undefined;
     let requestedVersion: string | undefined;
+    let environmentOverride: Record<string, unknown> | undefined;
     try {
       const body = await c.req.json();
       input = body.input ?? body;
@@ -83,6 +104,21 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
           );
         }
         requestedVersion = body.version;
+      }
+      // Optional environment override (shallow-merged onto agent.yaml defaults)
+      if (body.environment !== undefined && body.environment !== null) {
+        if (typeof body.environment !== "object" || Array.isArray(body.environment)) {
+          return c.json(
+            {
+              error: {
+                code: "INVALID_ENVIRONMENT",
+                message: "environment must be an object",
+              },
+            },
+            400,
+          );
+        }
+        environmentOverride = body.environment as Record<string, unknown>;
       }
     } catch {
       return c.json({ error: { code: "INVALID_REQUEST", message: "Invalid JSON body" } }, 400);
@@ -221,21 +257,19 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
       throw err;
     }
 
-    // 4. Extract bundle to disk
+    // 4. Extract bundle to disk (cached by namespace/name/version)
     let skillContent = "";
     let agentYamlContent = "";
     let agentsMdContent: string | undefined;
     let bundleDir = "";
-    let cleanupBundle = () => {};
 
     try {
-      const { extractBundleToDisk } = await import("../utils/bundle.js");
-      const extracted = extractBundleToDisk(bundleBuffer);
-      bundleDir = extracted.dir;
-      cleanupBundle = extracted.cleanup;
-      skillContent = extracted.files["SKILL.md"] ?? "";
-      agentYamlContent = extracted.files["agent.yaml"] ?? "";
-      agentsMdContent = extracted.files["AGENTS.md"];
+      const cacheKey = `${namespace}/${name}/${resolvedVersion}`;
+      const entry = getOrExtract(bundleCache, cacheKey, bundleBuffer);
+      bundleDir = entry.dir;
+      skillContent = entry.files["SKILL.md"] ?? "";
+      agentYamlContent = entry.files["agent.yaml"] ?? "";
+      agentsMdContent = entry.files["AGENTS.md"];
     } catch {
       return c.json(
         { error: { code: "BUNDLE_CORRUPT", message: "Failed to extract agent bundle" } },
@@ -265,6 +299,21 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
         },
         500,
       );
+    }
+
+    // 5b. Merge environment override (if provided)
+    if (environmentOverride) {
+      const { networking: netOverride, ...flatOverride } = environmentOverride as {
+        networking?: { allowed_hosts?: string[] };
+        [key: string]: unknown;
+      };
+      const mergedNetworking = netOverride
+        ? { ...agentConfig.environment.networking, ...netOverride }
+        : agentConfig.environment.networking;
+      agentConfig = {
+        ...agentConfig,
+        environment: { ...agentConfig.environment, ...flatOverride, networking: mergedNetworking },
+      };
     }
 
     // 6. Validate inputs
@@ -300,6 +349,7 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
     // 7. Setup tool registry
     const toolRegistry = new ToolRegistry();
     const warnings: string[] = [];
+    const allowedHosts = agentConfig.environment.networking.allowed_hosts;
 
     if (bundleDir) {
       const { existsSync } = await import("node:fs");
@@ -316,7 +366,11 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
         }
 
         if (isVerified || isDevToken) {
-          const scriptProvider = new ScriptToolProvider(scriptsDir, agentConfig.tools);
+          const scriptProvider = new ScriptToolProvider(
+            scriptsDir,
+            agentConfig.tools,
+            allowedHosts,
+          );
           await toolRegistry.addProvider(scriptProvider);
         } else {
           warnings.push("agent_not_verified_scripts_disabled");
@@ -325,7 +379,14 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
     }
 
     for (const mcpServer of agentConfig.mcp_servers) {
-      const mcpProvider = new McpToolProvider(mcpServer);
+      const tempProvider = new McpToolProvider(mcpServer, undefined, allowedHosts);
+      const configKey = `${tempProvider.getConfigKey()}:${JSON.stringify(allowedHosts)}`;
+      let mcpProvider = mcpCache.get(configKey);
+      if (!mcpProvider) {
+        mcpProvider = tempProvider;
+        await mcpProvider.listTools(); // triggers connect
+        mcpCache.set(configKey, mcpProvider);
+      }
       await toolRegistry.addProvider(mcpProvider);
     }
 
@@ -344,7 +405,16 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
       runId,
       callerKeys,
       agent_version: resolvedVersion,
+      outputDir: undefined as string | undefined,
     };
+
+    // Helper: build files array with download URLs from FileInfo[]
+    const buildFilesResponse = (files: FileInfo[] | undefined) =>
+      (files ?? []).map((f) => ({
+        name: f.name,
+        size: f.size,
+        url: `/api/runs/${runId}/files/${encodeURIComponent(f.name)}`,
+      }));
 
     // --- Sanitize helper: strip caller keys from event error messages ---
     const sanitizeEvent = (event: RunEvent): RunEvent => {
@@ -365,13 +435,16 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
       return streamSSE(c, async (stream) => {
         try {
           for await (const event of adapter.executeStream(runRequest)) {
+            if (event.type === "run_complete" && runRequest.outputDir) {
+              registerOutput(runId, runRequest.outputDir);
+            }
             const sanitized = sanitizeEvent(event);
             const { event: eventName, data } = formatSSEEvent(sanitized);
             await stream.writeSSE({ event: eventName, data });
           }
         } finally {
-          await toolRegistry.disconnectAll();
-          cleanupBundle();
+          // MCP disconnect handled by cache eviction
+          // Bundle cleanup handled by cache eviction
         }
       });
     }
@@ -385,6 +458,9 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
           let finalResult: Record<string, unknown> | undefined;
           for await (const event of adapter.executeStream(runRequest)) {
             if (event.type === "run_complete") {
+              if (runRequest.outputDir) {
+                registerOutput(runId, runRequest.outputDir);
+              }
               finalResult = {
                 run_id: runId,
                 status: "completed",
@@ -394,6 +470,7 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
                 ...(warnings.length > 0 && { warnings }),
                 cost: event.cost,
                 duration_ms: event.duration_ms,
+                files: buildFilesResponse(event.files),
               };
             } else if (event.type === "run_error") {
               const sanitized = sanitizeEvent(event);
@@ -415,8 +492,8 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
             "Background execution failed",
           );
         } finally {
-          await toolRegistry.disconnectAll();
-          cleanupBundle();
+          // MCP disconnect handled by cache eviction
+          // Bundle cleanup handled by cache eviction
         }
       })();
 
@@ -427,8 +504,10 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
     try {
       const result = await adapter.execute(runRequest);
 
-      await toolRegistry.disconnectAll();
-      cleanupBundle();
+      // Register output dir for file serving
+      if (runRequest.outputDir) {
+        registerOutput(runId, runRequest.outputDir);
+      }
 
       return c.json({
         run_id: result.runId,
@@ -445,12 +524,10 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
           estimated: result.usage.estimatedCost,
         },
         duration_ms: result.durationMs,
+        files: buildFilesResponse(result.files),
         ...(result.error && { error: result.error }),
       });
     } catch (err) {
-      await toolRegistry.disconnectAll();
-      cleanupBundle();
-
       const isTimeout = (err as Error).name === "TimeoutError";
       let errorMessage = err instanceof Error ? err.message : "Agent execution failed";
 

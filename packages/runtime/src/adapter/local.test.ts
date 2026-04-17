@@ -33,8 +33,14 @@ function createRunRequest(overrides?: Partial<RunRequest>): RunRequest {
       inputs: [],
       outputs: [{ name: "result", type: "string", description: "result" }],
       mcp_servers: [],
-      permissions: { network: false, filesystem: false, secrets: [] },
-      runtime: { timeout: "30s", max_cost: 1.0, sandbox: true },
+      environment: {
+        networking: { allowed_hosts: [] },
+        filesystem: "read-only",
+        secrets: [],
+        timeout: "30s",
+        max_cost: 1.0,
+        sandbox: "strict",
+      },
       state: { type: "none" },
       context_mode: "skill",
       tests: [],
@@ -90,8 +96,8 @@ describe("LocalAdapter.executeStream", () => {
 
     const llmEvent = events.find((e) => e.type === "llm_complete");
     expect(llmEvent).toBeDefined();
-    expect(llmEvent!.type).toBe("llm_complete");
-    if (llmEvent!.type === "llm_complete") {
+    expect(llmEvent?.type).toBe("llm_complete");
+    if (llmEvent?.type === "llm_complete") {
       expect(llmEvent.provider).toBe("mock");
       expect(llmEvent.model).toBe("mock-model");
       expect(llmEvent.tokens).toBe(150);

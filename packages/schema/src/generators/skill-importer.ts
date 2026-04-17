@@ -45,14 +45,11 @@ export function generateAgentYaml(skill: ParsedSkill): GeneratedAgentYaml {
     version: "1.0.0",
     tools,
     mcp_servers: [],
-    permissions: {
-      network: [],
+    environment: {
+      networking: { allowed_hosts: [] },
       filesystem: "read-only",
       secrets: [],
-    },
-    runtime: {
       timeout: "300s",
-      max_cost: undefined,
       sandbox: "strict",
     },
     context_mode: "skill",
@@ -83,7 +80,7 @@ export function generateAgentYaml(skill: ParsedSkill): GeneratedAgentYaml {
       default: "query:string",
     },
     {
-      field: "permissions.network",
+      field: "environment.networking.allowed_hosts",
       question: "Domains this agent needs to access? (comma-separated, empty for none)",
       type: "text",
       default: "",

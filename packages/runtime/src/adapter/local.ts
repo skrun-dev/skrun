@@ -1,3 +1,7 @@
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { collectOutputFiles } from "../files/output-collector.js";
 import type { ToolCallRequest, ToolCallResult } from "../llm/providers/types.js";
 import type { LLMRouter } from "../llm/router.js";
 import { createLogger } from "../logger.js";
@@ -38,6 +42,7 @@ export class LocalAdapter implements RuntimeAdapter {
             estimatedCost: event.cost.estimated,
           },
           durationMs: event.duration_ms,
+          files: event.files,
         };
       } else if (event.type === "run_error") {
         lastError = event;
@@ -59,8 +64,15 @@ export class LocalAdapter implements RuntimeAdapter {
 
   async *executeStream(request: RunRequest): AsyncGenerator<RunEvent> {
     const config = request.agentConfig;
-    const timeoutMs = parseTimeout(config.runtime.timeout);
+    const timeoutMs = parseTimeout(config.environment.timeout);
     const start = Date.now();
+
+    // Create output dir for file deliverables
+    if (!request.outputDir) {
+      const outputDir = join(tmpdir(), `skrun-outputs-${request.runId}`);
+      mkdirSync(outputDir, { recursive: true });
+      request.outputDir = outputDir;
+    }
 
     yield {
       type: "run_start",
@@ -90,9 +102,14 @@ export class LocalAdapter implements RuntimeAdapter {
         yield event;
       }
 
-      yield result;
+      // Scan output dir for produced files
+      if (result.type === "run_complete" && request.outputDir) {
+        const files = collectOutputFiles(request.outputDir);
+        yield { ...result, files };
+      } else {
+        yield result;
+      }
     } catch (err) {
-      const durationMs = Date.now() - start;
       const isTimeout = (err as Error).name === "TimeoutError";
       const action = isTimeout ? "timeout" : "run_failed";
 
@@ -241,14 +258,14 @@ export class LocalAdapter implements RuntimeAdapter {
       await this.state.set(config.name, newState);
     }
 
-    const costResult = checkCost(llmResponse.estimatedCost, config.runtime.max_cost);
+    const costResult = checkCost(llmResponse.estimatedCost, config.environment.max_cost);
     if (costResult.exceeded) {
       this.logger.warn(
         {
           event: "cost_exceeded",
           agent: config.name,
           estimated: costResult.estimated,
-          maxCost: config.runtime.max_cost,
+          maxCost: config.environment.max_cost,
         },
         "Run cost exceeded max_cost",
       );
@@ -273,6 +290,7 @@ export class LocalAdapter implements RuntimeAdapter {
       },
       cost: { estimated: llmResponse.estimatedCost },
       duration_ms: durationMs,
+      files: [],
     };
 
     return { events, result: completeEvent };

@@ -45,15 +45,14 @@ outputs:
   - name: score
     type: number
 
-permissions:
-  network:
-    - googleapis.com
-    - "*.target-site"
+environment:
+  networking:
+    allowed_hosts:
+      - googleapis.com
+      - "*.target-site"
   filesystem: read-only
   secrets:
     - GSC_API_KEY
-
-runtime:
   timeout: 300s
   max_cost: 0.50
   sandbox: strict
