@@ -13,8 +13,13 @@ export class RegistryClient {
     namespace: string,
     name: string,
     version: string,
+    force = false,
   ): Promise<Record<string, unknown>> {
-    const url = `${this.baseUrl}/api/agents/${namespace}/${name}/push?version=${version}`;
+    const params = new URLSearchParams({ version });
+    if (force) {
+      params.set("force", "true");
+    }
+    const url = `${this.baseUrl}/api/agents/${namespace}/${name}/push?${params.toString()}`;
     const res = await fetch(url, {
       method: "POST",
       headers: {

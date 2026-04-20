@@ -25,6 +25,7 @@ export class RegistryService {
     version: string,
     bundle: Buffer,
     userId: string,
+    force = false,
   ): Promise<AgentMetadata> {
     // Get or create agent
     let agent = this.db.getAgent(namespace, name);
@@ -39,7 +40,7 @@ export class RegistryService {
 
     // Check duplicate version
     const existing = this.db.getVersionByNumber(agent.id, version);
-    if (existing) {
+    if (existing && !force) {
       throw new RegistryError(
         "VERSION_EXISTS",
         `Version ${version} already exists for ${namespace}/${name}. Bump version in agent.yaml.`,
@@ -52,7 +53,7 @@ export class RegistryService {
     await this.storage.put(bundleKey, bundle);
 
     // Create version record
-    this.db.createVersion(agent.id, {
+    this.db.replaceVersion(agent.id, {
       version,
       size: bundle.length,
       bundle_key: bundleKey,

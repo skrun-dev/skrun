@@ -9,6 +9,7 @@ export function createRegistryRoutes(service: RegistryService): Hono {
   router.post("/agents/:namespace/:name/push", authMiddleware, async (c) => {
     const { namespace, name } = c.req.param();
     const version = c.req.query("version");
+    const force = c.req.query("force") === "true";
     const user = getUser(c);
 
     if (!version) {
@@ -34,7 +35,7 @@ export function createRegistryRoutes(service: RegistryService): Hono {
     try {
       const body = await c.req.arrayBuffer();
       const buffer = Buffer.from(body);
-      const metadata = await service.push(namespace, name, version, buffer, user.id);
+      const metadata = await service.push(namespace, name, version, buffer, user.id, force);
       return c.json(metadata);
     } catch (err) {
       if (err instanceof RegistryError) {

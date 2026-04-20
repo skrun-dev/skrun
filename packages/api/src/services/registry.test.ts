@@ -45,6 +45,18 @@ describe("RegistryService", () => {
     ).rejects.toThrow("already exists");
   });
 
+  it("should overwrite duplicate version when forced", async () => {
+    await service.push("acme", "agent", "1.0.0", Buffer.from("v1"), "user-1");
+    await service.push("acme", "agent", "1.0.0", Buffer.from("v2"), "user-1", true);
+
+    const pulled = await service.pull("acme", "agent", "1.0.0");
+    expect(pulled.buffer.toString()).toBe("v2");
+
+    const versions = await service.getVersions("acme", "agent");
+    expect(versions).toHaveLength(1);
+    expect(versions[0].version).toBe("1.0.0");
+  });
+
   it("should throw 404 on pull for non-existent agent", async () => {
     await expect(service.pull("x", "y")).rejects.toThrow(RegistryError);
   });

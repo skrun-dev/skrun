@@ -64,6 +64,24 @@ describe("Registry Routes", () => {
     expect(body.error.code).toBe("VERSION_EXISTS");
   });
 
+  it("POST /push overwrites duplicate version when force=true", async () => {
+    await pushAgent();
+    const updatedBundle = Buffer.from("force-overwrite-bundle");
+    const res = await app.request("/api/agents/dev/test-agent/push?version=1.0.0&force=true", {
+      method: "POST",
+      headers: { ...authHeader, "Content-Type": "application/octet-stream" },
+      body: updatedBundle,
+    });
+
+    expect(res.status).toBe(200);
+
+    const pullRes = await app.request("/api/agents/dev/test-agent/pull/1.0.0", {
+      headers: authHeader,
+    });
+    expect(pullRes.status).toBe(200);
+    expect(Buffer.from(await pullRes.arrayBuffer())).toEqual(updatedBundle);
+  });
+
   it("POST /push returns 400 without version param", async () => {
     const res = await app.request("/api/agents/dev/agent/push", {
       method: "POST",
