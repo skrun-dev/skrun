@@ -92,28 +92,6 @@ describe("POST /run — agent verification", () => {
     service = new RegistryService(storage, db);
   });
 
-  async function pushAndRun(token: string, verified: boolean) {
-    // Push a fake agent bundle
-    const bundle = Buffer.from("fake-bundle");
-    await app.request("/api/agents/dev/script-agent/push?version=1.0.0", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
-      body: bundle,
-    });
-
-    // Set verification if needed
-    if (verified) {
-      db.setVerified("dev", "script-agent", true);
-    }
-
-    // Try to run
-    return app.request("/api/agents/dev/script-agent/run", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ input: { code: "test" } }),
-    });
-  }
-
   it("non-verified agent: response does not crash (scripts skipped gracefully)", async () => {
     // Push agent (non-verified by default) and run with non-dev token
     // The run will fail at LLM call (no API key) but should NOT fail at verification

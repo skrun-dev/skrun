@@ -1,0 +1,120 @@
+name: dev/slide-deck-generator
+version: 0.1.0
+
+model:
+  provider: google
+  name: gemini-2.5-flash
+  fallback:
+    provider: google
+    name: gemini-2.5-flash-lite
+
+tools:
+  - name: render_pptx
+    description: Render a structured slide deck to a real .pptx file via python-pptx. Each slide can be a title slide, a content slide (title + bullets), or a closing slide. Output is a single deck.pptx in the run output directory.
+    input_schema:
+      type: object
+      properties:
+        slides:
+          type: array
+          description: Ordered list of slides to render.
+          items:
+            type: object
+            properties:
+              layout:
+                type: string
+                description: One of - title, content, closing.
+              title:
+                type: string
+              subtitle:
+                type: string
+                description: Optional. Used by title and closing layouts.
+              bullets:
+                type: array
+                description: Optional. Used by content layout. Each item is a string.
+                items:
+                  type: string
+              speaker_notes:
+                type: string
+                description: Optional speaker notes for the slide.
+            required: [layout, title]
+            additionalProperties: false
+        brand_primary_color:
+          type: string
+          description: Hex color for accents (defaults to "#1a73e8").
+        deck_title:
+          type: string
+          description: Title used in the .pptx properties metadata.
+      required: [slides]
+      additionalProperties: false
+
+inputs:
+  - name: outline_md
+    type: string
+    required: true
+    description: Markdown outline of the deck. The agent parses this and chooses layouts. Format below in the SKILL.
+  - name: deck_title
+    type: string
+    required: false
+    description: Title for the .pptx metadata. Defaults to the first H1 of the outline.
+  - name: brand_primary_color
+    type: string
+    required: false
+    description: Hex color for accents (e.g., "#0366d6"). Defaults to "#1a73e8".
+  - name: brand_font
+    type: string
+    required: false
+    description: Currently a hint only — python-pptx default theme fonts are used. Reserved for future template support.
+
+outputs:
+  - name: deck_path
+    type: string
+    description: Path to the generated deck.pptx in the run output directory.
+  - name: slide_count
+    type: number
+    description: Total slides in the deck.
+  - name: deck_title
+    type: string
+    description: The title applied to the deck (echoed for confirmation).
+
+environment:
+  networking:
+    allowed_hosts: []
+  filesystem: read-write
+  secrets: []
+  timeout: 180s
+  sandbox: strict
+
+state:
+  type: none
+  ttl: 30d
+
+tests:
+  - name: simple-3-slide-deck
+    input:
+      outline_md: |
+        # Q2 Roadmap
+
+        ## What we shipped
+        - Streaming SSE
+        - SDK v1
+        - Dashboard
+
+        ## What's next
+        - Cloud deploy
+        - Marketplace
+        - SOC2
+
+        # Thanks
+        Questions?
+      deck_title: Q2 Roadmap
+    assert: output.slide_count >= 3
+  - name: brand-color-applied
+    input:
+      outline_md: |
+        # Pitch
+        ## Problem
+        - Hard
+        ## Solution
+        - Easy
+      brand_primary_color: "#9b4f1f"
+    assert: output.slide_count >= 3

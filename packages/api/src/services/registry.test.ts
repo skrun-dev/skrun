@@ -91,4 +91,16 @@ describe("RegistryService", () => {
     await service.push("acme", "seo", "1.0.0", bundle, "u");
     expect(await storage.exists("acme/seo/1.0.0.agent")).toBe(true);
   });
+
+  it("should propagate notes from push to the stored version", async () => {
+    await service.push("acme", "agent", "1.0.0", Buffer.from("v1"), "u", "Added retry logic");
+    const versions = await service.getVersions("acme", "agent");
+    expect(versions[0].notes).toBe("Added retry logic");
+  });
+
+  it("should default notes to null when absent", async () => {
+    await service.push("acme", "agent", "1.0.0", Buffer.from("v1"), "u");
+    const versions = await service.getVersions("acme", "agent");
+    expect(versions[0].notes).toBeNull();
+  });
 });

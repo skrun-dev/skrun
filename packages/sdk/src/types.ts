@@ -89,6 +89,20 @@ export interface PushResult {
   latest_version: string;
 }
 
+export interface PushOptions {
+  /** Attach a note to this version (max 500 characters, plain text only). */
+  message?: string;
+}
+
+export interface AgentVersionInfo {
+  version: string;
+  size: number;
+  pushed_at: string;
+  config_snapshot?: Record<string, unknown>;
+  /** Optional note attached to the version at push time (≤ 500 chars, plain text). */
+  notes: string | null;
+}
+
 export interface ListOptions {
   page?: number;
   limit?: number;

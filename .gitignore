@@ -140,7 +140,14 @@ vite.config.ts.timestamp-*
 
 # Skrun build artifacts
 *.agent
+skrun.db
+skrun.db-*
+*.sqlite*
+.skrun/
 
 # Local tool config
 .claude/
 .playwright-mcp/
+
+# Per-worktree local journal (multi-session dev workflow)
+specs/_meta/JOURNAL-worktree.md

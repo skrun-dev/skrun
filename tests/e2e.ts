@@ -59,7 +59,17 @@ async function startRegistry(): Promise<void> {
   const devTs = join(ROOT, "packages/api/src/dev.ts");
   registryProcess = spawn(process.execPath, ["--import", "tsx", devTs], {
     cwd: ROOT,
-    env: { ...process.env, PORT: "4000" },
+    env: {
+      ...process.env,
+      PORT: "4000",
+      // Force dev-token mode regardless of user's local .env (OAuth must be off
+      // for `dev-token` to work — see packages/api/src/auth/github-oauth.ts).
+      GITHUB_CLIENT_ID: "",
+      GITHUB_CLIENT_SECRET: "",
+      // Force agents directory to the renamed dir (some local .env files may
+      // still point at the legacy `examples/`).
+      SKRUN_AGENTS_DIR: "./agents",
+    },
     stdio: "pipe",
   });
 
@@ -108,7 +118,7 @@ function patchAgent(dir: string, namespace: string, provider: string, model: str
   let patched = original;
   // Patch namespace
   patched = patched.replace(/name: dev\//, `name: ${namespace}/`);
-  // Patch provider + model (all examples default to google/gemini-2.5-flash)
+  // Patch provider + model (all demo agents default to google/gemini-2.5-flash)
   patched = patched.replace(/provider: \w+/g, `provider: ${provider}`);
   patched = patched.replace(/name: gemini-[\w.-]+/g, `name: ${model}`);
 
@@ -149,7 +159,7 @@ async function testAgent(
   input: Record<string, unknown>,
   validate: (res: Record<string, unknown>) => string | null,
 ): Promise<void> {
-  const dir = join(ROOT, "examples", name);
+  const dir = join(ROOT, "agents", name);
   const original = patchAgent(dir, "dev", "google", "gemini-2.5-flash");
 
   try {
@@ -267,7 +277,7 @@ await testAgent(
 // seo-audit run 2 — must remember!
 // Need to push again (same version conflict — use a trick: different version)
 console.log("Testing seo-audit (run 2 — should remember)...");
-const seoDir = join(ROOT, "examples/seo-audit");
+const seoDir = join(ROOT, "agents/seo-audit");
 const _seoOriginal = readFileSync(join(seoDir, "agent.yaml"), "utf-8");
 // Already pushed from run 1, just call /run again
 const seoRes2 = await postRun("dev", "seo-audit", { website_url: "https://example.com" });
@@ -985,6 +995,122 @@ console.log("Testing files API — response includes files array...");
       feature: "POST /run response includes files array (backward compat)",
       passed: false,
       duration: 0,
+      cost: 0,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+// ==================== Auth: GET /api/me ====================
+{
+  const start = Date.now();
+  try {
+    const res = await fetch(`${REGISTRY}/api/me`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    const data = (await res.json()) as {
+      id: string;
+      username: string;
+      namespace: string;
+      plan: string;
+    };
+    const ok = res.status === 200 && data.namespace === "dev" && data.username === "dev";
+    results.push({
+      agent: "auth",
+      feature: "GET /api/me returns user info (dev-token mode)",
+      passed: ok,
+      duration: Date.now() - start,
+      cost: 0,
+      detail: `status=${res.status} namespace=${data.namespace} username=${data.username} plan=${data.plan}`,
+    });
+  } catch (err) {
+    results.push({
+      agent: "auth",
+      feature: "GET /api/me returns user info (dev-token mode)",
+      passed: false,
+      duration: Date.now() - start,
+      cost: 0,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+// ==================== Auth: GET /login page ====================
+{
+  const start = Date.now();
+  try {
+    const res = await fetch(`${REGISTRY}/login`);
+    const html = await res.text();
+    const hasSkrun = html.includes("Skrun");
+    const hasDevToken = html.includes("dev-token");
+    results.push({
+      agent: "auth",
+      feature: "GET /login renders page (dev mode — no OAuth)",
+      passed: res.status === 200 && hasSkrun && hasDevToken,
+      duration: Date.now() - start,
+      cost: 0,
+      detail: `status=${res.status} hasSkrun=${hasSkrun} hasDevToken=${hasDevToken}`,
+    });
+  } catch (err) {
+    results.push({
+      agent: "auth",
+      feature: "GET /login renders page (dev mode — no OAuth)",
+      passed: false,
+      duration: Date.now() - start,
+      cost: 0,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+// --- #14c: Version notes via --message ---
+{
+  const start = Date.now();
+  const featureName = "skrun push -m 'note' → notes in versions API (#14c)";
+  try {
+    // Bump an example to a throwaway version we know isn't used, push with --message
+    const dir = join(ROOT, "agents/code-review");
+    const original = patchAgent(dir, "dev", "google", "gemini-2.5-flash");
+    // Also bump version so we don't collide with prior pushes
+    const yamlPath = join(dir, "agent.yaml");
+    const originalYaml = readFileSync(yamlPath, "utf-8");
+    const bumpedYaml = originalYaml.replace(/version: \d+\.\d+\.\d+/, "version: 9.9.99");
+    writeFileSync(yamlPath, bumpedYaml, "utf-8");
+
+    try {
+      skrun(["build"], dir);
+      const noteText = "Automated live test note 🚀";
+      skrun(["push", "-m", noteText], dir);
+
+      // Fetch versions and assert the latest one has our note
+      const res = await fetch(`${REGISTRY}/api/agents/dev/code-review/versions`);
+      const body = (await res.json()) as {
+        versions: Array<{ version: string; notes: string | null }>;
+      };
+      const v999 = body.versions.find((v) => v.version === "9.9.99");
+      const match = v999?.notes === noteText;
+
+      results.push({
+        agent: "#14c",
+        feature: featureName,
+        passed: match,
+        duration: Date.now() - start,
+        cost: 0,
+        detail: match
+          ? `version=9.9.99, notes="${v999?.notes}"`
+          : `expected notes="${noteText}" but got notes="${v999?.notes ?? "null"}"`,
+      });
+    } finally {
+      // Restore version + restore provider/namespace
+      writeFileSync(yamlPath, originalYaml, "utf-8");
+      restoreAgent(dir, original);
+    }
+  } catch (err) {
+    results.push({
+      agent: "#14c",
+      feature: featureName,
+      passed: false,
+      duration: Date.now() - start,
       cost: 0,
       detail: err instanceof Error ? err.message : String(err),
     });

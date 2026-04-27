@@ -1,0 +1,104 @@
+name: dev/knowledge-base-from-vault
+version: 0.1.0
+
+model:
+  provider: google
+  name: gemini-2.5-flash
+  fallback:
+    provider: google
+    name: gemini-2.5-flash-lite
+
+tools:
+  - name: read_vault
+    description: Scan a directory for `.md` files. Returns each note's path, slug, title (first H1), front-matter, headings, and outgoing links (both Obsidian-style `[[wiki]]` and Markdown `[text](url)`).
+    input_schema:
+      type: object
+      properties:
+        vault_dir:
+          type: string
+          description: Path to a directory of Markdown notes. Subdirectories are scanned recursively.
+      required: [vault_dir]
+      additionalProperties: false
+  - name: build_site_zip
+    description: Bundle a set of HTML pages plus a generated index into `kb.zip` in the run output directory. Wraps each page in a standard HTML envelope with theme CSS and site nav.
+    input_schema:
+      type: object
+      properties:
+        pages:
+          type: array
+          description: Pages to include. Each item is { filename (must end .html, flat name), title, body_html (raw HTML body, will be wrapped in the site template) }.
+          items:
+            type: object
+            properties:
+              filename:
+                type: string
+              title:
+                type: string
+              body_html:
+                type: string
+            required: [filename, title, body_html]
+            additionalProperties: false
+        theme:
+          type: string
+          description: Visual theme. One of - light, dark, sepia.
+        site_title:
+          type: string
+          description: Site title shown in nav and HTML <title>.
+      required: [pages, theme, site_title]
+      additionalProperties: false
+
+inputs:
+  - name: vault_dir
+    type: string
+    required: true
+    description: Path to a directory of Markdown notes (e.g., "./fixtures/sample-vault" or "/home/me/Documents/Obsidian/MyVault").
+  - name: site_title
+    type: string
+    required: false
+    description: Title for the generated knowledge base. Defaults to "Knowledge Base".
+  - name: theme
+    type: string
+    required: false
+    description: Visual theme - "light" (default), "dark", or "sepia".
+
+outputs:
+  - name: site_zip_path
+    type: string
+    description: Path to the generated kb.zip in the run output directory.
+  - name: concept_count
+    type: number
+    description: Number of distinct concepts in the knowledge graph after this run.
+  - name: link_count
+    type: number
+    description: Total internal links resolved between notes.
+  - name: pages_count
+    type: number
+    description: Number of pages in the bundled site.
+  - name: runs_processed
+    type: number
+    description: How many times this agent has been run against any vault (from persistent state).
+
+environment:
+  networking:
+    allowed_hosts: []
+  filesystem: read-write
+  secrets: []
+  timeout: 240s
+  sandbox: strict
+
+state:
+  type: kv
+  ttl: 90d
+
+tests:
+  - name: small-vault-light
+    input:
+      vault_dir: ./fixtures/sample-vault
+      site_title: Skrun KB demo
+    assert: output.pages_count >= 5
+  - name: dark-theme
+    input:
+      vault_dir: ./fixtures/sample-vault
+      site_title: Skrun KB demo
+      theme: dark
+    assert: output.concept_count > 0

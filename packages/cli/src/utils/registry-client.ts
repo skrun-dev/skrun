@@ -13,14 +13,20 @@ export class RegistryClient {
     namespace: string,
     name: string,
     version: string,
-  ): Promise<Record<string, unknown>> {
+    opts?: { notes?: string },
+  ): Promise<{ body: Record<string, unknown>; warning?: string }> {
     const url = `${this.baseUrl}/api/agents/${namespace}/${name}/push?version=${version}`;
+    const headers: Record<string, string> = {
+      ...this.authHeaders(),
+      "Content-Type": "application/octet-stream",
+    };
+    if (opts?.notes) {
+      // HTTP header values must be latin-1. Percent-encode to safely carry non-ASCII notes.
+      headers["X-Skrun-Version-Notes"] = encodeURIComponent(opts.notes);
+    }
     const res = await fetch(url, {
       method: "POST",
-      headers: {
-        ...this.authHeaders(),
-        "Content-Type": "application/octet-stream",
-      },
+      headers,
       body: bundle,
     });
 
@@ -30,7 +36,8 @@ export class RegistryClient {
       throw new Error(`Push failed (${res.status}): ${msg}`);
     }
 
-    return (await res.json()) as Record<string, unknown>;
+    const warning = res.headers.get("X-Skrun-Warning") ?? undefined;
+    return { body: (await res.json()) as Record<string, unknown>, warning };
   }
 
   async pull(namespace: string, name: string, version?: string): Promise<Buffer> {

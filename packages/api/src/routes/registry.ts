@@ -1,8 +1,12 @@
+import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
-import { authMiddleware, getUser } from "../middleware/auth.js";
+import { getUser } from "../middleware/auth.js";
 import { RegistryError, type RegistryService } from "../services/registry.js";
 
-export function createRegistryRoutes(service: RegistryService): Hono {
+export function createRegistryRoutes(
+  service: RegistryService,
+  authMiddleware: MiddlewareHandler,
+): Hono {
   const router = new Hono();
 
   // Push — auth required
@@ -31,10 +35,56 @@ export function createRegistryRoutes(service: RegistryService): Hono {
       );
     }
 
+    // Version notes (#14c): validate X-Skrun-Version-Notes header server-side.
+    // Client percent-encodes the value so non-ASCII chars transit safely in headers.
+    const rawNotes = c.req.header("X-Skrun-Version-Notes");
+    let notes: string | null = null;
+    if (rawNotes !== undefined && rawNotes !== "") {
+      let decoded: string;
+      try {
+        decoded = decodeURIComponent(rawNotes);
+      } catch {
+        return c.json(
+          {
+            error: {
+              code: "INVALID_NOTES",
+              message: "Version notes header is not valid percent-encoded UTF-8",
+            },
+          },
+          400,
+        );
+      }
+      // Length check (≤ 500 chars — checked on the decoded form, per spec)
+      if (decoded.length > 500) {
+        return c.json(
+          {
+            error: {
+              code: "INVALID_NOTES",
+              message: "Version notes must be 500 characters or less",
+            },
+          },
+          400,
+        );
+      }
+      // No null bytes
+      if (decoded.includes("\x00")) {
+        return c.json(
+          {
+            error: {
+              code: "INVALID_NOTES",
+              message: "Version notes must not contain null bytes",
+            },
+          },
+          400,
+        );
+      }
+      notes = decoded;
+    }
+
     try {
       const body = await c.req.arrayBuffer();
       const buffer = Buffer.from(body);
-      const metadata = await service.push(namespace, name, version, buffer, user.id);
+      const metadata = await service.push(namespace, name, version, buffer, user.id, notes);
       return c.json(metadata);
     } catch (err) {
       if (err instanceof RegistryError) {
@@ -129,9 +179,23 @@ export function createRegistryRoutes(service: RegistryService): Hono {
     }
   });
 
-  // Verify — auth required (operator action)
+  // Verify — auth required, namespace owner only
   router.patch("/agents/:namespace/:name/verify", authMiddleware, async (c) => {
     const { namespace, name } = c.req.param();
+    const user = getUser(c);
+
+    // Namespace ownership check
+    if (namespace !== user.namespace) {
+      return c.json(
+        {
+          error: {
+            code: "FORBIDDEN",
+            message: `You don't have permission to verify agents in namespace '${namespace}'`,
+          },
+        },
+        403,
+      );
+    }
 
     let body: { verified: boolean };
     try {
@@ -150,6 +214,37 @@ export function createRegistryRoutes(service: RegistryService): Hono {
     try {
       const metadata = await service.setVerified(namespace, name, body.verified);
       return c.json(metadata);
+    } catch (err) {
+      if (err instanceof RegistryError) {
+        return c.json(
+          { error: { code: err.code, message: err.message } },
+          err.status as 400 | 404 | 409 | 500,
+        );
+      }
+      throw err;
+    }
+  });
+
+  // Delete — auth required, namespace owner only
+  router.delete("/agents/:namespace/:name", authMiddleware, async (c) => {
+    const { namespace, name } = c.req.param();
+    const user = getUser(c);
+
+    if (namespace !== user.namespace) {
+      return c.json(
+        {
+          error: {
+            code: "FORBIDDEN",
+            message: `You don't have permission to delete agents in namespace '${namespace}'`,
+          },
+        },
+        403,
+      );
+    }
+
+    try {
+      await service.deleteAgent(namespace, name);
+      return c.body(null, 204);
     } catch (err) {
       if (err instanceof RegistryError) {
         return c.json(

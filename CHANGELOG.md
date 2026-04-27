@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.6.0] - 2026-04-27
+
+### Added
+- **Version notes at push** — `skrun push -m "retry logic"` (or `--message`) attaches a note to each version, displayed in the dashboard like git commit messages. Max 500 characters, plain text.
+- **GitHub OAuth login** — users sign in with GitHub, their username becomes their namespace. Set `GITHUB_CLIENT_ID` + `GITHUB_CLIENT_SECRET` to enable.
+- **API keys** — `sk_live_*` keys for programmatic access. Create via `POST /api/keys` or the dashboard Settings page. Keys are shown once at creation, stored as SHA-256 hashes.
+- **Multi-tenant namespaces** — push/verify/delete restricted to namespace owner (GitHub username). Running an agent stays public.
+- **Operator Dashboard** at `/dashboard` — agents, runs, stats with sparklines, integrated playground with SSE streaming, API key management. Light/dark theme.
+- **Persistent local storage** — SQLite by default (file-based, zero config). Agents, runs, and keys survive restarts. Optional Supabase for production.
+- **Agent deletion** — `DELETE /api/agents/:namespace/:name` (namespace owner only) + dashboard button.
+- **Stats & runs API** — `GET /api/stats`, `GET /api/agents/:ns/:name/stats`, `GET /api/runs`, `GET /api/runs/:id`.
+- **Dashboard agent import** — scan and one-click import agents from a directory set by `SKRUN_AGENTS_DIR`.
+- **Model tracked per run** — the LLM used (`provider/name`) appears in run detail and the runs list.
+- **Version config snapshot** — the parsed `agent.yaml` is stored with each version and exposed in the versions API. Powers the dashboard playground forms and metadata display.
+- **New documentation** — [Concepts](docs/concepts.md), [Getting Started](docs/getting-started.md) (with dashboard screenshots), [Self-hosting](docs/self-hosting.md).
+- **Eight new demo agents** under [`agents/`](agents/) — each produces a real downloadable artifact (PDF, XLSX, PPTX, ZIP, CSV, MD) and runs without any secondary API key. Covers OSS workflows (changelog, ADR), team operations (meeting recap, security rules), and analyst deliverables (executive report, slide deck, expense report, knowledge base).
+
+### Changed
+- README restructured around 3 use cases + animated dashboard hero GIF.
+- Supabase schema updated — self-hosters on older versions run migrations `002_add_model_to_runs.sql` and `003_add_version_notes.sql` from `packages/api/src/db/migrations/`.
+- **Renamed `examples/` → `agents/`** to align with the `SKRUN_AGENTS_DIR` convention used by the dashboard import flow. `.env.example` now sets `SKRUN_AGENTS_DIR=./agents` as the dev default. If you have local scripts or bookmarks pointing at `examples/<demo>`, update them to `agents/<demo>`.
+
+### Fixed
+- Dashboard "Failed runs" delta showed `NaN%` instead of `0%` when no failed runs existed.
+- Dashboard import dialog no longer expands beyond the viewport when the configured directory contains many agents — content area now scrolls.
+
+### Breaking
+- On shared instances with OAuth configured, `dev-token` is no longer accepted — use OAuth or an API key.
+
 ## [0.5.0] - 2026-04-17
 
 ### Breaking

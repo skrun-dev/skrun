@@ -4,26 +4,25 @@ import {
   LLMRouter,
   LocalAdapter,
   McpToolProvider,
-  MemoryStateStore,
   ScriptToolProvider,
   TTLCache,
   ToolRegistry,
   createLogger,
   redactSecretsFromString,
 } from "@skrun-dev/runtime";
-import type { FileInfo, RunEvent, StateStore } from "@skrun-dev/runtime";
+import type { FileInfo, RunEvent } from "@skrun-dev/runtime";
 import { parseAgentYaml } from "@skrun-dev/schema";
+import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { bundleCache, getOrExtract } from "../cache/bundle-cache.js";
 import { registerOutput } from "../cache/output-cache.js";
-import { authMiddleware } from "../middleware/auth.js";
+import type { DbAdapter } from "../db/adapter.js";
+import { getUser } from "../middleware/auth.js";
 import type { RegistryService } from "../services/registry.js";
 import { RegistryError } from "../services/registry.js";
 import { formatSSEEvent } from "../utils/sse.js";
 
-// Shared state store (persists across runs for the same server instance)
-const globalStateStore = new MemoryStateStore();
 const globalRouter = new LLMRouter();
 const logger = createLogger("api");
 
@@ -57,10 +56,14 @@ function hintForBadVersion(raw: string): string {
   return "";
 }
 
-export function createRunRoutes(service: RegistryService, stateStore?: StateStore): Hono {
+export function createRunRoutes(
+  service: RegistryService,
+  db: DbAdapter,
+  authMiddleware: MiddlewareHandler,
+): Hono {
   const router = new Hono();
-  const state = stateStore ?? globalStateStore;
 
+  // POST /run is public — any authenticated user can run any agent (marketplace model)
   router.post("/agents/:namespace/:name/run", authMiddleware, async (c) => {
     const { namespace, name } = c.req.param();
     const runId = randomUUID();
@@ -301,6 +304,10 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
       );
     }
 
+    const modelStr = agentConfig.model
+      ? `${agentConfig.model.provider}/${agentConfig.model.name}`
+      : null;
+
     // 5b. Merge environment override (if provided)
     if (environmentOverride) {
       const { networking: netOverride, ...flatOverride } = environmentOverride as {
@@ -390,13 +397,40 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
       await toolRegistry.addProvider(mcpProvider);
     }
 
-    // 8. Create adapter with request-scoped child logger
+    // 8. Track run in database
+    const caller = getUser(c);
+    let agentId: string | null = null;
+    try {
+      const agentRecord = await db.getAgent(namespace, name);
+      agentId = agentRecord?.id ?? null;
+    } catch {
+      // Non-critical — run tracking proceeds with null agent_id
+    }
+    await db.createRun({
+      id: runId,
+      agent_id: agentId,
+      agent_version: `${namespace}/${name}@${resolvedVersion}`,
+      model: modelStr,
+      user_id: caller.id,
+      status: "running",
+      input,
+    });
+
+    // 9. Create adapter with request-scoped child logger
     const log = logger.child({
       run_id: runId,
       agent: `${namespace}/${name}`,
       agent_version: resolvedVersion,
     });
-    const adapter = new LocalAdapter(globalRouter, toolRegistry, state, log);
+    const adapter = new LocalAdapter(
+      globalRouter,
+      toolRegistry,
+      {
+        getState: (name) => db.getState(name),
+        setState: (name, s) => db.setState(name, s),
+      },
+      log,
+    );
     const runRequest = {
       agentConfig,
       skillContent,
@@ -435,8 +469,28 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
       return streamSSE(c, async (stream) => {
         try {
           for await (const event of adapter.executeStream(runRequest)) {
-            if (event.type === "run_complete" && runRequest.outputDir) {
-              registerOutput(runId, runRequest.outputDir);
+            if (event.type === "run_complete") {
+              if (runRequest.outputDir) {
+                registerOutput(runId, runRequest.outputDir);
+              }
+              // Update run in DB (same as sync mode)
+              db.updateRun(runId, {
+                status: "completed",
+                output: event.output,
+                usage_prompt_tokens: event.usage.prompt_tokens,
+                usage_completion_tokens: event.usage.completion_tokens,
+                usage_total_tokens: event.usage.total_tokens,
+                usage_estimated_cost: event.cost?.estimated ?? 0,
+                duration_ms: event.duration_ms,
+                files: event.files?.map((f) => ({ name: f.name, size: f.size })) ?? null,
+                completed_at: new Date().toISOString(),
+              }).catch(() => {});
+            } else if (event.type === "run_error") {
+              db.updateRun(runId, {
+                status: "failed",
+                error: event.error.message,
+                completed_at: new Date().toISOString(),
+              }).catch(() => {});
             }
             const sanitized = sanitizeEvent(event);
             const { event: eventName, data } = formatSSEEvent(sanitized);
@@ -509,6 +563,22 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
         registerOutput(runId, runRequest.outputDir);
       }
 
+      // Track completed run
+      await db
+        .updateRun(runId, {
+          status: result.status === "completed" ? "completed" : "failed",
+          output: result.output,
+          error: result.error ?? null,
+          usage_prompt_tokens: result.usage.promptTokens,
+          usage_completion_tokens: result.usage.completionTokens,
+          usage_total_tokens: result.usage.totalTokens,
+          usage_estimated_cost: result.usage.estimatedCost,
+          duration_ms: result.durationMs,
+          files: result.files?.map((f) => ({ name: f.name, size: f.size })) ?? null,
+          completed_at: new Date().toISOString(),
+        })
+        .catch(() => {}); // Non-critical — don't fail the response
+
       return c.json({
         run_id: result.runId,
         status: result.status,
@@ -534,6 +604,15 @@ export function createRunRoutes(service: RegistryService, stateStore?: StateStor
       if (callerKeys) {
         errorMessage = redactSecretsFromString(errorMessage, Object.values(callerKeys));
       }
+
+      // Track failed run
+      await db
+        .updateRun(runId, {
+          status: "failed",
+          error: errorMessage,
+          completed_at: new Date().toISOString(),
+        })
+        .catch(() => {}); // Non-critical
 
       return c.json(
         {

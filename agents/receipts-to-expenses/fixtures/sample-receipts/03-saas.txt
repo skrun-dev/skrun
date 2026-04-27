@@ -1,0 +1,18 @@
+Linear — Subscription Receipt
+
+Linear, Inc.
+500 7th Avenue, New York, NY 10018, USA
+
+Bill to: Sophie Martin (sophie@studio-martin.fr)
+
+Description: Linear Standard Plan — monthly subscription
+Period: April 2026
+
+Subtotal:               USD 16.00
+Tax (VAT FR — 20%):     USD  3.20
+                        ----------
+Total charged:          USD 19.20
+
+Charged on April 1, 2026 to Visa **** 4521
+Invoice #L-INV-2026-04-9871
+Issued: 2026-04-01

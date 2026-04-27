@@ -1,7 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LLMProvider } from "../llm/providers/types.js";
 import { LLMRouter } from "../llm/router.js";
-import { MemoryStateStore } from "../state/memory.js";
+import type { StateCallbacks } from "./local.js";
+
+function createMemoryState(): StateCallbacks {
+  const store = new Map<string, Record<string, unknown>>();
+  return {
+    getState: async (name) => {
+      const s = store.get(name);
+      return s ? structuredClone(s) : null;
+    },
+    setState: async (name, s) => {
+      store.set(name, structuredClone(s));
+    },
+  };
+}
 import { ToolRegistry } from "../tools/registry.js";
 import type { RunEvent, RunRequest } from "../types.js";
 import { LocalAdapter } from "./local.js";
@@ -63,12 +76,12 @@ async function collectEvents(gen: AsyncGenerator<RunEvent>): Promise<RunEvent[]>
 describe("LocalAdapter.executeStream", () => {
   let router: LLMRouter;
   let tools: ToolRegistry;
-  let state: MemoryStateStore;
+  let state: StateCallbacks;
 
   beforeEach(() => {
     router = new LLMRouter();
     tools = new ToolRegistry();
-    state = new MemoryStateStore();
+    state = createMemoryState();
   });
 
   it("yields run_start as first event", async () => {
@@ -214,7 +227,7 @@ describe("LocalAdapter.execute (backward compat)", () => {
   it("returns RunResult from executeStream events", async () => {
     const router = new LLMRouter();
     const tools = new ToolRegistry();
-    const state = new MemoryStateStore();
+    const state = createMemoryState();
 
     router.registerProvider("mock", createMockProvider('{"result": "test"}'));
     const adapter = new LocalAdapter(router, tools, state);
@@ -231,7 +244,7 @@ describe("LocalAdapter.execute (backward compat)", () => {
   it("returns failed result on error", async () => {
     const router = new LLMRouter();
     const tools = new ToolRegistry();
-    const state = new MemoryStateStore();
+    const state = createMemoryState();
 
     router.registerProvider("mock", createFailingProvider());
     const adapter = new LocalAdapter(router, tools, state);

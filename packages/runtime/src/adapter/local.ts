@@ -8,10 +8,14 @@ import { createLogger } from "../logger.js";
 import type { Logger } from "../logger.js";
 import { checkCost } from "../security/cost-checker.js";
 import { parseTimeout, withTimeout } from "../security/timeout.js";
-import type { StateStore } from "../state/store.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { RunEvent, RunRequest, RunResult } from "../types.js";
 import type { RuntimeAdapter } from "./adapter.js";
+
+export interface StateCallbacks {
+  getState: (agentName: string) => Promise<Record<string, unknown> | null>;
+  setState: (agentName: string, state: Record<string, unknown>) => Promise<void>;
+}
 
 export class LocalAdapter implements RuntimeAdapter {
   private logger: Logger;
@@ -19,7 +23,7 @@ export class LocalAdapter implements RuntimeAdapter {
   constructor(
     private router: LLMRouter,
     private tools: ToolRegistry,
-    private state: StateStore,
+    private stateCallbacks?: StateCallbacks,
     logger?: Logger,
   ) {
     this.logger = logger ?? createLogger("runtime");
@@ -143,8 +147,8 @@ export class LocalAdapter implements RuntimeAdapter {
     const events: RunEvent[] = [];
 
     let currentState: Record<string, unknown> | null = null;
-    if (config.state.type === "kv") {
-      currentState = await this.state.get(config.name);
+    if (config.state.type === "kv" && this.stateCallbacks) {
+      currentState = await this.stateCallbacks.getState(config.name);
     }
 
     const systemPrompt =
@@ -254,8 +258,8 @@ export class LocalAdapter implements RuntimeAdapter {
       output = { result: llmResponse.content };
     }
 
-    if (config.state.type === "kv" && newState) {
-      await this.state.set(config.name, newState);
+    if (config.state.type === "kv" && newState && this.stateCallbacks) {
+      await this.stateCallbacks.setState(config.name, newState);
     }
 
     const costResult = checkCost(llmResponse.estimatedCost, config.environment.max_cost);

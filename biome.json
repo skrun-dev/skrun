@@ -21,6 +21,12 @@
         "noUnusedImports": "error",
         "noUnusedVariables": "warn"
       },
+      "a11y": {
+        "noSvgWithoutTitle": "off"
+      },
+      "suspicious": {
+        "noArrayIndexKey": "off"
+      },
       "style": {
         "noNonNullAssertion": "warn",
         "useConst": "error"

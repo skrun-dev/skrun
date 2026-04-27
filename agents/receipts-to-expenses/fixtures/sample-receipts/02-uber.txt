@@ -1,0 +1,19 @@
+Uber Receipt — Trip from Charles de Gaulle Airport to 12 Rue Lafayette
+
+Date: April 16, 2026
+Pickup: 09:14 — Charles de Gaulle Airport, Terminal 2E
+Dropoff: 09:58 — 12 Rue Lafayette, 75009 Paris
+Driver: Mehdi K.
+Vehicle: Renault Megane (Uber Comfort)
+
+Trip fare:                EUR 47.20
+Booking fee:              EUR  2.00
+Tolls:                    EUR  4.30
+Tip:                      EUR  3.00
+                          ---------
+Total charged:            EUR 56.50
+
+Payment method: Visa ending in 4521
+Charged at: April 16, 2026, 09:58 CEST
+
+Receipt ID: r-26041609581234

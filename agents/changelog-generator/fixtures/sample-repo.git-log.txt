@@ -1,0 +1,35 @@
+# Sample git log dump for changelog-generator demo.
+# Format: <hash>|<subject>|<author>|<date>
+# Lines starting with # are ignored.
+# Mock commits across two release ranges (v1.4.0 → v1.5.0 → HEAD).
+
+a1b2c3d|feat(api): add SSE streaming endpoint POST /run|Alice Chen|2026-04-22
+e4f5g6h|feat(sdk): TypeScript SDK with run/stream/list helpers|Bob Martinez|2026-04-21
+i7j8k9l|fix(runtime): memory leak in MCP connection cache|Carol Park|2026-04-20
+m1n2o3p|fix: handle null tool_args from provider response|Dani Wong|2026-04-19
+q4r5s6t|feat: caller-provided LLM keys via X-LLM-API-Key header|Alice Chen|2026-04-18
+u7v8w9x|chore: bump zod to 4.0.1|Bob Martinez|2026-04-17
+y1z2a3b|docs: getting-started guide with dashboard screenshots|Carol Park|2026-04-16
+c4d5e6f|feat(cli): skrun login --token for dev mode|Dani Wong|2026-04-15
+g7h8i9j|fix(api): correct error code for malformed caller-keys header|Alice Chen|2026-04-14
+k1l2m3n|refactor: split RuntimeAdapter into Local + Flyio interfaces|Bob Martinez|2026-04-13
+o4p5q6r|feat(api)!: drop legacy POST /run-sync, use POST /run with stream:false|Carol Park|2026-04-12
+s7t8u9v|docs: add agent.yaml reference|Dani Wong|2026-04-11
+w1x2y3z|chore(deps): bump hono to 4.6.0|Alice Chen|2026-04-10
+a5b6c7d|fix(cli): skrun build no longer follows symlinks outside agent dir|Bob Martinez|2026-04-09
+e8f9g0h|test(runtime): add coverage for fallback retry logic|Carol Park|2026-04-08
+i2j3k4l|feat: agent verification flag (verified=true blocks unverified scripts)|Dani Wong|2026-04-07
+m5n6o7p|fix: race condition in concurrent push to same agent|Alice Chen|2026-04-06
+q8r9s0t|chore: simplify CHANGELOG release-notes phrasing|Bob Martinez|2026-04-05
+u3v4w5x|docs: self-hosting OAuth + Caddy reverse proxy guide|Carol Park|2026-04-04
+y6z7a8b|feat(dashboard): runs page with sparklines and cost summary|Dani Wong|2026-04-03
+c9d0e1f|fix(dashboard): NaN% delta when no failed runs in window|Alice Chen|2026-04-02
+g2h3i4j|feat: API keys (sk_live_*) with SHA-256 storage|Bob Martinez|2026-04-01
+k5l6m7n|test: SDK integration tests for stream() backpressure|Carol Park|2026-03-31
+o8p9q0r|chore: tighten biome.json to ban console.* in src/|Dani Wong|2026-03-30
+s1t2u3v|feat: structured logs v1 with pino + LOG_LEVEL|Alice Chen|2026-03-29
+w4x5y6z|docs: API reference — annotated POST /run examples|Bob Martinez|2026-03-28
+a7b8c9d|fix: agent_version echo missing on async webhook responses|Carol Park|2026-03-27
+e0f1g2h|feat: agent version pinning via body.version|Dani Wong|2026-03-26
+i3j4k5l|refactor: collapse duplicate validateAgentName helpers|Alice Chen|2026-03-25
+m6n7o8p|chore: gitignore .skrun/ and bundle/cache files|Bob Martinez|2026-03-24

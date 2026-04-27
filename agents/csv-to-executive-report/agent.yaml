@@ -1,0 +1,136 @@
+name: dev/csv-to-executive-report
+version: 0.1.0
+
+model:
+  provider: google
+  name: gemini-2.5-flash
+  fallback:
+    provider: google
+    name: gemini-2.5-flash-lite
+
+tools:
+  - name: analyze_csv
+    description: Load a CSV via pandas and return a summary - columns and dtypes, row count, numeric column statistics (min/max/mean/sum), and the first 10 rows. The LLM uses this to decide what to chart and what to narrate.
+    input_schema:
+      type: object
+      properties:
+        csv_path:
+          type: string
+          description: Path to the CSV file to analyze.
+      required: [csv_path]
+      additionalProperties: false
+  - name: render_pdf
+    description: Render a multi-page executive PDF report. Title page, narrative sections, embedded matplotlib charts, and a summary stats table. Output is a single report.pdf in the run output directory.
+    input_schema:
+      type: object
+      properties:
+        report_title:
+          type: string
+        period:
+          type: string
+          description: Period label (e.g., "Q2 2026", "April 2026").
+        narrative_sections:
+          type: array
+          description: Ordered narrative blocks. Each block is a paragraph of plain prose.
+          items:
+            type: object
+            properties:
+              heading:
+                type: string
+              body:
+                type: string
+            required: [heading, body]
+            additionalProperties: false
+        charts:
+          type: array
+          description: Charts to render via matplotlib, then embed in the PDF.
+          items:
+            type: object
+            properties:
+              title:
+                type: string
+              chart_type:
+                type: string
+                description: One of - bar, line, pie.
+              x_labels:
+                type: array
+                items:
+                  type: string
+              series:
+                type: array
+                description: Each item is { name (legend label), values (numbers parallel to x_labels) }. Pie charts use the first series only.
+                items:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    values:
+                      type: array
+                      items:
+                        type: number
+                  required: [name, values]
+                  additionalProperties: false
+            required: [title, chart_type, x_labels, series]
+            additionalProperties: false
+        summary_table:
+          type: array
+          description: Final-page summary table. Each item is a [label, value] tuple.
+          items:
+            type: array
+            items:
+              type: string
+            minItems: 2
+            maxItems: 2
+      required: [report_title, period, narrative_sections, charts]
+      additionalProperties: false
+
+inputs:
+  - name: csv_path
+    type: string
+    required: true
+    description: Path to a local CSV (e.g., "./fixtures/sample-revenue.csv" or any path the runtime can read).
+  - name: report_title
+    type: string
+    required: true
+    description: Title for the report (e.g., "Q2 Revenue Report").
+  - name: period
+    type: string
+    required: true
+    description: Reporting period label (e.g., "Q2 2026" or "April 1-30, 2026").
+
+outputs:
+  - name: report_path
+    type: string
+    description: Path to the generated report.pdf in the run output directory.
+  - name: page_count
+    type: number
+    description: Number of pages in the rendered PDF.
+  - name: summary
+    type: string
+    description: One-paragraph executive summary (echoes the report's opening narrative).
+
+environment:
+  networking:
+    allowed_hosts: []
+  filesystem: read-write
+  secrets: []
+  timeout: 240s
+  sandbox: strict
+
+state:
+  type: none
+  ttl: 30d
+
+tests:
+  - name: revenue-csv-multi-page
+    input:
+      csv_path: ./fixtures/sample-revenue.csv
+      report_title: Q2 Revenue Report
+      period: Q2 2026
+    assert: output.page_count >= 2
+  - name: small-csv-runs
+    input:
+      csv_path: ./fixtures/sample-revenue.csv
+      report_title: Mini report
+      period: Last 30 days
+    assert: output.page_count >= 1

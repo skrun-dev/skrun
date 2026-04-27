@@ -1,0 +1,97 @@
+name: dev/semgrep-rule-creator
+version: 0.1.0
+
+model:
+  provider: google
+  name: gemini-2.5-flash
+  fallback:
+    provider: google
+    name: gemini-2.5-flash-lite
+
+tools:
+  - name: write_artifact
+    description: Write a file (rule.yml, tests.md, or README.md) to the run's output directory. Used to emit the 3 artifacts that make up a Semgrep rule bundle.
+    input_schema:
+      type: object
+      properties:
+        filename:
+          type: string
+          description: Output filename. Must be one of - rule.yml, tests.md, README.md.
+        content:
+          type: string
+          description: Full file content.
+      required: [filename, content]
+      additionalProperties: false
+
+inputs:
+  - name: cve_description
+    type: string
+    required: true
+    description: Description of the security issue/pattern the rule should detect. Free-form text — can quote a CVE writeup, a security advisory, or a plain English description.
+  - name: bad_code_example
+    type: string
+    required: true
+    description: Concrete code snippet exhibiting the vulnerability. The rule must match this snippet.
+  - name: good_code_example
+    type: string
+    required: false
+    description: Optional safe alternative (preferred way to write the same logic). The rule must NOT match this snippet. If omitted, the LLM will infer one.
+  - name: language
+    type: string
+    required: true
+    description: Target language. Must be one of - javascript, typescript, python, go, java, ruby.
+  - name: rule_id_prefix
+    type: string
+    required: false
+    description: Prefix for the generated rule id (default - "custom"). Final id becomes "<prefix>.<short-slug>" (e.g., "custom.ssrf-via-user-input").
+
+outputs:
+  - name: rule_id
+    type: string
+    description: The full Semgrep rule id (e.g., "custom.ssrf-via-user-input").
+  - name: severity
+    type: string
+    description: Chosen severity (WARNING / ERROR / INFO).
+  - name: cwe
+    type: string
+    description: CWE identifier the rule maps to (e.g., "CWE-918"), or empty if not applicable.
+  - name: summary
+    type: string
+    description: One-line summary of the rule (suitable for a security index page).
+
+environment:
+  networking:
+    allowed_hosts: []
+  filesystem: read-write
+  secrets: []
+  timeout: 120s
+  sandbox: strict
+
+state:
+  type: none
+  ttl: 30d
+
+tests:
+  - name: ssrf-pattern-typescript
+    input:
+      cve_description: |
+        Server-Side Request Forgery — when user-controlled input is passed
+        directly to a server-side HTTP fetch without allowlist validation,
+        an attacker can target internal services (cloud metadata, private
+        networks) from the server's network position.
+      bad_code_example: |
+        const url = req.body.target;
+        const res = await fetch(url);
+        return res.text();
+      language: typescript
+    assert: output.severity == "ERROR" || output.severity == "WARNING"
+  - name: sql-injection-python
+    input:
+      cve_description: |
+        SQL injection via raw string concatenation in a query — when user
+        input is interpolated into the SQL string instead of bound as a
+        parameter, an attacker can break out of the intended query.
+      bad_code_example: |
+        cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
+      language: python
+    assert: output.cwe == "CWE-89"

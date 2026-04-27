@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-surface: 255 255 255;
+    --color-surface-alt: 249 250 251;
+    --color-border: 229 231 235;
+    --color-text-primary: 17 24 39;
+    --color-text-secondary: 107 114 128;
+  }
+
+  .dark {
+    --color-surface: 3 7 18;
+    --color-surface-alt: 17 24 39;
+    --color-border: 55 65 81;
+    --color-text-primary: 243 244 246;
+    --color-text-secondary: 156 163 175;
+  }
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

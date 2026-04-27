@@ -12,6 +12,8 @@ export type {
   AgentMetadata,
   PaginatedList,
   PushResult,
+  PushOptions,
+  AgentVersionInfo,
   RunEvent,
   RunStartEvent,
   ToolCallEvent,

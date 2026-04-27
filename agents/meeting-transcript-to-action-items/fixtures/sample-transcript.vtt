@@ -1,0 +1,50 @@
+WEBVTT
+
+00:00:02.000 --> 00:00:08.500
+Alice: Hey everyone, thanks for joining. Quick agenda — we have the migration
+status, the mobile app cut, and the freelance contractor onboarding.
+
+00:00:09.000 --> 00:00:18.000
+Alice: First, the OAuth migration. I'm behind on the design doc.
+I'll have it ready by end of day Friday so we can review next Monday.
+
+00:00:19.000 --> 00:00:27.000
+Bob: That works. Related — I finished the database backup verification we
+talked about last week. Restored a test snapshot on Saturday, all clean.
+
+00:00:28.000 --> 00:00:35.000
+Alice: Great, we can close that one. What about the index rebuild?
+
+00:00:36.000 --> 00:00:42.000
+Bob: Still in flight — I want to wait until after the migration cut. So next
+sprint, not this one.
+
+00:00:43.000 --> 00:00:55.000
+Carol: Mobile app — we're cutting v3.2 on Thursday. I'll send the release
+notes draft to marketing on Wednesday. One open question: do we include the
+new live activity feature or hold it for v3.3?
+
+00:00:56.000 --> 00:01:05.000
+Alice: Let's defer that decision. I want one more day of QA before committing.
+Carol, can you bring it back tomorrow with the test report?
+
+00:01:06.000 --> 00:01:11.000
+Carol: Yep, will do. I'll have the QA report by tomorrow morning.
+
+00:01:12.000 --> 00:01:22.000
+Alice: Last item — the freelance contractor for the marketing site. We agreed
+to bring on Sophie for the landing page rebuild. Bob, can you set up her
+GitHub access by Friday?
+
+00:01:23.000 --> 00:01:28.000
+Bob: Sure. I'll also need her to sign the standard NDA before commits.
+
+00:01:29.000 --> 00:01:34.000
+Alice: Good catch. I'll handle the NDA paperwork — sending it today.
+
+00:01:35.000 --> 00:01:42.000
+Alice: Decisions for today: OAuth design doc by Friday, mobile v3.2 cut Thursday,
+Sophie onboarded by Friday with NDA signed.
+
+00:01:43.000 --> 00:01:46.500
+Alice: Anything else? No? Great, talk tomorrow. Thanks all.

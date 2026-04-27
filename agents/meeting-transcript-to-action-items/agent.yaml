@@ -1,0 +1,87 @@
+name: dev/meeting-transcript-to-action-items
+version: 0.1.0
+
+model:
+  provider: google
+  name: gemini-2.5-flash
+  fallback:
+    provider: google
+    name: gemini-2.5-flash-lite
+
+tools:
+  - name: write_artifact
+    description: Write a Markdown or CSV file to the run's output directory. Use to write `actions.csv` and `recap.md`.
+    input_schema:
+      type: object
+      properties:
+        filename:
+          type: string
+          description: Output filename. Must end in .md or .csv.
+        content:
+          type: string
+          description: Full file content.
+      required: [filename, content]
+      additionalProperties: false
+
+inputs:
+  - name: transcript
+    type: string
+    required: true
+    description: Meeting transcript. Plain text or WebVTT format. Speaker labels and timestamps are helpful but not required.
+  - name: meeting_date
+    type: string
+    required: true
+    description: Meeting date in ISO format (YYYY-MM-DD).
+  - name: meeting_title
+    type: string
+    required: false
+    description: Short meeting title (e.g., "Sprint planning"). Defaults to "Meeting".
+  - name: attendees
+    type: array
+    required: false
+    description: List of attendee names. Helps the LLM resolve speaker labels in the transcript.
+
+outputs:
+  - name: actions_added_count
+    type: number
+    description: Number of new action items extracted from this transcript.
+  - name: actions_resolved_count
+    type: number
+    description: Number of previously-open actions detected as completed in this meeting.
+  - name: actions_open_count
+    type: number
+    description: Total open actions after this run (carryover + new − resolved).
+  - name: summary
+    type: string
+    description: One-paragraph recap suitable for pasting into Slack.
+
+environment:
+  networking:
+    allowed_hosts: []
+  filesystem: read-write
+  secrets: []
+  timeout: 180s
+  sandbox: strict
+
+state:
+  type: kv
+  ttl: 90d
+
+tests:
+  - name: extract-actions-from-transcript
+    input:
+      transcript: |
+        Alice: Quick update — we're behind on the OAuth migration. I need to write the design doc by Friday.
+        Bob: I can take the database backup verification — should be done Monday.
+        Carol: We agreed last week that we'd skip Redis caching for v1. Let's confirm that's still the call.
+        Alice: Yes, confirmed. No Redis in v1.
+        Bob: One open question — do we deprecate the legacy /run-sync endpoint now or wait for v2?
+        Alice: Let's defer. I'll bring it back next week with data on usage.
+      meeting_date: "2026-04-22"
+      meeting_title: Engineering sync
+    assert: output.actions_added_count >= 2
+  - name: empty-transcript-graceful
+    input:
+      transcript: "Meeting started. Quick check-in. No actions today. Adjourned."
+      meeting_date: "2026-04-23"
+    assert: output.actions_added_count >= 0

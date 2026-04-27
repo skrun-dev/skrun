@@ -1,0 +1,110 @@
+name: dev/adr-writer
+version: 0.1.0
+
+model:
+  provider: google
+  name: gemini-2.5-flash
+  fallback:
+    provider: google
+    name: gemini-2.5-flash-lite
+
+tools:
+  - name: list_adrs
+    description: Scan a directory for existing ADR files (`NNNN-*.md`). Returns each ADR's number, slug, title (parsed from H1), and status (parsed from front-matter or first Status line). Used to compute the next ADR number and to surface candidates for cross-linking.
+    input_schema:
+      type: object
+      properties:
+        adrs_dir:
+          type: string
+          description: Path to a directory containing existing ADRs. May be empty or non-existent (returns empty list).
+      required: [adrs_dir]
+      additionalProperties: false
+  - name: write_artifact
+    description: Write a Markdown file to the run's output directory. Use to write the new ADR file (filename like `NNNN-<slug>.md`).
+    input_schema:
+      type: object
+      properties:
+        filename:
+          type: string
+          description: Output filename. Must end in .md. Convention is `NNNN-<slug>.md` where NNNN is zero-padded 4-digit (e.g., `0042-switch-to-dynamodb.md`).
+        content:
+          type: string
+          description: Full ADR content as Markdown.
+      required: [filename, content]
+      additionalProperties: false
+
+inputs:
+  - name: adrs_dir
+    type: string
+    required: true
+    description: Path to a directory containing existing ADRs (e.g., "./fixtures/existing-adrs" or "/repo/docs/adr"). Used to find the next ADR number and existing decisions to cross-link.
+  - name: title
+    type: string
+    required: true
+    description: Short decision title (e.g., "Switch from Postgres to DynamoDB").
+  - name: context
+    type: string
+    required: true
+    description: The situation/problem driving this decision. What forces are at play?
+  - name: options
+    type: string
+    required: true
+    description: The alternatives considered. Free-form Markdown — bullet list, paragraph, or table.
+  - name: decision
+    type: string
+    required: true
+    description: The chosen option and the rationale.
+  - name: consequences
+    type: string
+    required: false
+    description: What becomes easier, harder, or risky as a result. Optional — the LLM will infer if omitted.
+  - name: status
+    type: string
+    required: false
+    description: ADR status. Defaults to "proposed". Valid values per ADR convention - proposed, accepted, deprecated, superseded.
+
+outputs:
+  - name: adr_number
+    type: number
+    description: The numeric ID assigned to the new ADR (one greater than the highest existing number, or 1 if none).
+  - name: adr_filename
+    type: string
+    description: The filename written to the output directory (e.g., "0042-switch-to-dynamodb.md").
+  - name: summary
+    type: string
+    description: One-line summary of the decision suitable for an ADR index page.
+
+environment:
+  networking:
+    allowed_hosts: []
+  filesystem: read-write
+  secrets: []
+  timeout: 120s
+  sandbox: strict
+
+state:
+  type: none
+  ttl: 30d
+
+tests:
+  - name: first-adr-empty-dir
+    input:
+      adrs_dir: ./fixtures/empty-adrs
+      title: Use TypeScript strict mode
+      context: We have flaky type errors slipping into production.
+      options: |
+        - Stay on loose mode and add per-file pragmas.
+        - Enable strict mode globally.
+      decision: Enable strict mode globally for all packages.
+    assert: output.adr_number == 1
+  - name: numbered-after-existing
+    input:
+      adrs_dir: ./fixtures/existing-adrs
+      title: Switch state store from Memory to SQLite for local dev
+      context: Memory state store loses data on registry restart, breaking local test workflows.
+      options: |
+        - Keep Memory and document the limitation.
+        - Switch to SQLite via better-sqlite3 (synchronous, file-based).
+        - Use libsql/Turso for both local and cloud.
+      decision: SQLite via better-sqlite3 for local dev; Supabase for production.
+    assert: output.adr_number == 3

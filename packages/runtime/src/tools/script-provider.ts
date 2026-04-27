@@ -75,7 +75,11 @@ export class ScriptToolProvider implements ToolProvider {
       };
     }
 
-    const command = script.ext === ".py" ? "python3" : "node";
+    // On Windows, the standard alias is `python` (not `python3` — that name is
+    // a Microsoft Store stub by default and fails). Linux/macOS canonically use
+    // `python3` to disambiguate from system python2 still present on some distros.
+    const pythonCmd = process.platform === "win32" ? "python" : "python3";
+    const command = script.ext === ".py" ? pythonCmd : "node";
     const cmdArgs = script.ext === ".py" ? [script.path] : ["--input-type=module", script.path];
 
     return new Promise((resolve) => {

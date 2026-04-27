@@ -1,0 +1,98 @@
+name: dev/changelog-generator
+version: 0.1.0
+
+model:
+  provider: google
+  name: gemini-2.5-flash
+  fallback:
+    provider: google
+    name: gemini-2.5-flash-lite
+
+tools:
+  - name: git_log
+    description: Read commits from a local git repository OR from a captured `.txt` dump file. Returns parsed commits with hash, subject, author, date.
+    input_schema:
+      type: object
+      properties:
+        source:
+          type: string
+          description: Path to a local git repo directory OR path to a .txt file with one `hash|subject|author|date` line per commit.
+        from_ref:
+          type: string
+          description: Lower-bound tag or ref (e.g., "v1.4.0"). Optional. Ignored when source is a .txt dump.
+        to_ref:
+          type: string
+          description: Upper-bound tag or ref. Defaults to "HEAD".
+        limit:
+          type: number
+          description: Maximum commits to return. Defaults to 200.
+      required: [source]
+      additionalProperties: false
+  - name: write_artifact
+    description: Write a Markdown file to the run's output directory. Use to produce the final CHANGELOG.md and release-notes.md.
+    input_schema:
+      type: object
+      properties:
+        filename:
+          type: string
+          description: Output filename. Must end in .md (e.g., "CHANGELOG.md", "release-notes.md").
+        content:
+          type: string
+          description: Full file content as Markdown.
+      required: [filename, content]
+      additionalProperties: false
+
+inputs:
+  - name: repo_path
+    type: string
+    required: true
+    description: Path to a local git repo (e.g., "/home/me/my-project") OR a captured `.git-log.txt` dump (e.g., "./fixtures/sample-repo.git-log.txt").
+  - name: from_tag
+    type: string
+    required: false
+    description: Lower-bound tag/ref for the changelog range (e.g., "v1.4.0"). Ignored when repo_path is a .txt dump.
+  - name: to_tag
+    type: string
+    required: false
+    description: Upper-bound tag/ref. Defaults to "HEAD".
+  - name: project_name
+    type: string
+    required: false
+    description: Project name to use in headings. Defaults to "Project".
+
+outputs:
+  - name: summary
+    type: string
+    description: One-paragraph narrative description of the release (suitable for a blog post or Slack message).
+  - name: commit_count
+    type: number
+    description: Total commits processed.
+  - name: groups
+    type: object
+    description: Counts per Conventional Commit type (feat, fix, chore, docs, refactor, breaking, other).
+
+environment:
+  networking:
+    allowed_hosts: []
+  filesystem: read-write
+  secrets: []
+  timeout: 180s
+  sandbox: strict
+
+state:
+  type: none
+  ttl: 30d
+
+tests:
+  - name: fixture-quick-try
+    input:
+      repo_path: ./fixtures/sample-repo.git-log.txt
+      project_name: skrun
+    assert: output.commit_count > 0
+  - name: fixture-with-range
+    input:
+      repo_path: ./fixtures/sample-repo.git-log.txt
+      from_tag: v1.0.0
+      to_tag: HEAD
+      project_name: skrun
+    assert: output.commit_count >= 1

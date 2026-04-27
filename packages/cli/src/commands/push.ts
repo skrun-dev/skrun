@@ -11,8 +11,12 @@ export function registerPushCommand(program: Command): void {
   program
     .command("push")
     .description("Push agent to the Skrun registry")
-    .action(async () => {
+    .option("-m, --message <text>", "Attach a note to this version (max 500 chars, plain text)")
+    .action(async (opts: { message?: string }) => {
       const dir = process.cwd();
+
+      // Validate --message client-side before doing any work
+      const notes = validateNotes(opts.message);
 
       // Check auth
       const token = getToken();
@@ -47,13 +51,37 @@ export function registerPushCommand(program: Command): void {
       // Push
       const client = new RegistryClient(getRegistryUrl(), token);
       try {
-        await client.push(bundle, namespace, slug, version);
+        const { warning } = await client.push(bundle, namespace, slug, version, {
+          notes: notes ?? undefined,
+        });
         format.success(
           `Pushed ${namespace}/${slug}@${version} (${(bundle.length / 1024).toFixed(1)} KB)`,
         );
+        if (warning === "notes-unsupported" && notes) {
+          format.warn(
+            "Server doesn't support version notes — your message was not stored. Upgrade the registry to use `-m`.",
+          );
+        }
       } catch (err) {
         format.error(err instanceof Error ? err.message : String(err));
         process.exit(1);
       }
     });
+}
+
+/**
+ * Validate --message input client-side. Returns null (empty/missing) or the validated string.
+ * Exits the process on invalid input.
+ */
+function validateNotes(raw: string | undefined): string | null {
+  if (raw === undefined || raw === "") return null;
+  if (raw.length > 500) {
+    format.error(`--message too long (${raw.length} chars). Max 500.`);
+    process.exit(1);
+  }
+  if (raw.includes("\x00")) {
+    format.error("--message must not contain null bytes.");
+    process.exit(1);
+  }
+  return raw;
 }

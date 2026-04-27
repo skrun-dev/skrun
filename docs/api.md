@@ -8,13 +8,128 @@ Base URL: `http://localhost:4000` (local dev) or your deployed instance.
 
 ## Authentication
 
-All endpoints except health, list, metadata, and versions require a Bearer token:
+Skrun has three authentication modes. The mode is **auto-detected** based on whether GitHub OAuth env vars are configured.
 
 ```
-Authorization: Bearer <token>
+No GITHUB_CLIENT_ID set  →  dev-token mode (local dev)
+GITHUB_CLIENT_ID set     →  OAuth mode (self-hosted or cloud)
 ```
 
-In dev mode, use `dev-token` (grants access to the `dev` namespace).
+### Mode 1: Local dev (default)
+
+When no OAuth env vars are configured, Skrun accepts a simple `dev-token`. This is the default for local development — zero setup.
+
+```bash
+# Login
+skrun login --token dev-token
+
+# Push an agent (namespace = "dev")
+skrun build && skrun push
+
+# Call your agent
+curl -X POST http://localhost:4000/api/agents/dev/my-agent/run \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"input": {"query": "hello"}}'
+```
+
+All agents live in the `dev` namespace. There is no user isolation — this mode is for a single developer working locally.
+
+### Mode 2: Self-hosted (GitHub OAuth)
+
+When you deploy Skrun on a shared server, enable real authentication:
+
+**Step 1.** Create a GitHub OAuth App at [github.com/settings/developers](https://github.com/settings/developers):
+- **Homepage URL**: `https://your-domain.com` (or `http://localhost:4000` for testing)
+- **Authorization callback URL**: `https://your-domain.com/auth/github/callback`
+
+**Step 2.** Configure two env vars on the server:
+```bash
+GITHUB_CLIENT_ID=your_client_id
+GITHUB_CLIENT_SECRET=your_client_secret
+```
+
+**Step 3.** Start the server. OAuth is now active. `dev-token` is rejected.
+
+**Step 4.** Users sign in:
+1. Visit `/login` in a browser — click "Sign in with GitHub"
+2. After GitHub authorization, a session cookie is set
+3. The user's GitHub username becomes their namespace (e.g., `alice`)
+
+**Step 5.** Create API keys for programmatic access (CLI, CI/CD):
+```bash
+# From a browser session — create a key
+curl -X POST https://your-domain.com/api/keys \
+  -H "Cookie: skrun_session=<your-session-cookie>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "CI deploy"}'
+# Response: {"id": "...", "key": "sk_live_a1b2c3d4...", ...}
+# ⚠️ The key is shown ONCE — save it now.
+
+# Use the API key everywhere
+skrun login --token sk_live_a1b2c3d4...
+skrun build && skrun push   # pushes to alice/my-agent
+
+curl -X POST https://your-domain.com/api/agents/alice/my-agent/run \
+  -H "Authorization: Bearer sk_live_a1b2c3d4..." \
+  -H "Content-Type: application/json" \
+  -d '{"input": {"query": "hello"}}'
+```
+
+### Mode 3: Cloud (skrun.sh) — coming soon
+
+Same as self-hosted, but hosted by us. Sign in at `skrun.sh/login`. Comes with billing and a marketplace.
+
+### Transitioning from local to production
+
+When moving from local dev to a self-hosted or cloud instance:
+
+| | Local dev | Production |
+|--|-----------|------------|
+| Auth | `Bearer dev-token` | `Bearer sk_live_...` (API key) or session cookie |
+| Namespace | `dev` | Your GitHub username (e.g., `alice`) |
+| Agent names | `dev/my-agent` | `alice/my-agent` |
+| `agent.yaml` name | `name: dev/my-agent` | `name: alice/my-agent` |
+
+Update the `name` field in your `agent.yaml` to match your production namespace, then `skrun build && skrun push`.
+
+### Namespaces
+
+Your namespace equals your GitHub username (lowercase). Permissions:
+
+| Action | Who can do it |
+|--------|---------------|
+| Push, verify, delete | Namespace owner only (`alice` can only push to `alice/*`) |
+| Run any agent | Anyone (marketplace model — `bob` can run `alice/my-agent`) |
+| List agents | Anyone (public listing) |
+
+### API keys
+
+API keys use the `sk_live_` prefix followed by 32 hex characters. They are stored as SHA-256 hashes — the raw key is shown only once at creation time.
+
+Default scopes: `agent:push`, `agent:run`, `agent:verify` (all granted).
+
+### Auth middleware priority
+
+When a request arrives, the middleware checks authentication in this order:
+
+1. **Session cookie** (`skrun_session`) — from browser login
+2. **API key** (`Bearer sk_live_...`) — from `POST /api/keys`
+3. **Dev-token** (`Bearer dev-token`) — only if OAuth is NOT configured
+4. Otherwise — `401 Unauthorized`
+
+### Auth endpoints
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/login` | GET | No | Login page (HTML) — shows "Sign in with GitHub" or dev-token instructions |
+| `/auth/github` | GET | No | Redirects to GitHub OAuth (returns 404 if OAuth not configured) |
+| `/auth/github/callback` | GET | No | Handles OAuth callback — creates user, sets session cookie |
+| `/auth/logout` | POST | No | Clears session cookie, redirects to `/` |
+| `/api/me` | GET | Yes | Returns current user info (`id`, `username`, `namespace`, `email`, `plan`) |
+| `/api/keys` | POST | Yes | Create API key — returns `sk_live_...` key (shown once) |
+| `/api/keys` | GET | Yes | List your API keys (prefix only, never the full key) |
+| `/api/keys/:id` | DELETE | Yes | Revoke an API key — takes effect immediately |
 
 ---
 
@@ -250,6 +365,7 @@ Upload an agent bundle to the registry.
 |--------|----------|-------------|
 | `Authorization` | Yes | `Bearer <token>` |
 | `Content-Type` | Yes | `application/octet-stream` |
+| `X-Skrun-Version-Notes` | No | Optional note attached to this version. Percent-encoded UTF-8, max 500 characters, plain text only. Used to describe what changed (like a commit message). The CLI `-m` / `--message` flag sets this header. |
 
 **Body**: raw `.agent` bundle (tar.gz created by `skrun build`).
 
@@ -268,6 +384,21 @@ Upload an agent bundle to the registry.
   "latest_version": "1.0.0"
 }
 ```
+
+**Response headers**
+
+| Header | When |
+|--------|------|
+| `X-Skrun-Warning: notes-unsupported` | Set only if the client sent `X-Skrun-Version-Notes` but the server version doesn't support it. The push still succeeds but the note is not stored. |
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| `400` | `MISSING_VERSION` | `version` query param is missing |
+| `400` | `INVALID_NOTES` | `X-Skrun-Version-Notes` is > 500 chars, contains null bytes, or is malformed percent-encoding |
+| `403` | `FORBIDDEN` | Pushing outside your namespace |
+| `409` | `VERSION_EXISTS` | Same version already pushed (bump `version` in `agent.yaml`) |
 
 **Rate limit**: 10 requests per minute per IP.
 
@@ -377,21 +508,256 @@ Set or unset the `verified` flag on an agent. Only verified agents can execute s
 
 ---
 
+### Delete an agent
+
+```
+DELETE /api/agents/:namespace/:name
+```
+
+Permanently delete an agent along with all its versions. Requires authentication and namespace ownership (only the owner can delete).
+
+**Headers**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Authorization` | Yes | `Bearer <token>` |
+
+**Response** `200`
+
+```json
+{ "success": true }
+```
+
+**Errors**: `401` if no auth, `403` if not namespace owner, `404` if agent not found.
+
+Note: past runs for the deleted agent remain in the database with `agent_id: null` (soft reference via `ON DELETE SET NULL`).
+
+---
+
 ### Agent versions
 
 ```
 GET /api/agents/:namespace/:name/versions
 ```
 
-List all published versions of an agent. Public, no auth required.
+List all published versions of an agent with full metadata. Public, no auth required.
 
 **Response** `200`
 
 ```json
 {
-  "versions": ["1.0.0", "1.1.0"]
+  "versions": [
+    {
+      "version": "1.0.0",
+      "size": 4523,
+      "pushed_at": "2026-04-20T10:00:00Z",
+      "notes": "Initial release — Claude primary with GPT-4 fallback",
+      "config_snapshot": {
+        "model": {
+          "provider": "anthropic",
+          "name": "claude-sonnet-4-20250514",
+          "fallback": { "provider": "openai", "name": "gpt-4o" }
+        },
+        "tools": [{ "name": "search", "description": "Search the web" }],
+        "mcp_servers": [],
+        "inputs": [{ "name": "query", "type": "string", "description": "Search query" }],
+        "environment": { "timeout": "120s" }
+      }
+    },
+    {
+      "version": "1.1.0",
+      "size": 4600,
+      "pushed_at": "2026-04-22T11:30:00Z",
+      "notes": null,
+      "config_snapshot": { "...": "..." }
+    }
+  ]
 }
 ```
+
+**Response fields** (per version object):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | string | Semver version string |
+| `size` | number | Bundle size in bytes |
+| `pushed_at` | string (ISO 8601) | When this version was pushed |
+| `notes` | string \| null | Optional note attached at push time via `-m` / `--message` (≤ 500 chars, plain text). `null` if not provided. |
+| `config_snapshot` | object | Parsed `agent.yaml` from the bundle at push time (model, tools, mcp_servers, inputs, environment, etc.). Used by the dashboard to display metadata and generate playground forms. |
+
+The `config_snapshot` is populated at push time by parsing the `agent.yaml` from the uploaded bundle. It includes model configuration (with fallback), tools, MCP servers, inputs schema, and environment settings.
+
+---
+
+### Dashboard stats
+
+```
+GET /api/stats
+```
+
+Returns aggregated metrics for the dashboard home page.
+
+**Response** `200`
+```json
+{
+  "agents_count": 3,
+  "runs_today": 12,
+  "tokens_today": 45200,
+  "failed_today": 1,
+  "runs_yesterday": 10,
+  "tokens_yesterday": 38000,
+  "failed_yesterday": 0,
+  "daily_runs": [5, 8, 10, 12, 9, 10, 12],
+  "daily_tokens": [20000, 32000, 38000, 45200, 35000, 38000, 45200],
+  "daily_failed": [0, 1, 0, 0, 1, 0, 1]
+}
+```
+
+- `runs_yesterday` / `tokens_yesterday` / `failed_yesterday`: previous UTC day totals (for delta computation).
+- `failed_today` / `failed_yesterday`: failed run counts for today and yesterday.
+- `daily_runs` / `daily_tokens` / `daily_failed`: 7-element arrays (oldest first, index 6 = today). Zero-padded if fewer than 7 days of data.
+- "Today" = current UTC day (00:00 to now).
+
+---
+
+### Agent stats
+
+```
+GET /api/agents/:namespace/:name/stats?days=N
+```
+
+Returns aggregated metrics for a specific agent over the requested period.
+
+**Query params**
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `days` | `7` | Number of days to aggregate (1-30) |
+
+**Response** `200`
+```json
+{
+  "runs": 42,
+  "tokens": 84000,
+  "failed": 2,
+  "avg_duration_ms": 1200,
+  "prev_runs": 38,
+  "prev_tokens": 72000,
+  "prev_failed": 1,
+  "prev_avg_duration_ms": 1350,
+  "daily_runs": [4, 6, 8, 5, 7, 6, 6],
+  "daily_tokens": [8000, 12000, 16000, 10000, 14000, 12000, 12000],
+  "daily_failed": [0, 1, 0, 0, 1, 0, 0],
+  "daily_avg_duration_ms": [1100, 1300, 1200, 1150, 1250, 1200, 1200]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `runs` | number | Total runs in the requested period |
+| `tokens` | number | Total tokens consumed in the period |
+| `failed` | number | Failed runs in the period |
+| `avg_duration_ms` | number | Average run duration in milliseconds |
+| `prev_runs` | number | Total runs in the previous equivalent period (for delta computation) |
+| `prev_tokens` | number | Total tokens in the previous period |
+| `prev_failed` | number | Failed runs in the previous period |
+| `prev_avg_duration_ms` | number | Average duration in the previous period |
+| `daily_runs` | number[] | Runs per day (oldest first, last element = today). Zero-padded if fewer days of data. |
+| `daily_tokens` | number[] | Tokens per day (same ordering) |
+| `daily_failed` | number[] | Failed runs per day (same ordering) |
+| `daily_avg_duration_ms` | number[] | Average duration per day (same ordering) |
+
+---
+
+### List runs
+
+```
+GET /api/runs
+```
+
+Returns recent runs, sorted by most recent first.
+
+**Query parameters**
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `agent_id` | string | — | Filter by agent ID |
+| `status` | string | — | Filter by status: `running`, `completed`, `failed`, `cancelled` |
+| `limit` | number | 50 | Max results (capped at 100) |
+
+**Response** `200` — array of run objects.
+
+---
+
+### Get run detail
+
+```
+GET /api/runs/:id
+```
+
+Returns a single run by ID with all fields.
+
+**Response** `200`
+```json
+{
+  "id": "run-abc-123",
+  "agent_id": "...",
+  "agent_version": "dev/my-agent@1.0.0",
+  "status": "completed",
+  "model": "anthropic/claude-sonnet-4-20250514",
+  "input": { "topic": "AI" },
+  "output": { "result": "..." },
+  "error": null,
+  "usage_prompt_tokens": 200,
+  "usage_completion_tokens": 300,
+  "usage_total_tokens": 500,
+  "usage_estimated_cost": 0.0025,
+  "duration_ms": 1500,
+  "created_at": "2026-04-21T10:00:00Z",
+  "completed_at": "2026-04-21T10:00:01Z"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `model` | string \| null | LLM model used for this run, formatted as `"provider/model-name"` (e.g., `"anthropic/claude-sonnet-4-20250514"`). Populated at POST /run time. `null` if not applicable. |
+
+**Response** `404` — run not found.
+
+---
+
+### Scan agent directory
+
+```
+GET /api/agents/scan
+```
+
+Lists agent directories found in the path configured by `SKRUN_AGENTS_DIR` env var.
+
+**Response** `200`
+```json
+{
+  "configured": true,
+  "agents": [
+    { "name": "email-drafter", "path": "/path/to/agents/email-drafter", "registered": false },
+    { "name": "code-review", "path": "/path/to/agents/code-review", "registered": true }
+  ]
+}
+```
+
+If `SKRUN_AGENTS_DIR` is not set: `{ "configured": false, "agents": [] }`.
+
+---
+
+### Push scanned agent
+
+```
+POST /api/agents/scan/:name/push
+```
+
+Reads agent files from the scanned directory and registers the agent under the authenticated user's namespace. Version is read from `agent.yaml`.
+
+**Response** `200` — agent metadata (same format as push).
 
 ---
 
@@ -427,6 +793,9 @@ All errors follow the same format:
 | `BUNDLE_CORRUPT` | 500 | Failed to extract agent bundle |
 | `MISSING_CONFIG` | 500 | agent.yaml not found in bundle |
 | `INVALID_CONFIG` | 500 | agent.yaml is invalid |
+| `INVALID_NOTES` | 400 | Version notes header is invalid (>500 chars, contains null bytes, or malformed percent-encoding) |
+| `EXECUTION_FAILED` | 502 | Agent execution failed |
+| `TIMEOUT` | 504 | Agent execution timed out |
 
 ### Warning codes
 
@@ -435,8 +804,51 @@ Warnings appear in the `warnings` array of POST /run responses (not errors — t
 | Code | Description |
 |------|-------------|
 | `agent_not_verified_scripts_disabled` | Agent has `scripts/` but is not verified — scripts were skipped. Agent ran with LLM + MCP only. |
-| `TIMEOUT` | 504 | Agent execution timed out |
-| `EXECUTION_FAILED` | 502 | Agent execution failed |
+
+### Response warning headers
+
+Some endpoints may emit informational warning headers to signal non-fatal issues:
+
+| Header | When |
+|--------|------|
+| `X-Skrun-Warning: notes-unsupported` | The client sent `X-Skrun-Version-Notes` but the server doesn't support the feature (version skew). The push still succeeds but the note is not stored. Upgrade the registry to use `-m`. |
+
+## Database configuration
+
+Skrun uses a pluggable database backend via the `DbAdapter` interface. Three implementations ship:
+
+**Local dev (default)**: no configuration needed. Skrun uses SQLite (`SqliteDb`) — a file-based database (`skrun.db` in the working directory) that persists agents, runs, API keys, and users across restarts. Zero external dependencies.
+
+**Production (Supabase)**: set `DATABASE_URL` + `SUPABASE_KEY` env vars. Skrun auto-detects and uses `SupabaseDb` (PostgreSQL).
+
+**Tests**: `MemoryDb` — in-memory, fast, isolated (used by the unit test suite, not in production paths).
+
+```bash
+# Default — SQLite (file-based, persistent)
+pnpm dev:registry
+
+# Production — Supabase
+DATABASE_URL=https://your-project.supabase.co SUPABASE_KEY=your-service-key pnpm dev:registry
+```
+
+**Selection logic**: if `DATABASE_URL` is set, Skrun uses `SupabaseDb`. Otherwise, it uses `SqliteDb`.
+
+**SQL schema (Supabase)**: migration files live in `packages/api/src/db/migrations/`. Run them in order against your Supabase project via the SQL editor or CLI:
+
+- `001_initial_schema.sql` — initial schema (7 tables: users, api_keys, agents, agent_versions, agent_state, environments, runs). Fresh installs: run this only.
+- `002_add_model_to_runs.sql` — backfills the `runs.model` column added in v0.5.0. Run if upgrading from pre-v0.5.0.
+- `003_add_version_notes.sql` — backfills `agent_versions.notes` added in v0.6.0. Run if upgrading from pre-v0.6.0.
+
+**SQLite migrations**: handled automatically at startup — the `SqliteDb` constructor detects missing columns via `PRAGMA table_info` and runs idempotent `ALTER TABLE` statements. Nothing to do manually.
+
+**Run tracking**: every `POST /run` call creates a record in the `runs` table with agent, version, model, status, input/output, token usage, cost, duration, and files. This data powers the dashboard and is available for your own billing or observability pipeline.
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `DATABASE_URL` | — | Supabase project URL. If not set, SQLite is used. |
+| `SUPABASE_KEY` | — | Supabase service role key (for server-side access). Required when `DATABASE_URL` is set. |
+
+---
 
 ## Structured logging
 

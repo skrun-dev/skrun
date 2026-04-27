@@ -6,6 +6,7 @@ import type {
   AsyncRunResult,
   ListOptions,
   PaginatedList,
+  PushOptions,
   PushResult,
   RunEvent,
   RunOptions,
@@ -95,16 +96,28 @@ export class SkrunClient {
     agent: AgentIdentifier,
     bundle: Buffer | Uint8Array,
     version: string,
+    options?: PushOptions,
   ): Promise<PushResult> {
     const { namespace, name } = this.parseAgent(agent);
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.token}`,
+      "Content-Type": "application/octet-stream",
+    };
+    if (options?.message !== undefined && options.message !== "") {
+      if (options.message.length > 500) {
+        throw new Error(`Push message too long (${options.message.length} chars). Max 500.`);
+      }
+      if (options.message.includes("\x00")) {
+        throw new Error("Push message must not contain null bytes.");
+      }
+      // Percent-encode so non-ASCII characters transit safely in the HTTP header.
+      headers["X-Skrun-Version-Notes"] = encodeURIComponent(options.message);
+    }
     const res = await this.request(
       `/api/agents/${namespace}/${name}/push?version=${encodeURIComponent(version)}`,
       {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "Content-Type": "application/octet-stream",
-        },
+        headers,
         body: bundle,
       },
     );

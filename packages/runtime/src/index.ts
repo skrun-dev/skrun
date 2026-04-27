@@ -33,9 +33,8 @@ export { ToolRegistry } from "./tools/registry.js";
 export { ScriptToolProvider } from "./tools/script-provider.js";
 export { McpToolProvider } from "./tools/mcp-provider.js";
 
-// State
-export type { StateStore } from "./state/store.js";
-export { MemoryStateStore } from "./state/memory.js";
+// State callbacks
+export type { StateCallbacks } from "./adapter/local.js";
 
 // Security
 export { withTimeout, parseTimeout, TimeoutError } from "./security/timeout.js";

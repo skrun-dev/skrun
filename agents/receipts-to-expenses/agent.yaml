@@ -1,0 +1,145 @@
+name: dev/receipts-to-expenses
+version: 0.1.0
+
+# NOTE: this demo accepts receipts as already-extracted text (one .txt per receipt).
+# A future version will accept image inputs directly once Skrun's runtime supports
+# multimodal inputs (planned). Until then, an upstream OCR step (Tesseract, vision
+# LLM via separate API, etc.) is the user's responsibility.
+
+model:
+  provider: google
+  name: gemini-2.5-flash
+  fallback:
+    provider: google
+    name: gemini-2.5-flash-lite
+
+tools:
+  - name: read_receipts
+    description: Scan a directory for `.txt` receipt files. Each file contains the extracted text content of one receipt (vendor, date, amount, etc.). Returns the list of files with their text content for the LLM to parse field-by-field.
+    input_schema:
+      type: object
+      properties:
+        receipts_dir:
+          type: string
+          description: Path to a directory containing one .txt file per receipt. Subdirectories are scanned recursively.
+      required: [receipts_dir]
+      additionalProperties: false
+  - name: read_bank_statement
+    description: Optional — read a CSV bank statement for fuzzy reconciliation. Returns the rows. Skip if user did not pass `bank_statement_csv`.
+    input_schema:
+      type: object
+      properties:
+        csv_path:
+          type: string
+      required: [csv_path]
+      additionalProperties: false
+  - name: build_workbook
+    description: Render the structured line items + reconciliation results to expenses.xlsx (multi-sheet) and monthly.pdf (1-2 page summary).
+    input_schema:
+      type: object
+      properties:
+        line_items:
+          type: array
+          description: Each parsed receipt as a structured record.
+          items:
+            type: object
+            properties:
+              source_file:
+                type: string
+              vendor:
+                type: string
+              date:
+                type: string
+              amount:
+                type: number
+              currency:
+                type: string
+              category:
+                type: string
+              note:
+                type: string
+              matched_bank_row:
+                type: string
+                description: Optional - bank statement row label if reconciled.
+            required: [source_file, vendor, date, amount, currency, category]
+            additionalProperties: false
+        category_totals:
+          type: array
+          description: Pre-computed sum per category (LLM does the math).
+          items:
+            type: object
+            properties:
+              category:
+                type: string
+              total:
+                type: number
+              count:
+                type: integer
+            required: [category, total, count]
+            additionalProperties: false
+        report_title:
+          type: string
+        period:
+          type: string
+          description: e.g., "April 2026" or "Q2 2026".
+        unmatched_count:
+          type: integer
+          description: Number of bank rows not matched to any receipt (0 if no bank statement was provided).
+      required: [line_items, category_totals, report_title, period]
+      additionalProperties: false
+
+inputs:
+  - name: receipts_dir
+    type: string
+    required: true
+    description: Path to a directory of .txt files, one per receipt. Each file is the OCR-extracted text of a receipt (vendor name, date, amount, line items as plain text).
+  - name: bank_statement_csv
+    type: string
+    required: false
+    description: Optional path to a bank statement CSV for fuzzy reconciliation by amount + date.
+  - name: month
+    type: string
+    required: true
+    description: Reporting period (e.g., "2026-04" or "April 2026").
+
+outputs:
+  - name: expenses_xlsx_path
+    type: string
+    description: Path to the multi-sheet Excel workbook in the run output directory.
+  - name: summary_pdf_path
+    type: string
+    description: Path to the summary PDF in the run output directory.
+  - name: total_amount
+    type: number
+    description: Sum of all parsed receipt amounts.
+  - name: receipt_count
+    type: number
+    description: Number of receipts parsed.
+  - name: unmatched_count
+    type: number
+    description: Bank statement rows not matched to any receipt (0 if no bank statement input).
+
+environment:
+  networking:
+    allowed_hosts: []
+  filesystem: read-write
+  secrets: []
+  timeout: 240s
+  sandbox: strict
+
+state:
+  type: none
+  ttl: 30d
+
+tests:
+  - name: process-3-receipts
+    input:
+      receipts_dir: ./fixtures/sample-receipts
+      month: "2026-04"
+    assert: output.receipt_count >= 3
+  - name: with-bank-reconciliation
+    input:
+      receipts_dir: ./fixtures/sample-receipts
+      bank_statement_csv: ./fixtures/sample-bank.csv
+      month: "2026-04"
+    assert: output.unmatched_count >= 0

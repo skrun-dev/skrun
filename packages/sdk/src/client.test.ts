@@ -130,6 +130,58 @@ describe("SkrunClient", () => {
     expect(init.headers["Content-Type"]).toBe("application/octet-stream");
   });
 
+  it("push() with message sends X-Skrun-Version-Notes header (percent-encoded)", async () => {
+    globalThis.fetch = mockFetchJson({ name: "agent", namespace: "dev", latest_version: "1.0.0" });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+
+    await client.push("dev/agent", Buffer.from("bundle"), "1.0.0", {
+      message: "🚀 Amélioration",
+    });
+
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init.headers["X-Skrun-Version-Notes"]).toBe(encodeURIComponent("🚀 Amélioration"));
+  });
+
+  it("push() without message omits the header", async () => {
+    globalThis.fetch = mockFetchJson({ name: "agent", namespace: "dev", latest_version: "1.0.0" });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+
+    await client.push("dev/agent", Buffer.from("bundle"), "1.0.0");
+
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init.headers["X-Skrun-Version-Notes"]).toBeUndefined();
+  });
+
+  it("push() with empty message omits the header", async () => {
+    globalThis.fetch = mockFetchJson({ name: "agent", namespace: "dev", latest_version: "1.0.0" });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+
+    await client.push("dev/agent", Buffer.from("bundle"), "1.0.0", { message: "" });
+
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init.headers["X-Skrun-Version-Notes"]).toBeUndefined();
+  });
+
+  it("push() with message > 500 chars throws before network call", async () => {
+    globalThis.fetch = mockFetchJson({});
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+
+    await expect(
+      client.push("dev/agent", Buffer.from("bundle"), "1.0.0", { message: "a".repeat(501) }),
+    ).rejects.toThrow(/too long/);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("push() with null byte in message throws before network call", async () => {
+    globalThis.fetch = mockFetchJson({});
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+
+    await expect(
+      client.push("dev/agent", Buffer.from("bundle"), "1.0.0", { message: "hello\x00" }),
+    ).rejects.toThrow(/null bytes/);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
   it("pull() returns Buffer", async () => {
     globalThis.fetch = vi
       .fn()

@@ -7,6 +7,7 @@ const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 
 interface SkrunConfig {
   token?: string;
+  username?: string;
   registry_url?: string;
 }
 
@@ -35,10 +36,15 @@ export function getToken(): string | null {
   return readConfig().token ?? null;
 }
 
-export function saveToken(token: string): void {
+export function saveToken(token: string, username?: string): void {
   const config = readConfig();
   config.token = token;
+  if (username) config.username = username;
   writeConfig(config);
+}
+
+export function getUsername(): string | null {
+  return readConfig().username ?? null;
 }
 
 export function removeToken(): void {

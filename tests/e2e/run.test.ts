@@ -107,6 +107,14 @@ describe("E2E: POST /run", () => {
     expect(res.status).not.toBe(400);
   });
 
+  // --- Playground redirect (inline playground removed in #13b-3) ---
+
+  it("GET /playground redirects to /dashboard/agents", async () => {
+    const res = await ctx.app.request("/playground", { redirect: "manual" });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("Location")).toContain("/dashboard/agents");
+  });
+
   // --- Files API (#12) ---
 
   it("GET /runs/:run_id/files/:filename → 404 for unknown run", async () => {

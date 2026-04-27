@@ -11,8 +11,23 @@ export function registerDeployCommand(program: Command): void {
   program
     .command("deploy")
     .description("Deploy agent to Skrun — validate, build, push, get live URL")
-    .action(async () => {
+    .option("-m, --message <text>", "Attach a note to this version (max 500 chars, plain text)")
+    .action(async (opts: { message?: string }) => {
       const dir = process.cwd();
+
+      // Validate --message client-side
+      let notes: string | null = null;
+      if (opts.message !== undefined && opts.message !== "") {
+        if (opts.message.length > 500) {
+          format.error(`--message too long (${opts.message.length} chars). Max 500.`);
+          process.exit(1);
+        }
+        if (opts.message.includes("\x00")) {
+          format.error("--message must not contain null bytes.");
+          process.exit(1);
+        }
+        notes = opts.message;
+      }
 
       // 1. Check auth
       const token = getToken();
@@ -65,7 +80,14 @@ export function registerDeployCommand(program: Command): void {
       const client = new RegistryClient(registryUrl, token);
 
       try {
-        await client.push(bundle, namespace, slug, version);
+        const { warning } = await client.push(bundle, namespace, slug, version, {
+          notes: notes ?? undefined,
+        });
+        if (warning === "notes-unsupported" && notes) {
+          format.warn(
+            "Server doesn't support version notes — your message was not stored. Upgrade the registry to use `-m`.",
+          );
+        }
       } catch (err) {
         format.error(err instanceof Error ? err.message : String(err));
         process.exit(1);

@@ -218,4 +218,134 @@ describe("Registry Routes", () => {
     const body = await res.json();
     expect(body.versions).toHaveLength(2);
   });
+
+  // ── Version notes (#14c) ─────────────────────────────────────────
+
+  it("POST /push accepts X-Skrun-Version-Notes header", async () => {
+    const res = await app.request("/api/agents/dev/agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        ...authHeader,
+        "Content-Type": "application/octet-stream",
+        "X-Skrun-Version-Notes": encodeURIComponent("Initial release"),
+      },
+      body: bundle,
+    });
+    expect(res.status).toBe(200);
+
+    const versionsRes = await app.request("/api/agents/dev/agent/versions");
+    const { versions } = await versionsRes.json();
+    expect(versions[0].notes).toBe("Initial release");
+  });
+
+  it("POST /push without notes header stores null", async () => {
+    await pushAgent();
+    const versionsRes = await app.request("/api/agents/dev/test-agent/versions");
+    const { versions } = await versionsRes.json();
+    expect(versions[0].notes).toBeNull();
+  });
+
+  it("POST /push accepts notes containing emoji and non-ASCII (UTF-8 via percent-encoding)", async () => {
+    const note = "🚀 Amélioration 日本語";
+    const res = await app.request("/api/agents/dev/agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        ...authHeader,
+        "Content-Type": "application/octet-stream",
+        "X-Skrun-Version-Notes": encodeURIComponent(note),
+      },
+      body: bundle,
+    });
+    expect(res.status).toBe(200);
+    const versionsRes = await app.request("/api/agents/dev/agent/versions");
+    const { versions } = await versionsRes.json();
+    expect(versions[0].notes).toBe(note);
+  });
+
+  it("POST /push rejects notes longer than 500 chars with 400 INVALID_NOTES", async () => {
+    const tooLong = "a".repeat(501);
+    const res = await app.request("/api/agents/dev/agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        ...authHeader,
+        "Content-Type": "application/octet-stream",
+        "X-Skrun-Version-Notes": encodeURIComponent(tooLong),
+      },
+      body: bundle,
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe("INVALID_NOTES");
+  });
+
+  it("POST /push rejects notes containing null bytes with 400 INVALID_NOTES", async () => {
+    const withNull = "hello\x00world";
+    const res = await app.request("/api/agents/dev/agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        ...authHeader,
+        "Content-Type": "application/octet-stream",
+        "X-Skrun-Version-Notes": encodeURIComponent(withNull),
+      },
+      body: bundle,
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe("INVALID_NOTES");
+  });
+
+  it("POST /push with malformed percent-encoded notes returns 400 INVALID_NOTES", async () => {
+    const res = await app.request("/api/agents/dev/agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        ...authHeader,
+        "Content-Type": "application/octet-stream",
+        "X-Skrun-Version-Notes": "%GG",
+      },
+      body: bundle,
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe("INVALID_NOTES");
+  });
+
+  it("POST /push with empty notes header treats as null", async () => {
+    const res = await app.request("/api/agents/dev/agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        ...authHeader,
+        "Content-Type": "application/octet-stream",
+        "X-Skrun-Version-Notes": "",
+      },
+      body: bundle,
+    });
+    expect(res.status).toBe(200);
+    const versionsRes = await app.request("/api/agents/dev/agent/versions");
+    const { versions } = await versionsRes.json();
+    expect(versions[0].notes).toBeNull();
+  });
+
+  it("GET /versions returns notes field on every version", async () => {
+    await app.request("/api/agents/dev/agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        ...authHeader,
+        "Content-Type": "application/octet-stream",
+        "X-Skrun-Version-Notes": encodeURIComponent("v1 note"),
+      },
+      body: bundle,
+    });
+    await app.request("/api/agents/dev/agent/push?version=2.0.0", {
+      method: "POST",
+      headers: { ...authHeader, "Content-Type": "application/octet-stream" },
+      body: bundle,
+    });
+
+    const res = await app.request("/api/agents/dev/agent/versions");
+    const { versions } = await res.json();
+    expect(versions).toHaveLength(2);
+    // Versions sorted by pushed_at ascending
+    expect(versions[0].notes).toBe("v1 note");
+    expect(versions[1].notes).toBeNull();
+  });
 });
