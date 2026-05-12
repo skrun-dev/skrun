@@ -29,9 +29,11 @@ In Skrun, the skill is the brain of the agent. An [agent](#agent) wraps a skill 
 
 ## Bundle
 
-A **Bundle** is the packaged `.agent` archive produced by `skrun build`. It's a tar.gz containing `SKILL.md`, `agent.yaml`, optional `scripts/` and `references/`, and the parsed config snapshot. This is the artifact the registry stores — not your source directory.
+A **Bundle** is the packaged `.agent` archive produced by `skrun build`. It's a tar.gz containing `SKILL.md`, `agent.yaml`, optional `scripts/` and `references/`, the optional [script dependency manifest](#script-dependencies) (`package.json` / `requirements.txt` / `pyproject.toml`), and the parsed config snapshot. This is the artifact the registry stores — not your source directory.
 
 Bundles are immutable once pushed. Each [version](#version) is a distinct bundle. Callers don't interact with bundles directly — the runtime extracts them on demand when an agent is invoked.
+
+`skrun build` excludes dev-only directories from the tar: `node_modules/`, `venv/`, `.venv/`, `__pycache__/`, `.pytest_cache/`, `.git/`, `dist/`, `.env`. Only the manifest travels in the bundle; deps are resolved at runtime (see [Script dependencies](#script-dependencies)).
 
 **Where you see it**: `skrun build` output (`my-agent-1.0.0.agent` file), the registry's bundle storage, `GET /api/agents/<ns>/<name>/pull`.
 
@@ -54,6 +56,8 @@ A **Version** is an immutable semver-tagged snapshot of an agent's [bundle](#bun
 Each version carries its own `config_snapshot` (the parsed `agent.yaml` at push time) and an optional **note** — a short plain-text message (max 500 chars) attached via `skrun push -m "Added retry logic"`. Notes work like git commit messages: they describe what changed. They're visible in the dashboard next to each version and returned by `GET /api/agents/<ns>/<name>/versions`.
 
 Callers can pin a specific version at runtime via the `version` field in the POST /run body — useful for reproducible integrations that shouldn't silently track latest.
+
+Operators can remove a single bad version (broken bundle, wrong content) via [`DELETE /api/agents/:ns/:name/versions/:version`](api.md#delete-a-single-version) without removing the whole agent. Past runs referencing the deleted version stay readable.
 
 **Where you see it**: `agent.yaml` `version:` field, `skrun push -m "..."`, dashboard agent-detail Versions card, versions API response.
 
@@ -106,6 +110,60 @@ In local dev (`dev-token` mode), verification is bypassed — all scripts run by
 Skrun supports 3 MCP transports: **stdio** (local, typically via `npx` for npm-packaged servers), **Streamable HTTP** (new remote standard), and **SSE** (legacy remote). Declare MCP servers in `agent.yaml` under `mcp_servers:` — any MCP server that works with Claude Desktop works with Skrun.
 
 **Where you see it**: `agent.yaml` `mcp_servers:` section, [npm MCP servers](https://www.npmjs.com/search?q=mcp-server), the [official MCP servers repo](https://github.com/modelcontextprotocol/servers).
+
+---
+
+## Script dependencies
+
+When your `scripts/` import third-party libraries, declare them in a standard manifest at the bundle root: `package.json` (Node), `requirements.txt` (Python), or `pyproject.toml` (Python, PEP 621). The runtime detects the manifest, installs the dependencies on the **first** call, and caches them at `~/.skrun/deps/<sha256>/` so every subsequent call hits the cache and skips the install entirely.
+
+The hash is computed from the manifest's CONTENT only — same manifest text on two different machines produces the same hash. This means container build layers and shared NFS mounts can cache resolved deps across pushes of the same agent without re-downloading.
+
+Lockfiles are auto-detected and trigger reproducible installs: `pnpm-lock.yaml` / `yarn.lock` / `package-lock.json` for Node; `uv.lock` / `poetry.lock` for Python. Without a lockfile, the install resolves to the latest version satisfying each declared range and emits a "non-reproducible build" warning. **Add a lockfile to your bundle for stable, repeatable installs.**
+
+The runtime separates two networks: install-time (limited to public registries `registry.npmjs.org`, `pypi.org`, etc.) and runtime (governed by your `environment.networking.allowed_hosts`). Your scripts only see the runtime network — they cannot reach pypi.org once installed.
+
+**Where you see it**: bundle root (the manifest itself), `~/.skrun/deps/` on the runtime host, [`skrun cache list`](cli.md#skrun-cache-list) for inspection, [`skrun cache clear`](cli.md#skrun-cache-clear) to free disk. Full reference: [agent-yaml.md → Script dependencies](agent-yaml.md#script-dependencies).
+
+---
+
+## Tool choice
+
+By default the LLM decides whether and which tool to invoke for a given turn. This works well most of the time, but some models — Gemini Flash in particular — sometimes satisfy the output schema without calling the tool the agent author actually needed (e.g. returning markdown inline instead of writing a file via `write_artifact`). **Tool choice** is the declarative escape hatch: state in `agent.yaml` that the model **must** call a tool, the runtime translates that to the provider's native directive.
+
+Three forms cover the common cases:
+- **Top-level `tool_choice: required`** — any tool must fire before the response is final.
+- **Top-level `tool_choice: <tool-name>`** — that specific tool must fire.
+- **Per-tool `required: true`** — declarative invariant on a single tool (e.g. an audit-log tool that must always run, regardless of caller intent).
+
+The orthogonal `parallel_tools: bool` controls whether the model may emit multiple tool calls per turn. Set it to `false` to force at-most-one tool call per response.
+
+**Where you see it**: `agent.yaml` top-level (`tool_choice`, `parallel_tools`) and per-tool (`required`). Provider behavior — Anthropic, Gemini, OpenAI, xAI — and the soft-fallback rules for cases a provider doesn't natively support (subset-of-N) are detailed in [agent-yaml.md → Tool choice](agent-yaml.md#tool_choice-optional).
+
+---
+
+## Cost & caching
+
+LLM providers bill input tokens at a higher rate than cached tokens — typically 90% off on Anthropic, OpenAI GPT-5.x, and Gemini 2.5+; 50% off on Groq's openai/gpt-oss-* family. When the runtime wires the provider's caching primitive correctly, every repeat of a stable prefix (system prompt + tool definitions + reference documents) is served from cache and billed at the cheaper rate. Skrun does this automatically across 5 of the 6 first-class providers:
+
+- **Anthropic** — explicit `cache_control: { type: "ephemeral" }` injected on the last block of the `tools` array AND the last block of the `system` block, but ONLY when each prefix's own token count exceeds the model threshold (1k-4k tokens depending on the model). Default TTL is 5 minutes — cache survives idle periods of less than 5 min within the same workspace.
+- **OpenAI** (Chat Completions + Responses API) — passes a stable `prompt_cache_key` body field derived from `${agent.name}@${agent.version}+default`, hashed with SHA-256. Caching is automatic past 1024-token prefixes. Same agent + same version share the cache pool across runs.
+- **Google Gemini** (2.5+ and 3.x) — implicit caching is on by default; the runtime parses `cachedContentTokenCount` from responses for accurate cost-tracking. Explicit Cache API (with hourly storage fee) is intentionally not wired — runtime backlog item.
+- **xAI Grok** — sets `x-grok-conv-id` HTTP header on Chat Completions requests for sticky-routing, mirroring OpenAI's `prompt_cache_key` semantics.
+- **Groq** — implicit on the `openai/gpt-oss-*` family + `kimi-k2-instruct` only; Llama / Qwen / compound models do not yet expose caching.
+- **Mistral** — no native caching API as of May 2026; the runtime emits a structured `cache_skipped` log and proceeds without cache primitives.
+
+**Reading the discount in your runs**: every `POST /run` response includes optional `usage.cache_read_tokens` (tokens served from cache, billed at the cached-read rate) and `usage.cache_write_tokens` (Anthropic only — tokens written to cache at the 1.25× write surcharge). When fields are absent, no cache activity occurred. The `cost.estimated` field already accounts for the cached-rate billing — within ±5% of the provider's actual invoice.
+
+**Anthropic 5min vs 1h TTL break-even**: 5min TTL costs 1.25× input on writes + 0.10× on reads → break-even at ~2 reuses within 5 minutes. 1h TTL costs 2.0× write + 0.10× read → break-even at ~6-7 reuses within the hour. The runtime defaults to 5min — sufficient for most multi-turn agents and chained API calls. The 1h toggle is a runtime-backlog item for long-PDF workflows.
+
+**Cache invalidation triggers** (Anthropic explicit cache only — implicit providers re-detect prefix automatically): tool definitions change, image add / remove / reorder in messages, `tool_choice` value change, thinking-settings change, web-search or citations toggling, and any system prompt content change (even one character). Repeat calls with stable system + tools survive across iterations of the tool-loop without re-write.
+
+**Where you see it**: `usage.cache_read_tokens` + `usage.cache_write_tokens` in POST /run responses ([api.md](api.md#post-runs-execute-an-agent)), the SDK's typed `usage` object, the OpenAPI schema. The `cache` column in [agent-yaml.md → Models per provider](agent-yaml.md#model-required) marks per-model support. No agent.yaml configuration is required — caching is automatic for every supported model.
+
+### Tracking your savings
+
+Operators care about dollars, not tokens. The runtime snapshots a USD savings value at run completion: live as `cost.saved` on the `POST /run` response, persisted as `usage_cache_savings_usd` on the run record, and aggregated in `GET /api/stats` + `GET /api/agents/:ns/:name/stats`. The dashboard renders all three (home tile, run-detail Cost cell, agent-detail stat). Full field reference in [api.md](api.md#post-runs-execute-an-agent).
 
 ---
 

@@ -7,7 +7,7 @@ export const NetworkingConfigSchema = z.object({
 export type NetworkingConfig = z.infer<typeof NetworkingConfigSchema>;
 
 export const EnvironmentConfigSchema = z.object({
-  networking: NetworkingConfigSchema.default({}),
+  networking: NetworkingConfigSchema.prefault({}),
   filesystem: z.enum(["none", "read-only", "read-write"]).default("read-only"),
   secrets: z.array(z.string()).default([]),
   timeout: z

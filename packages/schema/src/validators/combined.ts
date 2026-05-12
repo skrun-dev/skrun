@@ -1,6 +1,7 @@
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ValidationIssue } from "../errors.js";
+import { detectManifest, hasNonStdlibImports } from "../manifests.js";
 import type { ParsedAgentYaml } from "../parsers/agent-yaml.js";
 import { parseAgentYaml } from "../parsers/agent-yaml.js";
 import type { ParsedAgentsMd } from "../parsers/agents-md.js";
@@ -135,6 +136,40 @@ export async function validateAgent(dir: string): Promise<ValidationResult> {
         code: "TOOLS_NOT_IN_SKILL",
         message: `agent.yaml declares tools [${extraTools.join(", ")}] not listed in SKILL.md allowed-tools`,
       });
+    }
+  }
+
+  // tool_choice referential integrity: if tool_choice is a custom value
+  // (not auto/required/none), it must match a declared tool name.
+  const toolChoice = agentConfig.config.tool_choice;
+  if (toolChoice && !["auto", "required", "none"].includes(toolChoice)) {
+    const declaredToolNames = agentConfig.config.tools.map((t) => t.name);
+    if (!declaredToolNames.includes(toolChoice)) {
+      errors.push({
+        code: "TOOL_CHOICE_REFERENCES_UNDECLARED_TOOL",
+        message: `agent.yaml tool_choice "${toolChoice}" references an undeclared tool. Available tools: [${declaredToolNames.join(", ") || "none"}].`,
+        file: "agent.yaml",
+      });
+    }
+  }
+
+  // Script dependency manifest warning: if scripts/ contains imports
+  // beyond the language stdlib but no manifest is present at the bundle root,
+  // the runtime cannot resolve those dependencies. Warn the agent author so
+  // they can add a manifest before deploying.
+  const scriptsDir = join(dir, "scripts");
+  if (await fileExists(scriptsDir)) {
+    const manifest = detectManifest(dir);
+    if (manifest.ecosystem === "none") {
+      const flagged =
+        hasNonStdlibImports(scriptsDir, "python") || hasNonStdlibImports(scriptsDir, "node");
+      if (flagged) {
+        warnings.push({
+          code: "SCRIPTS_NO_MANIFEST",
+          message:
+            "scripts/ contains non-stdlib imports but no manifest (package.json/requirements.txt/pyproject.toml) found at bundle root. Add a manifest to enable dependency resolution.",
+        });
+      }
     }
   }
 

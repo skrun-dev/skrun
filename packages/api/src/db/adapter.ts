@@ -12,7 +12,10 @@ export interface DbAdapter {
   listAgents(
     page: number,
     limit: number,
-  ): Promise<{ agents: (Agent & { run_count: number; token_count: number })[]; total: number }>;
+  ): Promise<{
+    agents: (Agent & { run_count: number; token_count: number; cost_total: number })[];
+    total: number;
+  }>;
   setVerified(namespace: string, name: string, verified: boolean): Promise<Agent | null>;
   deleteAgent(namespace: string, name: string): Promise<boolean>;
 
@@ -30,6 +33,7 @@ export interface DbAdapter {
   getVersions(agentId: string): Promise<AgentVersion[]>;
   getLatestVersion(agentId: string): Promise<AgentVersion | null>;
   getVersionByNumber(agentId: string, version: string): Promise<AgentVersion | null>;
+  deleteVersion(agentId: string, version: string): Promise<void>;
 
   // --- Agent State ---
   getState(agentName: string): Promise<Record<string, unknown> | null>;
@@ -88,6 +92,9 @@ export interface DbAdapter {
         | "usage_completion_tokens"
         | "usage_total_tokens"
         | "usage_estimated_cost"
+        | "usage_cache_read_tokens"
+        | "usage_cache_write_tokens"
+        | "usage_cache_savings_usd"
         | "duration_ms"
         | "files"
         | "completed_at"
@@ -103,7 +110,7 @@ export interface DbAdapter {
   }): Promise<Run[]>;
 
   // --- Stats ---
-  getStats(): Promise<{
+  getStats(opts?: { userId?: string }): Promise<{
     agents_count: number;
     runs_today: number;
     tokens_today: number;
@@ -114,6 +121,12 @@ export interface DbAdapter {
     daily_runs: number[];
     daily_tokens: number[];
     daily_failed: number[];
+    cache_savings_today: number;
+    cache_savings_yesterday: number;
+    daily_cache_savings: number[];
+    cost_today: number;
+    cost_yesterday: number;
+    daily_cost: number[];
   }>;
 
   getAgentStats(
@@ -132,6 +145,12 @@ export interface DbAdapter {
     daily_tokens: number[];
     daily_failed: number[];
     daily_avg_duration_ms: number[];
+    cache_savings: number;
+    prev_cache_savings: number;
+    daily_cache_savings: number[];
+    cost: number;
+    prev_cost: number;
+    daily_cost: number[];
   }>;
 
   // --- Environments ---

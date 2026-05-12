@@ -1,3 +1,13 @@
+export class SkrunFileUploadError extends Error {
+  readonly code = "FILE_UPLOAD_FAILED";
+  readonly cause?: unknown;
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "SkrunFileUploadError";
+    this.cause = cause;
+  }
+}
+
 export class SkrunApiError extends Error {
   readonly code: string;
   readonly status: number;

@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  SESSION_COOKIE_NAME,
   clearSessions,
   createSession,
   destroySession,
   getSessionCookieOptions,
+  SESSION_COOKIE_NAME,
   validateSession,
 } from "./session.js";
 

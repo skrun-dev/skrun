@@ -51,7 +51,7 @@ export function createApp(storage: StorageAdapter, db: DbAdapter) {
   app.route("/api", createStatsRoutes(db, authMiddleware));
   app.route("/api", createRegistryRoutes(service, authMiddleware));
   app.route("/api", createRunRoutes(service, db, authMiddleware));
-  app.route("/api", createFilesRoutes());
+  app.route("/api", createFilesRoutes(authMiddleware));
 
   // Dashboard static files (served from packages/web/dist/)
   app.use(
@@ -69,16 +69,16 @@ export function createApp(storage: StorageAdapter, db: DbAdapter) {
   return app;
 }
 
+export type { DbAdapter } from "./db/adapter.js";
+export { MemoryDb } from "./db/memory.js";
+export { SqliteDb } from "./db/sqlite.js";
+export { RegistryError, RegistryService } from "./services/registry.js";
+export type { StorageAdapter } from "./storage/adapter.js";
+export { LocalStorage } from "./storage/local.js";
+export { MemoryStorage } from "./storage/memory.js";
 export type {
   AgentMetadata,
   AgentVersionInfo,
   RegistryErrorResponse,
   UserContext,
 } from "./types.js";
-export type { StorageAdapter } from "./storage/adapter.js";
-export { MemoryStorage } from "./storage/memory.js";
-export { LocalStorage } from "./storage/local.js";
-export type { DbAdapter } from "./db/adapter.js";
-export { MemoryDb } from "./db/memory.js";
-export { SqliteDb } from "./db/sqlite.js";
-export { RegistryService, RegistryError } from "./services/registry.js";

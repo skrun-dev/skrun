@@ -10,10 +10,10 @@ import {
   isOAuthConfigured,
 } from "../auth/github-oauth.js";
 import {
-  SESSION_COOKIE_NAME,
   createSession,
   destroySession,
   getSessionCookieOptions,
+  SESSION_COOKIE_NAME,
 } from "../auth/session.js";
 import type { DbAdapter } from "../db/adapter.js";
 import { getUser } from "../middleware/auth.js";

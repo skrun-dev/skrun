@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { createLogger } from "../logger.js";
 import type { FileInfo } from "../types.js";
@@ -49,7 +50,11 @@ export function collectOutputFiles(dir: string, options?: CollectOptions): FileI
       break;
     }
 
-    files.push({ name, size: stat.size });
+    files.push({
+      name,
+      size: stat.size,
+      file_id: `fil_${randomUUID().replace(/-/g, "")}`,
+    });
   }
 
   return files;

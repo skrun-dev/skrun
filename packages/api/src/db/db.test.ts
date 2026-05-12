@@ -92,6 +92,37 @@ describe("MemoryDb", () => {
     expect(await db.getVersionByNumber(agent.id, "3.0.0")).toBeNull();
   });
 
+  // VT-1 (#77): deleteVersion happy path — memory impl
+  it("deleteVersion removes the row and preserves listAgents aggregates", async () => {
+    const agent = await db.createAgent({
+      name: "del-version",
+      namespace: "ns",
+      description: "",
+      owner_id: "u",
+    });
+    await db.createVersion(agent.id, { version: "1.0.0", size: 100, bundle_key: "k1" });
+    await db.createVersion(agent.id, { version: "2.0.0", size: 200, bundle_key: "k2" });
+
+    // Pre-condition: listAgents aggregates capture run_count etc.
+    const before = await db.listAgents(1, 10);
+    const beforeStats = before.agents.find((a) => a.id === agent.id);
+    expect(beforeStats).toBeDefined();
+
+    await db.deleteVersion(agent.id, "1.0.0");
+
+    const versions = await db.getVersions(agent.id);
+    expect(versions).toHaveLength(1);
+    expect(versions[0].version).toBe("2.0.0");
+
+    // RT-3 collapsed in: listAgents aggregate counts (run_count, token_count, cost_total)
+    // are unchanged because they join on `runs`, not `agent_versions`.
+    const after = await db.listAgents(1, 10);
+    const afterStats = after.agents.find((a) => a.id === agent.id);
+    expect(afterStats?.run_count).toBe(beforeStats?.run_count);
+    expect(afterStats?.token_count).toBe(beforeStats?.token_count);
+    expect(afterStats?.cost_total).toBe(beforeStats?.cost_total);
+  });
+
   it("should return null for latest version on empty agent", async () => {
     const agent = await db.createAgent({
       name: "a",
@@ -337,6 +368,138 @@ describe("MemoryDb", () => {
 
       const envs = await db.listEnvironments("u-1");
       expect(envs).toHaveLength(2);
+    });
+  });
+
+  // --- Cache cost-savings ([005-cache-cost-savings-dashboard]) ---
+
+  describe("cache cost-savings", () => {
+    it("VT-6: getStats single-tenant — sums cache_savings_today across runs", async () => {
+      // 2 runs today with savings $0.42 each, 1 run with $0
+      const today = new Date().toISOString();
+      await db.createRun({ id: "r1", agent_id: "a1", agent_version: "1.0.0", status: "running" });
+      await db.updateRun("r1", { usage_cache_savings_usd: 0.42, completed_at: today });
+      await db.createRun({ id: "r2", agent_id: "a1", agent_version: "1.0.0", status: "running" });
+      await db.updateRun("r2", { usage_cache_savings_usd: 0.42, completed_at: today });
+      await db.createRun({ id: "r3", agent_id: "a1", agent_version: "1.0.0", status: "running" });
+      await db.updateRun("r3", { usage_cache_savings_usd: 0, completed_at: today });
+
+      const stats = await db.getStats();
+      expect(stats.cache_savings_today).toBeCloseTo(0.84, 6);
+      expect(stats.daily_cache_savings).toHaveLength(7);
+      // Today is index 6 (last) — sum should be 0.84
+      expect(stats.daily_cache_savings[6]).toBeCloseTo(0.84, 6);
+      expect(stats.daily_cache_savings.slice(0, 6).every((v) => v === 0)).toBe(true);
+    });
+
+    it("VT-7: getStats multi-tenant — userId filter isolates aggregates", async () => {
+      // User A: 2 runs × $0.42, User B: 3 runs × $1.00
+      await db.createRun({
+        id: "a1",
+        agent_id: "ag1",
+        agent_version: "1.0.0",
+        user_id: "user-A",
+        status: "running",
+      });
+      await db.updateRun("a1", { usage_cache_savings_usd: 0.42 });
+      await db.createRun({
+        id: "a2",
+        agent_id: "ag1",
+        agent_version: "1.0.0",
+        user_id: "user-A",
+        status: "running",
+      });
+      await db.updateRun("a2", { usage_cache_savings_usd: 0.42 });
+
+      for (const id of ["b1", "b2", "b3"]) {
+        await db.createRun({
+          id,
+          agent_id: "ag1",
+          agent_version: "1.0.0",
+          user_id: "user-B",
+          status: "running",
+        });
+        await db.updateRun(id, { usage_cache_savings_usd: 1.0 });
+      }
+
+      const statsA = await db.getStats({ userId: "user-A" });
+      expect(statsA.cache_savings_today).toBeCloseTo(0.84, 6);
+
+      const statsB = await db.getStats({ userId: "user-B" });
+      expect(statsB.cache_savings_today).toBeCloseTo(3.0, 6);
+
+      // No filter — instance-wide
+      const statsAll = await db.getStats();
+      expect(statsAll.cache_savings_today).toBeCloseTo(3.84, 6);
+    });
+
+    it("VT-8: getAgentStats — sums cache_savings over period", async () => {
+      // Agent A with 5 runs today totaling 5.00 USD
+      for (let i = 0; i < 5; i++) {
+        const id = `r${i}`;
+        await db.createRun({ id, agent_id: "agent-A", agent_version: "1.0.0", status: "running" });
+        await db.updateRun(id, { usage_cache_savings_usd: 1.0 });
+      }
+
+      const stats = await db.getAgentStats("agent-A", 7);
+      expect(stats.cache_savings).toBeCloseTo(5.0, 6);
+      expect(stats.daily_cache_savings).toHaveLength(7);
+      expect(stats.daily_cache_savings.reduce((s, v) => s + v, 0)).toBeCloseTo(5.0, 6);
+    });
+
+    it("VT-9: getAgentStats variable days — daily_cache_savings.length === days", async () => {
+      await db.createRun({
+        id: "r1",
+        agent_id: "agent-A",
+        agent_version: "1.0.0",
+        status: "running",
+      });
+      await db.updateRun("r1", { usage_cache_savings_usd: 0.5 });
+
+      const stats7 = await db.getAgentStats("agent-A", 7);
+      expect(stats7.daily_cache_savings).toHaveLength(7);
+
+      const stats30 = await db.getAgentStats("agent-A", 30);
+      expect(stats30.daily_cache_savings).toHaveLength(30);
+    });
+
+    it("VT-11: failed run keeps cache_savings_usd = 0", async () => {
+      await db.createRun({
+        id: "r-fail",
+        agent_id: "agent-A",
+        agent_version: "1.0.0",
+        status: "running",
+      });
+      // Failure path: updateRun without any usage_cache_* fields
+      await db.updateRun("r-fail", {
+        status: "failed",
+        error: "boom",
+        completed_at: new Date().toISOString(),
+      });
+      const run = await db.getRun("r-fail");
+      expect(run?.status).toBe("failed");
+      expect(run?.usage_cache_savings_usd).toBe(0);
+      expect(run?.usage_cache_read_tokens).toBe(0);
+      expect(run?.usage_cache_write_tokens).toBe(0);
+    });
+
+    it("RT-5: CRUD column completeness — all 3 cache fields preserved across update→get", async () => {
+      await db.createRun({
+        id: "r-rt",
+        agent_id: "agent-A",
+        agent_version: "1.0.0",
+        status: "running",
+      });
+      await db.updateRun("r-rt", {
+        status: "completed",
+        usage_cache_read_tokens: 7143,
+        usage_cache_write_tokens: 0,
+        usage_cache_savings_usd: 0.000964,
+      });
+      const run = await db.getRun("r-rt");
+      expect(run?.usage_cache_read_tokens).toBe(7143);
+      expect(run?.usage_cache_write_tokens).toBe(0);
+      expect(run?.usage_cache_savings_usd).toBeCloseTo(0.000964, 6);
     });
   });
 

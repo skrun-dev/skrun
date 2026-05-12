@@ -1,5 +1,5 @@
 name: dev/adr-writer
-version: 0.1.0
+version: 0.2.0
 
 model:
   provider: google
@@ -7,6 +7,8 @@ model:
   fallback:
     provider: google
     name: gemini-2.5-flash-lite
+
+tool_choice: write_artifact
 
 tools:
   - name: list_adrs

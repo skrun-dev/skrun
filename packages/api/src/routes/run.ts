@@ -1,21 +1,29 @@
 import { randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { FileInfo, RunEvent } from "@skrun-dev/runtime";
 import {
+  createLogger,
+  estimateCacheSavings,
   LLMRouter,
   LocalAdapter,
   McpToolProvider,
-  ScriptToolProvider,
-  TTLCache,
-  ToolRegistry,
-  createLogger,
+  ResolveError,
   redactSecretsFromString,
+  resolveInput,
+  ScriptToolProvider,
+  type SkrunPart,
+  ToolRegistry,
+  TTLCache,
 } from "@skrun-dev/runtime";
-import type { FileInfo, RunEvent } from "@skrun-dev/runtime";
-import { parseAgentYaml } from "@skrun-dev/schema";
+import { type FileInputField, parseAgentYaml } from "@skrun-dev/schema";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { bundleCache, getOrExtract } from "../cache/bundle-cache.js";
+import { depsCache } from "../cache/deps-cache.js";
+import { getInputFile } from "../cache/input-cache.js";
 import { registerOutput } from "../cache/output-cache.js";
 import type { DbAdapter } from "../db/adapter.js";
 import { getUser } from "../middleware/auth.js";
@@ -308,6 +316,22 @@ export function createRunRoutes(
       ? `${agentConfig.model.provider}/${agentConfig.model.name}`
       : null;
 
+    // Strip the leading provider prefix so cost.ts PRICING entries match.
+    // PRICING uses bare model names (e.g., "claude-sonnet-4-6") for most
+    // providers, except Groq which uses prefixed entries like
+    // "openai/gpt-oss-120b". So we strip ONLY the first segment.
+    // Examples:
+    //   "anthropic/claude-sonnet-4-6" -> "claude-sonnet-4-6"
+    //   "groq/openai/gpt-oss-120b"    -> "openai/gpt-oss-120b"
+    //   "claude-sonnet-4-6"           -> "claude-sonnet-4-6" (unchanged)
+    // Note: this uses the primary model from agent.yaml. If the runtime
+    // falls back to the fallback model (e.g., on primary 5xx), savings are
+    // still computed using the primary's rates — acceptable approximation
+    // (would need RunResult.model exposure for precision).
+    const modelForCostLookup = modelStr?.includes("/")
+      ? modelStr.slice(modelStr.indexOf("/") + 1)
+      : (modelStr ?? "");
+
     // 5b. Merge environment override (if provided)
     if (environmentOverride) {
       const { networking: netOverride, ...flatOverride } = environmentOverride as {
@@ -323,7 +347,7 @@ export function createRunRoutes(
       };
     }
 
-    // 6. Validate inputs
+    // 6. Validate inputs (primitive types only; file inputs are handled by resolveInput below)
     for (const field of agentConfig.inputs) {
       if (field.required && !(field.name in input)) {
         return c.json(
@@ -331,6 +355,7 @@ export function createRunRoutes(
           400,
         );
       }
+      if (field.type === "file") continue; // file fields validated by resolveInput
       if (field.name in input) {
         const value = input[field.name];
         const actualType = Array.isArray(value) ? "array" : typeof value;
@@ -353,10 +378,72 @@ export function createRunRoutes(
       }
     }
 
+    // 6b. Resolve file inputs to SkrunPart[] (Tasks 3.1, 6.1+6.2+6.4)
+    let resolvedInputs: Map<string, SkrunPart[]> | undefined;
+    const fileSchemas = agentConfig.inputs.filter((f): f is FileInputField => f.type === "file");
+    if (fileSchemas.length > 0) {
+      try {
+        resolvedInputs = await resolveInput(input, fileSchemas, {
+          fetchInputFile: async (fileId) => {
+            const meta = getInputFile(fileId);
+            if (!meta) return null;
+            const bytes = readFileSync(meta.path);
+            return { bytes: new Uint8Array(bytes), media_type: meta.media_type };
+          },
+          allowedHosts: agentConfig.environment.networking.allowed_hosts,
+        });
+        // Strict per-agent mime check
+        for (const schema of fileSchemas) {
+          const parts = resolvedInputs.get(schema.name);
+          if (!parts) continue;
+          const allowed = schema.mime_types ?? [];
+          if (allowed.length === 0) continue; // no allowlist declared → accept any (defaults applied at runtime)
+          for (const part of parts) {
+            if (part.kind === "text") continue;
+            if (!allowed.includes(part.media_type)) {
+              return c.json(
+                {
+                  error: {
+                    code: "MIME_NOT_ALLOWED",
+                    message: `Input '${schema.name}' got media_type '${part.media_type}' but allowed: ${allowed.join(", ")}`,
+                  },
+                },
+                415,
+              );
+            }
+          }
+        }
+      } catch (err) {
+        if (err instanceof ResolveError) {
+          const httpCode =
+            err.code === "INLINE_TOO_LARGE" || err.code === "MAX_COUNT_EXCEEDED"
+              ? 413
+              : err.code === "URL_NOT_ALLOWED"
+                ? 403
+                : err.code === "FILE_NOT_FOUND"
+                  ? 404
+                  : err.code === "REQUIRED_INPUT_MISSING"
+                    ? 400
+                    : err.code === "URL_FETCH_FAILED"
+                      ? 502
+                      : 400;
+          return c.json({ error: { code: err.code, message: err.message } }, httpCode);
+        }
+        throw err;
+      }
+    }
+
     // 7. Setup tool registry
     const toolRegistry = new ToolRegistry();
     const warnings: string[] = [];
     const allowedHosts = agentConfig.environment.networking.allowed_hosts;
+
+    // Create the per-run output directory NOW, before constructing the
+    // script provider — the provider passes this path to spawned scripts
+    // via SKRUN_OUTPUT_DIR. Re-used by LocalAdapter for output collection
+    // (LocalAdapter no-ops when outputDir is already set).
+    const runOutputDir = join(tmpdir(), `skrun-outputs-${runId}`);
+    mkdirSync(runOutputDir, { recursive: true });
 
     if (bundleDir) {
       const { existsSync } = await import("node:fs");
@@ -377,6 +464,8 @@ export function createRunRoutes(
             scriptsDir,
             agentConfig.tools,
             allowedHosts,
+            runOutputDir,
+            { bundleRoot: bundleDir, depsCache },
           );
           await toolRegistry.addProvider(scriptProvider);
         } else {
@@ -439,7 +528,13 @@ export function createRunRoutes(
       runId,
       callerKeys,
       agent_version: resolvedVersion,
-      outputDir: undefined as string | undefined,
+      outputDir: runOutputDir as string | undefined,
+      resolvedInputs,
+      // environmentId for prompt-cache routing. The API doesn't have
+      // persistent env records keyed by ID today; "default" gives stable
+      // cache pools per (agent, version). Future feature can hash
+      // environmentOverride for per-shape isolation.
+      environmentId: "default",
     };
 
     // Helper: build files array with download URLs from FileInfo[]
@@ -448,6 +543,7 @@ export function createRunRoutes(
         name: f.name,
         size: f.size,
         url: `/api/runs/${runId}/files/${encodeURIComponent(f.name)}`,
+        ...(f.file_id && { file_id: f.file_id }),
       }));
 
     // --- Sanitize helper: strip caller keys from event error messages ---
@@ -471,9 +567,15 @@ export function createRunRoutes(
           for await (const event of adapter.executeStream(runRequest)) {
             if (event.type === "run_complete") {
               if (runRequest.outputDir) {
-                registerOutput(runId, runRequest.outputDir);
+                registerOutput(runId, runRequest.outputDir, event.files);
               }
               // Update run in DB (same as sync mode)
+              const sseCacheReadTokens = event.usage.cache_read_tokens ?? 0;
+              const sseCacheWriteTokens = event.usage.cache_write_tokens ?? 0;
+              const sseCacheSavingsUsd = estimateCacheSavings(
+                modelForCostLookup,
+                sseCacheReadTokens,
+              );
               db.updateRun(runId, {
                 status: "completed",
                 output: event.output,
@@ -481,6 +583,9 @@ export function createRunRoutes(
                 usage_completion_tokens: event.usage.completion_tokens,
                 usage_total_tokens: event.usage.total_tokens,
                 usage_estimated_cost: event.cost?.estimated ?? 0,
+                usage_cache_read_tokens: sseCacheReadTokens,
+                usage_cache_write_tokens: sseCacheWriteTokens,
+                usage_cache_savings_usd: sseCacheSavingsUsd,
                 duration_ms: event.duration_ms,
                 files: event.files?.map((f) => ({ name: f.name, size: f.size })) ?? null,
                 completed_at: new Date().toISOString(),
@@ -513,8 +618,31 @@ export function createRunRoutes(
           for await (const event of adapter.executeStream(runRequest)) {
             if (event.type === "run_complete") {
               if (runRequest.outputDir) {
-                registerOutput(runId, runRequest.outputDir);
+                registerOutput(runId, runRequest.outputDir, event.files);
               }
+              // Persist usage to DB — mirrors sync/SSE pattern. This was a
+              // latent gap since #3 streaming: webhook-mode runs never wrote
+              // usage data, so token counts and savings were silently 0 in
+              // stats and run-detail.
+              const whCacheReadTokens = event.usage.cache_read_tokens ?? 0;
+              const whCacheWriteTokens = event.usage.cache_write_tokens ?? 0;
+              const whCacheSavingsUsd = estimateCacheSavings(modelForCostLookup, whCacheReadTokens);
+              await db
+                .updateRun(runId, {
+                  status: "completed",
+                  output: event.output,
+                  usage_prompt_tokens: event.usage.prompt_tokens,
+                  usage_completion_tokens: event.usage.completion_tokens,
+                  usage_total_tokens: event.usage.total_tokens,
+                  usage_estimated_cost: event.cost?.estimated ?? 0,
+                  usage_cache_read_tokens: whCacheReadTokens,
+                  usage_cache_write_tokens: whCacheWriteTokens,
+                  usage_cache_savings_usd: whCacheSavingsUsd,
+                  duration_ms: event.duration_ms,
+                  files: event.files?.map((f) => ({ name: f.name, size: f.size })) ?? null,
+                  completed_at: new Date().toISOString(),
+                })
+                .catch(() => {});
               finalResult = {
                 run_id: runId,
                 status: "completed",
@@ -522,12 +650,26 @@ export function createRunRoutes(
                 output: event.output,
                 usage: event.usage,
                 ...(warnings.length > 0 && { warnings }),
-                cost: event.cost,
+                cost: {
+                  ...(event.cost ?? {}),
+                  // Surface cache savings on the webhook payload too
+                  ...(whCacheSavingsUsd > 0 && { saved: whCacheSavingsUsd }),
+                },
                 duration_ms: event.duration_ms,
                 files: buildFilesResponse(event.files),
               };
             } else if (event.type === "run_error") {
               const sanitized = sanitizeEvent(event);
+              // Persist failure to DB — explicitly omit ALL usage_* fields
+              // (mirrors sync fail path L695-702). Cache fields stay at the
+              // DB DEFAULT 0 — no partial accounting for failed runs.
+              await db
+                .updateRun(runId, {
+                  status: "failed",
+                  error: event.error.message,
+                  completed_at: new Date().toISOString(),
+                })
+                .catch(() => {});
               finalResult = {
                 run_id: runId,
                 status: "failed",
@@ -558,10 +700,20 @@ export function createRunRoutes(
     try {
       const result = await adapter.execute(runRequest);
 
-      // Register output dir for file serving
+      // Register output dir for file serving (file-id index for downloads)
       if (runRequest.outputDir) {
-        registerOutput(runId, runRequest.outputDir);
+        registerOutput(runId, runRequest.outputDir, result.files);
       }
+
+      // Compute cache-savings snapshot at write time (matches usage_estimated_cost
+      // pattern). Always 0 for failed runs since the runtime returns 0 cacheReadTokens
+      // and the formula short-circuits.
+      const cacheReadTokens = result.usage.cacheReadTokens ?? 0;
+      const cacheWriteTokens = result.usage.cacheWriteTokens ?? 0;
+      const cacheSavingsUsd =
+        result.status === "completed"
+          ? estimateCacheSavings(modelForCostLookup, cacheReadTokens)
+          : 0;
 
       // Track completed run
       await db
@@ -573,6 +725,9 @@ export function createRunRoutes(
           usage_completion_tokens: result.usage.completionTokens,
           usage_total_tokens: result.usage.totalTokens,
           usage_estimated_cost: result.usage.estimatedCost,
+          usage_cache_read_tokens: cacheReadTokens,
+          usage_cache_write_tokens: cacheWriteTokens,
+          usage_cache_savings_usd: cacheSavingsUsd,
           duration_ms: result.durationMs,
           files: result.files?.map((f) => ({ name: f.name, size: f.size })) ?? null,
           completed_at: new Date().toISOString(),
@@ -588,10 +743,20 @@ export function createRunRoutes(
           prompt_tokens: result.usage.promptTokens,
           completion_tokens: result.usage.completionTokens,
           total_tokens: result.usage.totalTokens,
+          // Prompt-caching fields — snake_case wire format. Surfaced
+          // only when present (provider returned cache activity).
+          ...(result.usage.cacheReadTokens !== undefined && {
+            cache_read_tokens: result.usage.cacheReadTokens,
+          }),
+          ...(result.usage.cacheWriteTokens !== undefined && {
+            cache_write_tokens: result.usage.cacheWriteTokens,
+          }),
         },
         ...(warnings.length > 0 && { warnings }),
         cost: {
           estimated: result.usage.estimatedCost,
+          // Surface cache savings when present (omit when 0 to keep responses lean)
+          ...(cacheSavingsUsd > 0 && { saved: cacheSavingsUsd }),
         },
         duration_ms: result.durationMs,
         files: buildFilesResponse(result.files),

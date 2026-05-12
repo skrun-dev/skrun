@@ -1,5 +1,5 @@
 import { createLogger } from "@skrun-dev/runtime";
-import { type SupabaseClient, createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { DbAdapter } from "./adapter.js";
 import type { Agent, AgentVersion, ApiKey, Environment, Run, RunStatus, User } from "./schema.js";
 
@@ -44,7 +44,10 @@ export class SupabaseDb implements DbAdapter {
   async listAgents(
     page: number,
     limit: number,
-  ): Promise<{ agents: (Agent & { run_count: number; token_count: number })[]; total: number }> {
+  ): Promise<{
+    agents: (Agent & { run_count: number; token_count: number; cost_total: number })[];
+    total: number;
+  }> {
     const from = (page - 1) * limit;
     const to = from + limit - 1;
     const { data, error, count } = await this.client
@@ -58,11 +61,13 @@ export class SupabaseDb implements DbAdapter {
       agents.map(async (agent) => {
         const { data: runs, error: runsErr } = await this.client
           .from("runs")
-          .select("usage_total_tokens")
+          .select("usage_total_tokens, usage_estimated_cost")
           .eq("agent_id", agent.id);
-        if (runsErr) return { ...agent, run_count: 0, token_count: 0 };
-        const token_count = (runs ?? []).reduce((sum, r) => sum + (r.usage_total_tokens ?? 0), 0);
-        return { ...agent, run_count: runs?.length ?? 0, token_count };
+        if (runsErr) return { ...agent, run_count: 0, token_count: 0, cost_total: 0 };
+        const rows = runs ?? [];
+        const token_count = rows.reduce((sum, r) => sum + (r.usage_total_tokens ?? 0), 0);
+        const cost_total = rows.reduce((sum, r) => sum + (r.usage_estimated_cost ?? 0), 0);
+        return { ...agent, run_count: rows.length, token_count, cost_total };
       }),
     );
 
@@ -150,6 +155,15 @@ export class SupabaseDb implements DbAdapter {
       .maybeSingle();
     if (error) throw new Error(`getVersionByNumber failed: ${error.message}`);
     return data;
+  }
+
+  async deleteVersion(agentId: string, version: string): Promise<void> {
+    const { error } = await this.client
+      .from("agent_versions")
+      .delete()
+      .eq("agent_id", agentId)
+      .eq("version", version);
+    if (error) throw new Error(`deleteVersion failed: ${error.message}`);
   }
 
   // --- Agent State ---
@@ -349,6 +363,9 @@ export class SupabaseDb implements DbAdapter {
         | "usage_completion_tokens"
         | "usage_total_tokens"
         | "usage_estimated_cost"
+        | "usage_cache_read_tokens"
+        | "usage_cache_write_tokens"
+        | "usage_cache_savings_usd"
         | "duration_ms"
         | "files"
         | "completed_at"
@@ -391,7 +408,7 @@ export class SupabaseDb implements DbAdapter {
 
   // --- Stats ---
 
-  async getStats() {
+  async getStats(opts?: { userId?: string }) {
     const now = new Date();
     const todayStart = new Date(now);
     todayStart.setUTCHours(0, 0, 0, 0);
@@ -401,12 +418,21 @@ export class SupabaseDb implements DbAdapter {
     sevenDaysAgo.setUTCDate(sevenDaysAgo.getUTCDate() - 6);
     const sevenDaysAgoISO = sevenDaysAgo.toISOString();
 
+    // Multi-tenancy: when userId provided, the runs query filters via .eq()
+    // before the JS-side fan-out reduces the row stream.
+    let runsQuery = this.client
+      .from("runs")
+      .select(
+        "status, usage_total_tokens, usage_cache_savings_usd, usage_estimated_cost, created_at, user_id",
+      )
+      .gte("created_at", sevenDaysAgoISO);
+    if (opts?.userId) {
+      runsQuery = runsQuery.eq("user_id", opts.userId);
+    }
+
     const [agentsResult, runsResult] = await Promise.all([
       this.client.from("agents").select("id", { count: "exact", head: true }),
-      this.client
-        .from("runs")
-        .select("status, usage_total_tokens, created_at")
-        .gte("created_at", sevenDaysAgoISO),
+      runsQuery,
     ]);
 
     if (agentsResult.error)
@@ -419,6 +445,8 @@ export class SupabaseDb implements DbAdapter {
     let runs_today = 0;
     let tokens_today = 0;
     let failed_today = 0;
+    let cache_savings_today = 0;
+    let cost_today = 0;
 
     const yesterdayStart = new Date(todayStart);
     yesterdayStart.setUTCDate(yesterdayStart.getUTCDate() - 1);
@@ -426,22 +454,32 @@ export class SupabaseDb implements DbAdapter {
     let runs_yesterday = 0;
     let tokens_yesterday = 0;
     let failed_yesterday = 0;
+    let cache_savings_yesterday = 0;
+    let cost_yesterday = 0;
 
     const dailyRuns = new Array<number>(7).fill(0);
     const dailyTokens = new Array<number>(7).fill(0);
     const dailyFailed = new Array<number>(7).fill(0);
+    const dailyCacheSavings = new Array<number>(7).fill(0);
+    const dailyCost = new Array<number>(7).fill(0);
 
     for (const run of allRuns) {
       const tokens = run.usage_total_tokens ?? 0;
+      const cacheSavings = run.usage_cache_savings_usd ?? 0;
+      const cost = run.usage_estimated_cost ?? 0;
       const isFailed = run.status === "failed";
 
       if (run.created_at >= todayISO) {
         runs_today++;
         tokens_today += tokens;
+        cache_savings_today += cacheSavings;
+        cost_today += cost;
         if (isFailed) failed_today++;
       } else if (run.created_at >= yesterdayISO) {
         runs_yesterday++;
         tokens_yesterday += tokens;
+        cache_savings_yesterday += cacheSavings;
+        cost_yesterday += cost;
         if (isFailed) failed_yesterday++;
       }
 
@@ -452,6 +490,8 @@ export class SupabaseDb implements DbAdapter {
       if (dayIndex >= 0 && dayIndex < 7) {
         dailyRuns[dayIndex]++;
         dailyTokens[dayIndex] += tokens;
+        dailyCacheSavings[dayIndex] += cacheSavings;
+        dailyCost[dayIndex] += cost;
         if (isFailed) dailyFailed[dayIndex]++;
       }
     }
@@ -467,6 +507,12 @@ export class SupabaseDb implements DbAdapter {
       daily_runs: dailyRuns,
       daily_tokens: dailyTokens,
       daily_failed: dailyFailed,
+      cache_savings_today,
+      cache_savings_yesterday,
+      daily_cache_savings: dailyCacheSavings,
+      cost_today,
+      cost_yesterday,
+      daily_cost: dailyCost,
     };
   }
 
@@ -483,7 +529,9 @@ export class SupabaseDb implements DbAdapter {
 
     const { data, error } = await this.client
       .from("runs")
-      .select("status, usage_total_tokens, duration_ms, created_at")
+      .select(
+        "status, usage_total_tokens, usage_cache_savings_usd, usage_estimated_cost, duration_ms, created_at",
+      )
       .eq("agent_id", agentId)
       .gte("created_at", prevStart.toISOString());
 
@@ -496,40 +544,56 @@ export class SupabaseDb implements DbAdapter {
     let tokens = 0;
     let failed = 0;
     let totalDuration = 0;
+    let cacheSavings = 0;
+    let cost = 0;
     let prevRuns = 0;
     let prevTokens = 0;
     let prevFailed = 0;
     let prevTotalDuration = 0;
+    let prevCacheSavings = 0;
+    let prevCost = 0;
 
-    // Daily arrays are always 7 items for sparkline rendering
+    // Existing daily arrays remain 7 items for sparkline UX consistency
     const dailyRuns = new Array<number>(7).fill(0);
     const dailyTokens = new Array<number>(7).fill(0);
     const dailyFailed = new Array<number>(7).fill(0);
     const dailyDurTotal = new Array<number>(7).fill(0);
     const dailyDurCount = new Array<number>(7).fill(0);
 
-    // 7-day window for daily arrays (independent of the main period)
+    // daily_cache_savings + daily_cost array lengths match the `days` parameter
+    // (window starts `days` back from today). Other daily arrays remain at
+    // 7 for sparkline UX consistency on the home page.
+    const dailyCacheSavings = new Array<number>(days).fill(0);
+    const dailyCost = new Array<number>(days).fill(0);
+
+    // 7-day window for the existing daily arrays (independent of the main period)
     const dailyStart = new Date(todayStart);
     dailyStart.setUTCDate(dailyStart.getUTCDate() - 6);
 
     for (const run of allRuns) {
       const tok = run.usage_total_tokens ?? 0;
       const dur = run.duration_ms ?? 0;
+      const runCacheSavings = run.usage_cache_savings_usd ?? 0;
+      const runCost = run.usage_estimated_cost ?? 0;
       const isFailed = run.status === "failed";
 
       if (run.created_at >= periodISO) {
         runs++;
         tokens += tok;
+        cacheSavings += runCacheSavings;
+        cost += runCost;
         if (isFailed) failed++;
         if (dur > 0) totalDuration += dur;
       } else {
         prevRuns++;
         prevTokens += tok;
+        prevCacheSavings += runCacheSavings;
+        prevCost += runCost;
         if (isFailed) prevFailed++;
         if (dur > 0) prevTotalDuration += dur;
       }
 
-      // Populate daily arrays from 7-day window
+      // Populate existing daily arrays from 7-day window
       if (run.created_at >= dailyStart.toISOString()) {
         const runDate = new Date(run.created_at);
         const dayIndex = Math.floor(
@@ -543,6 +607,18 @@ export class SupabaseDb implements DbAdapter {
             dailyDurTotal[dayIndex] += dur;
             dailyDurCount[dayIndex]++;
           }
+        }
+      }
+
+      // Populate daily_cache_savings + daily_cost using the parameterized window
+      if (run.created_at >= periodISO) {
+        const runDate = new Date(run.created_at);
+        const periodDayIndex = Math.floor(
+          (runDate.getTime() - periodStart.getTime()) / (24 * 60 * 60 * 1000),
+        );
+        if (periodDayIndex >= 0 && periodDayIndex < days) {
+          dailyCacheSavings[periodDayIndex] += runCacheSavings;
+          dailyCost[periodDayIndex] += runCost;
         }
       }
     }
@@ -562,6 +638,12 @@ export class SupabaseDb implements DbAdapter {
       daily_avg_duration_ms: dailyDurCount.map((c, i) =>
         c > 0 ? Math.round(dailyDurTotal[i] / c) : 0,
       ),
+      cache_savings: cacheSavings,
+      prev_cache_savings: prevCacheSavings,
+      daily_cache_savings: dailyCacheSavings,
+      cost,
+      prev_cost: prevCost,
+      daily_cost: dailyCost,
     };
   }
 

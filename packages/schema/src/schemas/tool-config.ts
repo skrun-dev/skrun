@@ -21,6 +21,7 @@ export const ToolConfigSchema = z.object({
     ),
   description: z.string().min(1, "Tool description is required"),
   input_schema: InputSchemaSchema,
+  required: z.boolean().default(false),
 });
 
 export type ToolConfig = z.infer<typeof ToolConfigSchema>;

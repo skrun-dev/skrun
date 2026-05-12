@@ -186,7 +186,7 @@ Execute an agent and return the result. Supports three modes:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `input` | Yes | Input fields matching the agent's `agent.yaml` |
+| `input` | Yes | Input fields matching the agent's `agent.yaml`. For `file`-typed inputs, pass an array of source descriptors — see [Uploading input files](#uploading-input-files). |
 | `version` | No | Pin a specific agent version (**strict semver**, e.g. `"1.2.0"`). Omit to target latest. Ranges (`^`, `~`, `*`) and keywords (`"latest"`, `"HEAD"`) are not supported — omit the field for latest. |
 | `environment` | No | Environment override — shallow-merged on top of agent.yaml defaults. Accepts any subset of: `networking.allowed_hosts`, `filesystem`, `secrets`, `timeout`, `max_cost`, `sandbox`. |
 | `webhook_url` | No | URL to receive the result when execution completes (activates async mode) |
@@ -206,10 +206,13 @@ Execute an agent and return the result. Supports three modes:
   "usage": {
     "prompt_tokens": 500,
     "completion_tokens": 150,
-    "total_tokens": 650
+    "total_tokens": 650,
+    "cache_read_tokens": 2048,
+    "cache_write_tokens": 1024
   },
   "cost": {
-    "estimated": 0.00025
+    "estimated": 0.00025,
+    "saved": 0.00185
   },
   "duration_ms": 3200
 }
@@ -221,11 +224,14 @@ Execute an agent and return the result. Supports three modes:
 | `status` | `"completed"` or `"failed"` | Execution result |
 | `agent_version` | string | Resolved agent version (semver) that was executed. Always present, whether pinned or resolved-to-latest. |
 | `output` | object | Agent output fields (as defined in agent.yaml) |
-| `usage.prompt_tokens` | number | Tokens sent to the LLM |
+| `usage.prompt_tokens` | number | Tokens billed at the FULL input rate (cached portion already excluded — see `cache_read_tokens` below) |
 | `usage.completion_tokens` | number | Tokens received from the LLM |
-| `usage.total_tokens` | number | Total tokens |
+| `usage.total_tokens` | number | Sum of `prompt_tokens + completion_tokens` (excludes cached portion — preserves the legacy pre-caching semantic) |
+| `usage.cache_read_tokens` | number? | Optional. Tokens served from the provider's prompt cache. Billed at the cached-read rate (typically 0.10× input on Anthropic / GPT-5.x / Gemini 2.5+, 0.5× on Groq gpt-oss / OpenAI gpt-4o legacy). Only present when the provider returned cache activity. |
+| `usage.cache_write_tokens` | number? | Optional. Tokens written to the provider's prompt cache. Anthropic only — other providers do not expose a separate cache write surcharge. Billed at the cached-write rate (1.25× input at 5min TTL). |
 | `warnings` | string[] | Warnings (only present if non-empty). E.g., `["agent_not_verified_scripts_disabled"]` |
-| `cost.estimated` | number | Estimated cost in USD |
+| `cost.estimated` | number | Estimated cost in USD. Applies the per-model cached-read rate to `cache_read_tokens` and cached-write rate to `cache_write_tokens` so the value matches what the provider invoice will show within ±5%. |
+| `cost.saved` | number? | Optional. Dollar savings (USD) produced by prompt-caching on this run, computed as `cache_read_tokens × (full_input_rate - cached_rate) / 1_000_000`. Surfaced only when > 0 (omitted when no cache activity, model has no caching, or savings round to 0). Aligned with NUMERIC(10,6) DB precision (6 decimals). Same value persisted in the `runs.usage_cache_savings_usd` column. |
 | `duration_ms` | number | Total execution time in milliseconds |
 | `error` | string | Error message (only when `status` is `"failed"`) |
 
@@ -328,7 +334,7 @@ X-LLM-API-Key: {"google": "AIza...", "anthropic": "sk-ant-..."}
 
 The value is a JSON object mapping provider names to API keys.
 
-**Accepted providers**: `anthropic`, `openai`, `google`, `mistral`, `groq`
+**Accepted providers**: `anthropic`, `openai`, `google`, `mistral`, `groq`, `xai`
 
 **Key priority** (per provider):
 1. Caller key (from header) — takes precedence
@@ -534,6 +540,42 @@ Note: past runs for the deleted agent remain in the database with `agent_id: nul
 
 ---
 
+### Delete a single version
+
+```
+DELETE /api/agents/:namespace/:name/versions/:version
+```
+
+Permanently delete one version of an agent. Use this when a single push went bad (broken bundle, wrong content) and you don't want to remove the whole agent. Requires authentication and namespace ownership. Cannot delete the last remaining version — use [`DELETE /api/agents/:namespace/:name`](#delete-an-agent) for full removal.
+
+**Headers**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Authorization` | Yes | `Bearer <token>` |
+
+**Response** `204` (no body)
+
+**Errors**:
+- `401` if no auth
+- `403` if not namespace owner
+- `404 NOT_FOUND` if the agent does not exist
+- `404 VERSION_NOT_FOUND` if the agent exists but the version does not
+- `409 LAST_VERSION` if deletion would leave the agent with zero versions
+
+**Example**
+
+```bash
+curl -X DELETE \
+  -H "Authorization: Bearer dev-token" \
+  http://localhost:4000/api/agents/dev/email-drafter/versions/1.0.5
+# → HTTP/1.1 204 No Content
+```
+
+Note: past runs referencing the deleted version remain readable. `runs.agent_version` is stored as plain text (not a foreign key), so historical run records keep their version reference even after the version row is gone. The agent's `latest_version` field automatically reflects the new latest after deletion.
+
+---
+
 ### Agent versions
 
 ```
@@ -555,7 +597,7 @@ List all published versions of an agent with full metadata. Public, no auth requ
       "config_snapshot": {
         "model": {
           "provider": "anthropic",
-          "name": "claude-sonnet-4-20250514",
+          "name": "claude-sonnet-4-6",
           "fallback": { "provider": "openai", "name": "gpt-4o" }
         },
         "tools": [{ "name": "search", "description": "Search the web" }],
@@ -609,13 +651,18 @@ Returns aggregated metrics for the dashboard home page.
   "failed_yesterday": 0,
   "daily_runs": [5, 8, 10, 12, 9, 10, 12],
   "daily_tokens": [20000, 32000, 38000, 45200, 35000, 38000, 45200],
-  "daily_failed": [0, 1, 0, 0, 1, 0, 1]
+  "daily_failed": [0, 1, 0, 0, 1, 0, 1],
+  "cache_savings_today": 0.42,
+  "cache_savings_yesterday": 0.31,
+  "daily_cache_savings": [0.05, 0.18, 0.22, 0.31, 0.27, 0.33, 0.42]
 }
 ```
 
 - `runs_yesterday` / `tokens_yesterday` / `failed_yesterday`: previous UTC day totals (for delta computation).
 - `failed_today` / `failed_yesterday`: failed run counts for today and yesterday.
 - `daily_runs` / `daily_tokens` / `daily_failed`: 7-element arrays (oldest first, index 6 = today). Zero-padded if fewer than 7 days of data.
+- `cache_savings_today` / `cache_savings_yesterday` / `daily_cache_savings`: dollar savings (USD, fractional) produced by prompt-caching. Same 7-element array layout for `daily_cache_savings`. Snapshot at run completion via `cache_read_tokens × (full_input_rate - cached_rate)`.
+- **Multi-tenancy**: aggregates filter by the authenticated user. Single-tenant self-host (dev-token mode) gets effectively instance-wide stats; cloud / shared deployments isolate per-user.
 - "Today" = current UTC day (00:00 to now).
 
 ---
@@ -648,7 +695,10 @@ Returns aggregated metrics for a specific agent over the requested period.
   "daily_runs": [4, 6, 8, 5, 7, 6, 6],
   "daily_tokens": [8000, 12000, 16000, 10000, 14000, 12000, 12000],
   "daily_failed": [0, 1, 0, 0, 1, 0, 0],
-  "daily_avg_duration_ms": [1100, 1300, 1200, 1150, 1250, 1200, 1200]
+  "daily_avg_duration_ms": [1100, 1300, 1200, 1150, 1250, 1200, 1200],
+  "cache_savings": 1.42,
+  "prev_cache_savings": 0.95,
+  "daily_cache_savings": [0.10, 0.15, 0.22, 0.18, 0.25, 0.20, 0.32]
 }
 ```
 
@@ -666,6 +716,9 @@ Returns aggregated metrics for a specific agent over the requested period.
 | `daily_tokens` | number[] | Tokens per day (same ordering) |
 | `daily_failed` | number[] | Failed runs per day (same ordering) |
 | `daily_avg_duration_ms` | number[] | Average duration per day (same ordering) |
+| `cache_savings` | number | Total dollar savings (USD) produced by prompt-caching for this agent in the current period. |
+| `prev_cache_savings` | number | Cache savings in the previous equivalent period. |
+| `daily_cache_savings` | number[] | Daily savings array (USD). Length matches the `days` query param (default 7). |
 
 ---
 
@@ -704,7 +757,7 @@ Returns a single run by ID with all fields.
   "agent_id": "...",
   "agent_version": "dev/my-agent@1.0.0",
   "status": "completed",
-  "model": "anthropic/claude-sonnet-4-20250514",
+  "model": "anthropic/claude-sonnet-4-6",
   "input": { "topic": "AI" },
   "output": { "result": "..." },
   "error": null,
@@ -712,6 +765,9 @@ Returns a single run by ID with all fields.
   "usage_completion_tokens": 300,
   "usage_total_tokens": 500,
   "usage_estimated_cost": 0.0025,
+  "usage_cache_read_tokens": 7143,
+  "usage_cache_write_tokens": 0,
+  "usage_cache_savings_usd": 0.001928,
   "duration_ms": 1500,
   "created_at": "2026-04-21T10:00:00Z",
   "completed_at": "2026-04-21T10:00:01Z"
@@ -720,7 +776,10 @@ Returns a single run by ID with all fields.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `model` | string \| null | LLM model used for this run, formatted as `"provider/model-name"` (e.g., `"anthropic/claude-sonnet-4-20250514"`). Populated at POST /run time. `null` if not applicable. |
+| `model` | string \| null | LLM model used for this run, formatted as `"provider/model-name"` (e.g., `"anthropic/claude-sonnet-4-6"`). Populated at POST /run time. `null` if not applicable. |
+| `usage_cache_read_tokens` | number | Tokens served from the provider's prompt cache. 0 when no cache activity. Persisted at run completion. |
+| `usage_cache_write_tokens` | number | Tokens written to the provider's prompt cache (Anthropic only). 0 for non-Anthropic models or runs without cache activity. |
+| `usage_cache_savings_usd` | number | Dollar savings (USD) produced by prompt-caching, snapshot at write time using the model's per-token rates from `cost.ts`. NUMERIC(10,6) precision. 0 for failed runs (no partial accounting). Same value mirrored as `cost.saved` on the live POST /run response. |
 
 **Response** `404` — run not found.
 
@@ -906,26 +965,218 @@ MCP connections automatically reconnect on error (retry once). Cached entries ar
 
 ---
 
-## Files API
+## Uploading input files
 
-Agents produce files by writing to the `$SKRUN_OUTPUT_DIR` directory during execution (available to tool scripts and MCP stdio processes). After the run, produced files appear in the response `files` array and are downloadable via a dedicated endpoint.
+For agents that declare `file`-typed inputs (image, PDF, audio — see [agent-yaml.md → File inputs](agent-yaml.md#inputs-required)), there are **three interchangeable ways** to pass each file in the `POST /run` request body. All three are wrapped in a discriminated `source` field. The wire format is **always an array**, regardless of `max_count`.
+
+### The three transports
+
+```jsonc
+// (1) file_id reference — uploaded ahead of time via POST /api/files
+{ "type": "file", "source": "id", "file_id": "fil_a1b2c3..." }
+
+// (2) base64 inline — capped at 4 MB total per request
+{ "type": "file", "source": "data",
+  "media_type": "image/jpeg", "data": "<base64-encoded-bytes>" }
+
+// (3) URL — fetched server-side, subject to allowed_hosts
+{ "type": "file", "source": "url",
+  "url": "https://files.example.com/photo.jpg" }
+```
+
+Use `source: id` for any payload bigger than ~4 MB or that you'll reuse across multiple runs. Use `source: data` for one-shot small payloads. Use `source: url` for assets already publicly hosted.
+
+**Example — agent with `receipts: file/image[]` (max_count: 20)**
+
+```bash
+# Upload the 3 files, capture each file_id
+RECEIPT_1=$(curl -s -X POST http://localhost:4000/api/files \
+  -H "Authorization: Bearer dev-token" \
+  -F "file=@/path/to/receipt-1.jpg" | jq -r .file_id)
+
+RECEIPT_2=$(curl -s -X POST http://localhost:4000/api/files \
+  -H "Authorization: Bearer dev-token" \
+  -F "file=@/path/to/receipt-2.jpg" | jq -r .file_id)
+
+RECEIPT_3=$(curl -s -X POST http://localhost:4000/api/files \
+  -H "Authorization: Bearer dev-token" \
+  -F "file=@/path/to/receipt-3.jpg" | jq -r .file_id)
+
+# Run with the file_id refs
+curl -X POST http://localhost:4000/api/agents/dev/receipts-to-expenses/run \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"input\": {
+      \"receipts\": [
+        { \"type\": \"file\", \"source\": \"id\", \"file_id\": \"$RECEIPT_1\" },
+        { \"type\": \"file\", \"source\": \"id\", \"file_id\": \"$RECEIPT_2\" },
+        { \"type\": \"file\", \"source\": \"id\", \"file_id\": \"$RECEIPT_3\" }
+      ],
+      \"month\": \"2026-04\"
+    }
+  }"
+```
+
+The TypeScript SDK auto-uploads `Blob`, `File`, and `Uint8Array` values via `POST /api/files` transparently — pass them directly to `client.run()`.
+
+### POST /api/files — upload an input file
+
+```
+POST /api/files
+Content-Type: multipart/form-data
+Authorization: Bearer <token>
+```
+
+**Form fields**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `file` | Yes | The binary file. Filename is derived from the multipart `filename` parameter. |
+
+**Broad media-class allowlist at upload**: `image/*`, `application/pdf`, `audio/*`. Mime types outside these classes return `415 MIME_NOT_ALLOWED` (e.g. `text/plain`, `application/zip`). Strict per-agent `mime_types` validation runs at `/run` time against the agent's `agent.yaml` declaration.
+
+**Response** `201`
+
+```json
+{
+  "file_id": "fil_a1b2c3d4e5f6789012345678901234ab",
+  "size": 524288,
+  "media_type": "image/jpeg",
+  "purpose": "input",
+  "expires_at": "2026-05-02T10:00:00.000Z"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `file_id` | string | Unified-namespace identifier — use to reference the file in subsequent `/run` calls and `GET /api/files/:id/content`. Format: `fil_<32 hex>`. |
+| `size` | number | File size in bytes |
+| `media_type` | string | MIME type as detected from the multipart upload |
+| `purpose` | `"input"` | Always `input` for caller-uploaded files |
+| `expires_at` | string (ISO 8601) | When the file will be evicted from storage. Default TTL: 24 h. |
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| `400` | `INVALID_MULTIPART` | Body is not valid `multipart/form-data` |
+| `400` | `MISSING_FILE` | No `file` field in the form |
+| `413` | `FILE_TOO_LARGE` | File size exceeds `INPUT_FILES_MAX_SIZE_MB` (default 25 MB) |
+| `415` | `MIME_NOT_ALLOWED` | MIME type outside the broad upload allowlist |
+| `401` | — | Missing / invalid `Authorization` header |
+
+### GET /api/files/:id — file metadata
+
+```
+GET /api/files/:id
+```
+
+**Response** `200`
+
+```json
+{
+  "file_id": "fil_a1b2c3...",
+  "size": 524288,
+  "media_type": "image/jpeg",
+  "purpose": "input",
+  "expires_at": "2026-05-02T10:00:00.000Z"
+}
+```
+
+For `purpose: output` files (produced by an agent run, see [Output files](#output-files)), the response shape is the same minus `expires_at` (output retention follows `FILES_RETENTION_S`, not `INPUT_FILES_RETENTION_S`).
+
+`404 FILE_NOT_FOUND` if the `file_id` is unknown or its TTL has expired.
+
+### GET /api/files/:id/content — download binary
+
+```
+GET /api/files/:id/content
+```
+
+Returns the raw bytes with the recorded `Content-Type`. Works for both input and output files (unified namespace).
+
+`404 FILE_NOT_FOUND` if unknown or expired.
+
+### DELETE /api/files/:id — delete an input file
+
+```
+DELETE /api/files/:id
+Authorization: Bearer <token>
+```
+
+Removes the file from storage and the cache. Returns `204 No Content` on success.
+
+| Status | Code | When |
+|--------|------|------|
+| `204` | — | Deleted |
+| `403` | `DELETE_OUTPUT_FORBIDDEN` | The `file_id` belongs to a `purpose: output` file. Output files are produced by agents and cannot be deleted by callers. |
+| `404` | `FILE_NOT_FOUND` | Unknown `file_id` |
+| `401` | — | Missing / invalid `Authorization` header |
+
+### Storage configuration
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `INPUT_FILES_MAX_SIZE_MB` | `25` | Max upload size per file |
+| `INPUT_FILES_RETENTION_S` | `86400` (24 h) | How long uploaded input files remain available |
+| `INPUT_FILES_MAX_INLINE_MB` | `4` | Max base64 inline size on `POST /run` (`source: data`) |
+
+### Capability negotiation
+
+When an `agent.yaml` declares `file`-typed inputs, the chosen `model` (and its `fallback`) must support the declared `media`. The check runs at `skrun deploy` / `skrun push` and refuses the operation with a clear error before any network call. The runtime also enforces the same matrix as defense-in-depth — calls reaching the LLM router with unsupported media throw `LLMCapabilityError` (status `422`).
+
+### Errors at /run for binary inputs
+
+| Status | Code | When |
+|--------|------|------|
+| `400` | `REQUIRED_INPUT_MISSING` | Agent declared `required: true` but the field is absent |
+| `404` | `FILE_NOT_FOUND` | `source: id` references an unknown or expired `file_id` |
+| `403` | `URL_NOT_ALLOWED` | `source: url` host is not in the agent's `allowed_hosts` allowlist (SSRF protection) |
+| `413` | `INLINE_TOO_LARGE` | `source: data` decodes to more than `INPUT_FILES_MAX_INLINE_MB` (default 4 MB). Use `source: id` via `POST /api/files` for larger payloads. |
+| `413` | `MAX_COUNT_EXCEEDED` | Field has more elements than `max_count` in `agent.yaml` |
+| `415` | `MIME_NOT_ALLOWED` | Resolved file's `media_type` is not in the agent's `mime_types` allowlist |
+| `422` | `LLM_CAPABILITY_UNSUPPORTED` | The chosen model does not support the resolved `media` (defense-in-depth — primary gate is at deploy/push) |
+| `502` | `URL_FETCH_FAILED` | `source: url` returned non-2xx |
+
+---
+
+## Output files
+
+Agents produce files by writing to the `$SKRUN_OUTPUT_DIR` directory during execution (available to tool scripts and MCP stdio processes). After the run, produced files appear in the response `files` array and are downloadable via two equivalent paths.
 
 **Response format** (sync, SSE `run_complete`, webhook callback):
 ```json
 {
   "files": [
-    { "name": "report.pdf", "size": 524288, "url": "/api/runs/<run_id>/files/report.pdf" }
+    {
+      "name": "report.pdf",
+      "size": 524288,
+      "url": "/api/runs/<run_id>/files/report.pdf",
+      "file_id": "fil_b2c3d4e5..."
+    }
   ]
 }
 ```
 
-**Download**: `GET /api/runs/:run_id/files/:filename` — returns the file with correct Content-Type and Content-Disposition header. Returns 404 if the run or file doesn't exist, or if the retention period has expired.
+| Field | Description |
+|-------|-------------|
+| `name` | Original filename as written to `$SKRUN_OUTPUT_DIR` |
+| `size` | File size in bytes |
+| `url` | Run-scoped download path (existing route — kept for backward compatibility) |
+| `file_id` | Unified-namespace identifier — use with `GET /api/files/:id/content` |
+
+**Download — two equivalent paths**:
+- `GET /api/files/:id/content` — unified namespace (recommended). Same path for input + output.
+- `GET /api/runs/:run_id/files/:filename` — run-scoped (existing route, backward-compatible).
+
+**`DELETE /api/files/:id` on a `purpose: output` file** returns `403 DELETE_OUTPUT_FORBIDDEN` — output files are owned by the run, not by the caller.
 
 | Env var | Default | Description |
 |---------|---------|-------------|
 | `FILES_MAX_SIZE_MB` | `10` | Max file size in MB (larger files excluded) |
 | `FILES_MAX_COUNT` | `20` | Max files per run |
-| `FILES_RETENTION_S` | `3600` (1 hour) | How long files are available for download |
+| `FILES_RETENTION_S` | `3600` (1 hour) | How long output files are available for download |
 
 Agents without file output get `files: []` in the response (backward compatible).
 

@@ -1,6 +1,6 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { http, HttpResponse } from "msw";
+import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { renderWithProviders } from "../test-utils";
@@ -73,7 +73,9 @@ describe("SettingsPage", () => {
     });
 
     const createButtons = screen.getAllByText("Create Key");
-    await user.click(createButtons[0]!);
+    const firstButton = createButtons[0];
+    if (!firstButton) throw new Error("Expected at least one Create Key button");
+    await user.click(firstButton);
 
     expect(screen.getByText("Create API Key")).toBeInTheDocument();
     expect(screen.getByPlaceholderText("e.g. CI pipeline, local dev...")).toBeInTheDocument();

@@ -163,6 +163,49 @@ skrun logs acme/seo-audit -n 20
 |------|-------------|
 | `-n, --lines <n>` | Number of recent runs (default: 10) |
 
+## skrun cache
+
+Manage the script-dependency cache at `~/.skrun/deps/<hash>/` (override with `SKRUN_DEPS_DIR`).
+
+When an agent declares a `package.json` / `requirements.txt` / `pyproject.toml` at its bundle root, Skrun's runtime resolves the dependencies on first call and caches the result by content hash. Identical manifests across agents share the same cache entry. See [agent-yaml.md → Script dependencies](agent-yaml.md#script-dependencies) for the full lifecycle.
+
+### skrun cache list
+
+List every cached dependency entry with hash, size, package count, and last-used timestamp.
+
+```bash
+skrun cache list
+```
+
+Output (truncated):
+
+```text
+HASH         SIZE       PACKAGES   LAST USED
+------------ ---------- ---------- ---------------
+1a2b3c4d5e6f 78.4 MB    3          2h ago
+9876543210ab 4.2 MB     1          15m ago
+------------ ---------- ---------- ---------------
+2 entries     82.6 MB    4
+```
+
+Empty cache prints `No cache entries.` and exits 0. Package count shows `?` when the entry's layout cannot be identified (corrupted install or unsupported tool).
+
+### skrun cache clear
+
+Delete every entry in the cache (hash directories + any `.tmp-*` orphans from interrupted installs).
+
+```bash
+skrun cache clear
+skrun cache clear --yes  # skip the confirmation prompt for CI scripts
+```
+
+**Options:**
+| Flag | Description |
+|------|-------------|
+| `-y, --yes` | Skip the confirmation prompt above 100 MB |
+
+When the cache exceeds 100 MB, `clear` asks for confirmation (`Cache is X.X GB. Delete all entries? [y/N]`). Below 100 MB, it deletes immediately. Use `--yes` in CI / automation to bypass the prompt regardless of size.
+
 ## Common Workflows
 
 ### New agent from scratch

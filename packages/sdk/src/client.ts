@@ -1,4 +1,4 @@
-import { SkrunApiError } from "./errors.js";
+import { SkrunApiError, SkrunFileUploadError } from "./errors.js";
 import { parseSSEStream } from "./sse.js";
 import type {
   AgentIdentifier,
@@ -9,8 +9,11 @@ import type {
   PushOptions,
   PushResult,
   RunEvent,
+  RunInput,
+  RunInputValue,
   RunOptions,
   SdkRunResult,
+  SdkUploadedFileInfo,
   SkrunClientOptions,
 } from "./types.js";
 
@@ -37,16 +40,13 @@ export class SkrunClient {
   // --- Execution methods ---
 
   /** Run an agent synchronously. Blocks until completion. */
-  async run(
-    agent: AgentIdentifier,
-    input: Record<string, unknown>,
-    options?: RunOptions,
-  ): Promise<SdkRunResult> {
+  async run(agent: AgentIdentifier, input: RunInput, options?: RunOptions): Promise<SdkRunResult> {
     const { namespace, name } = this.parseAgent(agent);
+    const resolvedInput = await this.uploadBinaryInputs(input);
     const res = await this.request(`/api/agents/${namespace}/${name}/run`, {
       method: "POST",
       headers: this.buildHeaders(options),
-      body: JSON.stringify(this.buildRunBody(input, options)),
+      body: JSON.stringify(this.buildRunBody(resolvedInput, options)),
       timeout: options?.timeout,
     });
     return (await res.json()) as SdkRunResult;
@@ -55,17 +55,18 @@ export class SkrunClient {
   /** Stream agent execution via SSE. Returns an async iterable of RunEvent objects. */
   async *stream(
     agent: AgentIdentifier,
-    input: Record<string, unknown>,
+    input: RunInput,
     options?: RunOptions,
   ): AsyncGenerator<RunEvent> {
     const { namespace, name } = this.parseAgent(agent);
+    const resolvedInput = await this.uploadBinaryInputs(input);
     const headers = this.buildHeaders(options);
     headers.Accept = "text/event-stream";
 
     const res = await this.request(`/api/agents/${namespace}/${name}/run`, {
       method: "POST",
       headers,
-      body: JSON.stringify(this.buildRunBody(input, options)),
+      body: JSON.stringify(this.buildRunBody(resolvedInput, options)),
       timeout: options?.timeout,
     });
 
@@ -75,18 +76,81 @@ export class SkrunClient {
   /** Run an agent asynchronously. Returns immediately with a run ID. Result delivered via webhook. */
   async runAsync(
     agent: AgentIdentifier,
-    input: Record<string, unknown>,
+    input: RunInput,
     webhookUrl: string,
     options?: RunOptions,
   ): Promise<AsyncRunResult> {
     const { namespace, name } = this.parseAgent(agent);
+    const resolvedInput = await this.uploadBinaryInputs(input);
     const res = await this.request(`/api/agents/${namespace}/${name}/run`, {
       method: "POST",
       headers: this.buildHeaders(options),
-      body: JSON.stringify(this.buildRunBody(input, options, webhookUrl)),
+      body: JSON.stringify(this.buildRunBody(resolvedInput, options, webhookUrl)),
       timeout: options?.timeout,
     });
     return (await res.json()) as AsyncRunResult;
+  }
+
+  /** Upload a binary value to /api/files and return the file_id reference shape. */
+  async uploadFile(
+    blob: Blob | File | Uint8Array,
+    options?: { filename?: string; contentType?: string },
+  ): Promise<SdkUploadedFileInfo> {
+    const fd = new FormData();
+    const filename = options?.filename ?? (blob instanceof File ? blob.name : "upload.bin");
+    const contentType =
+      options?.contentType ??
+      (blob instanceof Blob ? blob.type || "application/octet-stream" : "application/octet-stream");
+    const blobToSend =
+      blob instanceof Blob
+        ? blob
+        : new Blob([blob as unknown as ArrayBuffer], { type: contentType });
+    fd.append("file", blobToSend, filename);
+
+    let res: Response;
+    try {
+      res = await this.request("/api/files", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.token}` },
+        body: fd,
+      });
+    } catch (err) {
+      if (err instanceof SkrunApiError) {
+        throw new SkrunFileUploadError(`Failed to upload file: ${err.message}`, err);
+      }
+      throw new SkrunFileUploadError("Failed to upload file", err);
+    }
+    return (await res.json()) as SdkUploadedFileInfo;
+  }
+
+  /**
+   * Walk `input` for binary values (Blob/File/Uint8Array), upload each via
+   * POST /api/files, and substitute the value with the wire-format file
+   * reference shape `{type: "file", source: "id", file_id}`. Plain values
+   * pass through unchanged.
+   */
+  private async uploadBinaryInputs(input: RunInput): Promise<Record<string, unknown>> {
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(input)) {
+      if (Array.isArray(value)) {
+        const arr: unknown[] = [];
+        for (const item of value) {
+          arr.push(await this.maybeUploadValue(item));
+        }
+        out[key] = arr;
+      } else {
+        out[key] = await this.maybeUploadValue(value);
+      }
+    }
+    return out;
+  }
+
+  private async maybeUploadValue(value: RunInputValue): Promise<unknown> {
+    if (isBinaryValue(value)) {
+      const uploaded = await this.uploadFile(value);
+      return { type: "file", source: "id", file_id: uploaded.file_id };
+    }
+    return value;
   }
 
   // --- Registry methods ---
@@ -191,7 +255,7 @@ export class SkrunClient {
   }
 
   private buildRunBody(
-    input: Record<string, unknown>,
+    input: Record<string, unknown>, // resolved (post-uploadBinaryInputs)
     options?: RunOptions,
     webhookUrl?: string,
   ): Record<string, unknown> {
@@ -236,4 +300,11 @@ export class SkrunClient {
     // Non-2xx → throw typed error
     throw await SkrunApiError.fromResponse(response);
   }
+}
+
+function isBinaryValue(v: unknown): v is Blob | File | Uint8Array {
+  if (typeof Blob !== "undefined" && v instanceof Blob) return true;
+  if (typeof File !== "undefined" && v instanceof File) return true;
+  if (v instanceof Uint8Array) return true;
+  return false;
 }

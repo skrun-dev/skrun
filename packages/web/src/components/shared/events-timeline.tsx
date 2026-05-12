@@ -28,12 +28,12 @@ export function EventsTimeline({ events }: EventsTimelineProps) {
           className="flex items-start gap-3 p-2.5 rounded-lg border border-gray-100 dark:border-gray-800"
         >
           <span
-            className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium shrink-0 ${eventStyles[event.type] ?? "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400"}`}
+            className={`inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium shrink-0 ${eventStyles[event.type] ?? "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400"}`}
           >
             {event.type}
           </span>
           <div className="flex-1 min-w-0">
-            <pre className="text-xs font-mono text-gray-600 dark:text-gray-400 whitespace-pre-wrap break-words truncate max-h-20 overflow-hidden">
+            <pre className="text-xs font-mono text-gray-600 dark:text-gray-400 whitespace-pre-wrap wrap-break-word truncate max-h-20 overflow-hidden">
               {typeof event.data === "string" ? event.data : JSON.stringify(event.data, null, 2)}
             </pre>
           </div>

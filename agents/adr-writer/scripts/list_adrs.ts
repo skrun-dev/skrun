@@ -2,7 +2,7 @@
 // Input (stdin JSON): { adrs_dir }
 // Output (stdout JSON): { adrs: [{ number, slug, title, status, filename }] }
 
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 
 const ADR_FILE_REGEX = /^(\d{4})-([a-z0-9][a-z0-9-]*)\.md$/i;
@@ -65,6 +65,7 @@ process.stdin.on("end", () => {
       const match = ADR_FILE_REGEX.exec(basename(entry));
       if (!match) continue;
       const [, numStr, slug] = match;
+      if (!numStr || !slug) continue;
       const filename = entry;
       const fullPath = join(adrsDir, filename);
       let content = "";
@@ -74,9 +75,9 @@ process.stdin.on("end", () => {
         continue;
       }
       adrs.push({
-        number: Number.parseInt(numStr!, 10),
-        slug: slug!,
-        title: parseTitle(content, slug!),
+        number: Number.parseInt(numStr, 10),
+        slug,
+        title: parseTitle(content, slug),
         status: parseStatus(content),
         filename,
       });

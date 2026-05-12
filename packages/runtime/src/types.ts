@@ -1,8 +1,14 @@
 import type { AgentConfig } from "@skrun-dev/schema";
+import type { SkrunPart } from "./llm/parts.js";
 
 export interface FileInfo {
   name: string;
   size: number;
+  /**
+   * Unified-namespace file_id (`fil_<32 hex>`) assigned at collection time.
+   * Used by `GET /api/files/:id/content` for output retrieval.
+   */
+  file_id?: string;
 }
 
 export interface RunRequest {
@@ -18,6 +24,21 @@ export interface RunRequest {
   agent_version?: string;
   /** Directory where tool scripts can write output files. Set by the runtime. */
   outputDir?: string;
+  /**
+   * Resolved file-typed inputs as SkrunPart[] per field name. Set by the API
+   * layer after validating + resolving wire-format file inputs (id/data/url).
+   * Consumed by the adapter to build LLMCallRequest.userContent.
+   */
+  resolvedInputs?: Map<string, SkrunPart[]>;
+  /**
+   * Environment identifier for prompt-cache routing. Combined with agent
+   * name + version to derive a stable cache key. Defaults to `"default"`
+   * when the API doesn't have persistent environment records keyed by ID
+   * — caching is then per (agent, version) only. Refine with a hash of the
+   * environment override shape in a future feature for per-environment-shape
+   * isolation.
+   */
+  environmentId?: string;
 }
 
 export interface RunResult {
@@ -30,6 +51,10 @@ export interface RunResult {
     completionTokens: number;
     totalTokens: number;
     estimatedCost: number;
+    /** Tokens served from provider-side cache. Optional — undefined when no cache activity. */
+    cacheReadTokens?: number;
+    /** Tokens written to provider-side cache. Anthropic only. Optional. */
+    cacheWriteTokens?: number;
   };
   durationMs: number;
   error?: string;
@@ -77,6 +102,10 @@ export interface RunCompleteEvent extends BaseRunEvent {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
+    /** Tokens served from provider-side cache. Snake_case wire format. */
+    cache_read_tokens?: number;
+    /** Tokens written to provider-side cache. Anthropic only. */
+    cache_write_tokens?: number;
   };
   cost: { estimated: number };
   duration_ms: number;

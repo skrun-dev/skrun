@@ -1,10 +1,13 @@
 name: dev/receipts-to-expenses
-version: 0.1.0
+version: 0.4.0
 
-# NOTE: this demo accepts receipts as already-extracted text (one .txt per receipt).
-# A future version will accept image inputs directly once Skrun's runtime supports
-# multimodal inputs (planned). Until then, an upstream OCR step (Tesseract, vision
-# LLM via separate API, etc.) is the user's responsibility.
+# v0.4.0: tool_choice: build_workbook (#58) so Gemini Flash always invokes the
+#         workbook builder (previously skipped, returning JSON only — vt29 live fail).
+# v0.3.0: deps now auto-resolved by Skrun runtime via requirements.txt (#57).
+#         Manual `pip install -r requirements.txt` no longer needed.
+# v0.2.0: vision-native. Receipts are passed as image inputs (JPEG/PNG/WebP/HEIC),
+#         read directly by the LLM via Skrun's multimodal-inputs feature (#56).
+# v0.1.0: text-mode + read_receipts tool + upstream OCR (removed in v0.2.0).
 
 model:
   provider: google
@@ -13,17 +16,9 @@ model:
     provider: google
     name: gemini-2.5-flash-lite
 
+tool_choice: build_workbook
+
 tools:
-  - name: read_receipts
-    description: Scan a directory for `.txt` receipt files. Each file contains the extracted text content of one receipt (vendor, date, amount, etc.). Returns the list of files with their text content for the LLM to parse field-by-field.
-    input_schema:
-      type: object
-      properties:
-        receipts_dir:
-          type: string
-          description: Path to a directory containing one .txt file per receipt. Subdirectories are scanned recursively.
-      required: [receipts_dir]
-      additionalProperties: false
   - name: read_bank_statement
     description: Optional — read a CSV bank statement for fuzzy reconciliation. Returns the rows. Skip if user did not pass `bank_statement_csv`.
     input_schema:
@@ -44,8 +39,9 @@ tools:
           items:
             type: object
             properties:
-              source_file:
-                type: string
+              source_index:
+                type: integer
+                description: Position of the receipt image in the input array (0-based).
               vendor:
                 type: string
               date:
@@ -61,7 +57,7 @@ tools:
               matched_bank_row:
                 type: string
                 description: Optional - bank statement row label if reconciled.
-            required: [source_file, vendor, date, amount, currency, category]
+            required: [source_index, vendor, date, amount, currency, category]
             additionalProperties: false
         category_totals:
           type: array
@@ -89,10 +85,14 @@ tools:
       additionalProperties: false
 
 inputs:
-  - name: receipts_dir
-    type: string
+  - name: receipts
+    type: file
+    media: image
+    mime_types: [image/jpeg, image/png, image/webp, image/heic]
+    max_size: 10000000
+    max_count: 20
     required: true
-    description: Path to a directory of .txt files, one per receipt. Each file is the OCR-extracted text of a receipt (vendor name, date, amount, line items as plain text).
+    description: One or more receipt photos (JPEG/PNG/WebP/HEIC). The LLM reads each image directly using its vision capability — no upstream OCR step required.
   - name: bank_statement_csv
     type: string
     required: false
@@ -130,16 +130,3 @@ environment:
 state:
   type: none
   ttl: 30d
-
-tests:
-  - name: process-3-receipts
-    input:
-      receipts_dir: ./fixtures/sample-receipts
-      month: "2026-04"
-    assert: output.receipt_count >= 3
-  - name: with-bank-reconciliation
-    input:
-      receipts_dir: ./fixtures/sample-receipts
-      bank_statement_csv: ./fixtures/sample-bank.csv
-      month: "2026-04"
-    assert: output.unmatched_count >= 0

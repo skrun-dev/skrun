@@ -4,17 +4,18 @@ import { IconChevRight, IconPlay } from "../components/shared/icons";
 import { JsonViewer } from "../components/shared/json-viewer";
 import { Btn, Card, PageHeader, Pill, StatusPill } from "../components/shared/ui";
 import { type RunEvent, useRun } from "../lib/api-client";
+import { formatUsd } from "../lib/format";
 
 export function RunDetailPage() {
-  const { id } = useParams<{ id: string }>();
+  const { id = "" } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const { data: run, isLoading, error } = useRun(id!);
+  const { data: run, isLoading, error } = useRun(id);
 
   if (isLoading) {
     return (
       <div className="space-y-4">
-        <div className="h-8 w-64 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
-        <div className="h-48 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
+        <div className="h-8 w-64 bg-gray-100 dark:bg-gray-800 rounded-sm animate-pulse" />
+        <div className="h-48 bg-gray-100 dark:bg-gray-800 rounded-sm animate-pulse" />
       </div>
     );
   }
@@ -104,7 +105,17 @@ export function RunDetailPage() {
           { l: "Input tokens", v: run.usage_prompt_tokens.toLocaleString(), mono: false },
           { l: "Output tokens", v: run.usage_completion_tokens.toLocaleString(), mono: false },
           { l: "Total tokens", v: run.usage_total_tokens.toLocaleString(), mono: false },
-          { l: "Cost", v: `$${run.usage_estimated_cost.toFixed(4)}`, mono: false },
+          {
+            l: "Cost",
+            v: `$${run.usage_estimated_cost.toFixed(4)}`,
+            mono: false,
+            // Surface savings only on completed runs with non-zero savings.
+            // Hidden for failed / running / cancelled regardless of value.
+            sub:
+              run.status === "completed" && run.usage_cache_savings_usd > 0
+                ? `saved ${formatUsd(run.usage_cache_savings_usd)}`
+                : undefined,
+          },
           { l: "Model", v: run.model ?? "\u2014", mono: true },
         ].map((s) => (
           <div key={s.l} className="bg-white dark:bg-gray-950/40 px-4 py-3">
@@ -116,6 +127,14 @@ export function RunDetailPage() {
             >
               {s.v}
             </div>
+            {s.sub && (
+              <div
+                className="text-[11px] text-gray-400 dark:text-gray-600 mt-0.5"
+                data-testid="cost-cell-saved"
+              >
+                {s.sub}
+              </div>
+            )}
           </div>
         ))}
       </div>
@@ -144,7 +163,11 @@ export function RunDetailPage() {
           title={run.status === "failed" ? "Error" : "Output"}
           action={
             <span className="text-[10px] font-mono text-gray-400">
-              {run.output ? `${JSON.stringify(run.output).length} B` : "—"}
+              {run.status === "failed" && run.error
+                ? `${run.error.length} B`
+                : run.output
+                  ? `${JSON.stringify(run.output).length} B`
+                  : "—"}
             </span>
           }
           pad={false}
@@ -152,7 +175,9 @@ export function RunDetailPage() {
           <div className="p-4 bg-gray-50/40 dark:bg-gray-950/60">
             {run.status === "failed" && run.error ? (
               <div className="bg-red-500/5 border border-red-200 dark:border-red-800/50 rounded-md p-3">
-                <p className="text-sm text-red-600 dark:text-red-400 font-mono">{run.error}</p>
+                <p className="text-sm text-red-600 dark:text-red-400 font-mono break-all whitespace-pre-wrap">
+                  {run.error}
+                </p>
               </div>
             ) : run.output ? (
               <JsonViewer data={run.output} />

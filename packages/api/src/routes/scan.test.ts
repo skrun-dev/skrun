@@ -25,7 +25,6 @@ describe("GET /api/agents/scan", () => {
   beforeEach(() => {
     const ctx = createTestApp();
     app = ctx.app;
-    // biome-ignore lint/performance/noDelete: Node.js requires delete to truly unset env vars
     delete process.env.SKRUN_AGENTS_DIR;
   });
 
@@ -33,7 +32,6 @@ describe("GET /api/agents/scan", () => {
     if (originalEnv !== undefined) {
       process.env.SKRUN_AGENTS_DIR = originalEnv;
     } else {
-      // biome-ignore lint/performance/noDelete: Node.js requires delete to truly unset env vars
       delete process.env.SKRUN_AGENTS_DIR;
     }
   });

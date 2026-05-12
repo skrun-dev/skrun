@@ -7,8 +7,9 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
     openapi: "3.1.0",
     info: {
       title: "Skrun API",
-      version: "0.6.0",
-      description: "Deploy any Agent Skill as an API. Multi-model, stateful, open source.",
+      version: "0.7.0",
+      description:
+        "Deploy any Agent Skill as an API. Multi-model, stateful, multimodal, open source.",
       license: { name: "MIT", url: "https://github.com/skrun-dev/skrun/blob/main/LICENSE" },
     },
     servers: [{ url: baseUrl, description: "Registry server" }],
@@ -61,12 +62,32 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                 prompt_tokens: { type: "integer" },
                 completion_tokens: { type: "integer" },
                 total_tokens: { type: "integer" },
+                cache_read_tokens: {
+                  type: "integer",
+                  description:
+                    "Tokens served from the provider's prompt cache. Optional — only present when the provider returned cache activity. Billed at the cached-read rate (typically 0.10× input on Anthropic / GPT-5.x / Gemini, 0.5× on Groq gpt-oss / OpenAI gpt-4o legacy). NOT included in prompt_tokens (which is the FULL-RATE residual).",
+                },
+                cache_write_tokens: {
+                  type: "integer",
+                  description:
+                    "Tokens written to the provider's prompt cache. Anthropic only — other providers do not expose a separate cache write surcharge. Optional, undefined for non-Anthropic models.",
+                },
               },
             },
             warnings: { type: "array", items: { type: "string" } },
             cost: {
               type: "object",
-              properties: { estimated: { type: "number" } },
+              properties: {
+                estimated: {
+                  type: "number",
+                  description: "Total cost (USD) for this run.",
+                },
+                saved: {
+                  type: "number",
+                  description:
+                    "Dollar savings (USD) produced by prompt-caching on this run, computed at write time from `cacheReadTokens × (full_input_rate - cached_rate)`. Surfaced only when > 0 (omitted otherwise). Aligned with NUMERIC(10,6) DB precision.",
+                },
+              },
             },
             duration_ms: { type: "integer" },
             files: {
@@ -85,11 +106,66 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
             size: { type: "integer", description: "File size in bytes", example: 524288 },
             url: {
               type: "string",
-              description: "Download URL (GET endpoint or presigned URL in cloud)",
+              description:
+                "Run-scoped download URL (existing route, kept for backward-compat). Prefer GET /api/files/:id/content via the unified namespace using `file_id`.",
               example: "/api/runs/uuid/files/report.pdf",
+            },
+            file_id: {
+              type: "string",
+              pattern: "^fil_[0-9a-f]{32}$",
+              description:
+                "Unified-namespace identifier for GET /api/files/{file_id}/content. Optional for backward-compat.",
+              example: "fil_a1b2c3d4e5f6789012345678901234ab",
             },
           },
           required: ["name", "size", "url"],
+        },
+        WireFileSource: {
+          oneOf: [
+            {
+              type: "object",
+              description: "Reference an already-uploaded file by id (recommended for >4 MB).",
+              properties: {
+                type: { const: "file" },
+                source: { const: "id" },
+                file_id: { type: "string", pattern: "^fil_[0-9a-f]{32}$" },
+              },
+              required: ["type", "source", "file_id"],
+            },
+            {
+              type: "object",
+              description: "Inline base64 — capped at INPUT_FILES_MAX_INLINE_MB (default 4 MB).",
+              properties: {
+                type: { const: "file" },
+                source: { const: "data" },
+                media_type: { type: "string", example: "image/jpeg" },
+                data: { type: "string", description: "Base64-encoded bytes" },
+              },
+              required: ["type", "source", "media_type", "data"],
+            },
+            {
+              type: "object",
+              description: "Public URL — fetched server-side, subject to allowed_hosts.",
+              properties: {
+                type: { const: "file" },
+                source: { const: "url" },
+                url: { type: "string", format: "uri" },
+              },
+              required: ["type", "source", "url"],
+            },
+          ],
+          discriminator: { propertyName: "source" },
+        },
+        UploadedFileMetadata: {
+          type: "object",
+          properties: {
+            file_id: { type: "string", pattern: "^fil_[0-9a-f]{32}$" },
+            size: { type: "integer" },
+            media_type: { type: "string", example: "image/jpeg" },
+            purpose: { type: "string", enum: ["input", "output"] },
+            expires_at: { type: "string", format: "date-time" },
+          },
+          required: ["file_id", "size", "media_type", "purpose"],
         },
         AsyncRunResult: {
           type: "object",
@@ -633,6 +709,49 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
           },
         },
       },
+      "/api/agents/{namespace}/{name}/versions/{version}": {
+        delete: {
+          summary: "Delete a single version of an agent",
+          operationId: "deleteAgentVersion",
+          description:
+            "Permanently remove one version of an agent. Returns 409 LAST_VERSION if it would leave the agent with no versions; use DELETE /api/agents/{namespace}/{name} to remove the agent entirely. Past runs referencing this version remain readable (agent_version is a text column).",
+          parameters: [
+            { name: "namespace", in: "path", required: true, schema: { type: "string" } },
+            { name: "name", in: "path", required: true, schema: { type: "string" } },
+            { name: "version", in: "path", required: true, schema: { type: "string" } },
+          ],
+          responses: {
+            "204": {
+              description: "Version deleted (no content)",
+            },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description: "Forbidden (not namespace owner)",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "404": {
+              description: "Agent (NOT_FOUND) or version (VERSION_NOT_FOUND) not found",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "409": {
+              description:
+                "LAST_VERSION — cannot delete the last remaining version. Use DELETE /api/agents/{namespace}/{name} for full removal.",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+      },
       "/api/agents/{namespace}/{name}/verify": {
         patch: {
           summary: "Verify or unverify an agent",
@@ -902,10 +1021,10 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
       },
       "/api/runs/{run_id}/files/{filename}": {
         get: {
-          summary: "Download a file produced by an agent run",
+          summary: "Download a file produced by an agent run (run-scoped, backward-compat)",
           operationId: "getRunFile",
           description:
-            "Returns a file produced during agent execution. Files are available for a limited time after the run (default: 1 hour, configurable via FILES_RETENTION_S).",
+            "Run-scoped download. Kept for backward compatibility. New clients should prefer the unified GET /api/files/{id}/content using `file_id` from the run response.",
           security: [],
           parameters: [
             {
@@ -925,6 +1044,158 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
             },
             "404": {
               description: "Run or file not found",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+      },
+      "/api/files": {
+        post: {
+          summary: "Upload an input file (for use with `file`-typed agent inputs)",
+          operationId: "uploadInputFile",
+          description:
+            "Multipart upload returning a `file_id` to reference in subsequent POST /run calls. Broad media-class allowlist at upload (image/*, application/pdf, audio/*); strict per-agent mime check happens at /run time. Default 24h retention (INPUT_FILES_RETENTION_S). Default 25 MB max (INPUT_FILES_MAX_SIZE_MB).",
+          requestBody: {
+            required: true,
+            content: {
+              "multipart/form-data": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    file: { type: "string", format: "binary" },
+                  },
+                  required: ["file"],
+                },
+              },
+            },
+          },
+          responses: {
+            "201": {
+              description: "Uploaded — file_id and metadata",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/UploadedFileMetadata" },
+                },
+              },
+            },
+            "400": {
+              description: "INVALID_MULTIPART or MISSING_FILE",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "401": {
+              description: "Missing or invalid Authorization header",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "413": {
+              description: "FILE_TOO_LARGE — exceeds INPUT_FILES_MAX_SIZE_MB",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "415": {
+              description:
+                "MIME_NOT_ALLOWED — outside the broad upload allowlist (image/*, application/pdf, audio/*)",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+      },
+      "/api/files/{id}": {
+        get: {
+          summary: "Get file metadata (input or output, unified namespace)",
+          operationId: "getFileMetadata",
+          security: [],
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string", pattern: "^fil_[0-9a-f]{32}$" },
+            },
+          ],
+          responses: {
+            "200": {
+              description: "File metadata",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/UploadedFileMetadata" },
+                },
+              },
+            },
+            "404": {
+              description: "FILE_NOT_FOUND — unknown or expired file_id",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+        delete: {
+          summary: "Delete an uploaded input file",
+          operationId: "deleteInputFile",
+          description:
+            "Removes the file from storage. Returns 403 DELETE_OUTPUT_FORBIDDEN if the file_id refers to an agent-produced output (callers don't own outputs).",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string", pattern: "^fil_[0-9a-f]{32}$" },
+            },
+          ],
+          responses: {
+            "204": { description: "Deleted" },
+            "401": {
+              description: "Missing or invalid Authorization header",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description: "DELETE_OUTPUT_FORBIDDEN — cannot delete output files",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "404": {
+              description: "FILE_NOT_FOUND",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+      },
+      "/api/files/{id}/content": {
+        get: {
+          summary: "Download file binary content (input or output, unified namespace)",
+          operationId: "getFileContent",
+          security: [],
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string", pattern: "^fil_[0-9a-f]{32}$" },
+            },
+          ],
+          responses: {
+            "200": {
+              description: "Binary file content with Content-Type from upload",
+              content: {
+                "application/octet-stream": { schema: { type: "string", format: "binary" } },
+              },
+            },
+            "404": {
+              description: "FILE_NOT_FOUND",
               content: {
                 "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
@@ -972,6 +1243,38 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                         minItems: 7,
                         maxItems: 7,
                       },
+                      cache_savings_today: {
+                        type: "number",
+                        description:
+                          "Total dollar savings (USD) produced by prompt-caching today. Filtered by authenticated user (multi-tenancy).",
+                      },
+                      cache_savings_yesterday: {
+                        type: "number",
+                        description:
+                          "Total dollar savings (USD) produced by prompt-caching yesterday.",
+                      },
+                      daily_cache_savings: {
+                        type: "array",
+                        items: { type: "number" },
+                        minItems: 7,
+                        maxItems: 7,
+                        description: "7-day daily savings in USD (oldest first, index 6 = today).",
+                      },
+                      cost_today: {
+                        type: "number",
+                        description: "Total estimated cost (USD) today, summed across all runs.",
+                      },
+                      cost_yesterday: {
+                        type: "number",
+                        description: "Total estimated cost (USD) yesterday.",
+                      },
+                      daily_cost: {
+                        type: "array",
+                        items: { type: "number" },
+                        minItems: 7,
+                        maxItems: 7,
+                        description: "7-day daily cost in USD (oldest first, index 6 = today).",
+                      },
                     },
                   },
                 },
@@ -1017,6 +1320,37 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                       daily_tokens: { type: "array", items: { type: "integer" } },
                       daily_failed: { type: "array", items: { type: "integer" } },
                       daily_avg_duration_ms: { type: "array", items: { type: "integer" } },
+                      cache_savings: {
+                        type: "number",
+                        description:
+                          "Total dollar savings (USD) produced by prompt-caching for this agent over the current period.",
+                      },
+                      prev_cache_savings: {
+                        type: "number",
+                        description:
+                          "Total dollar savings (USD) for the previous period (same window length, shifted back by `days`).",
+                      },
+                      daily_cache_savings: {
+                        type: "array",
+                        items: { type: "number" },
+                        description:
+                          "Daily savings array (USD). Length matches the `days` query parameter (default 7).",
+                      },
+                      cost: {
+                        type: "number",
+                        description:
+                          "Total estimated cost (USD) for this agent over the current period.",
+                      },
+                      prev_cost: {
+                        type: "number",
+                        description: "Total estimated cost (USD) for the previous period.",
+                      },
+                      daily_cost: {
+                        type: "array",
+                        items: { type: "number" },
+                        description:
+                          "Daily cost array (USD). Length matches the `days` query parameter (default 7).",
+                      },
                     },
                   },
                 },
@@ -1095,6 +1429,21 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                       usage_completion_tokens: { type: "integer" },
                       usage_total_tokens: { type: "integer" },
                       usage_estimated_cost: { type: "number" },
+                      usage_cache_read_tokens: {
+                        type: "integer",
+                        description:
+                          "Tokens served from the provider's prompt cache. Persisted at run completion; 0 for runs without cache activity or for failed runs.",
+                      },
+                      usage_cache_write_tokens: {
+                        type: "integer",
+                        description:
+                          "Tokens written to the provider's prompt cache (Anthropic only). 0 for non-Anthropic models or runs without cache activity.",
+                      },
+                      usage_cache_savings_usd: {
+                        type: "number",
+                        description:
+                          "Dollar savings (USD) produced by prompt-caching on this run. Snapshot at write time from `cacheReadTokens × (full_input_rate - cached_rate)`. Aligned with NUMERIC(10,6) precision; 0 for failed runs (no partial accounting).",
+                      },
                       duration_ms: { type: ["integer", "null"] },
                       created_at: { type: "string", format: "date-time" },
                       completed_at: { type: ["string", "null"], format: "date-time" },

@@ -1,5 +1,9 @@
 name: dev/knowledge-base-from-vault
-version: 0.1.0
+version: 0.2.0
+# v0.2.0: deps now auto-resolved by Skrun runtime via package.json (#57).
+# v0.1.0 hand-rolled a 95-line STORE-method ZIP writer because the runtime
+# could not bundle/resolve npm deps. v0.2.0 declares jszip as a normal Node
+# dep and uses ~5 lines of jszip API instead.
 
 model:
   provider: google

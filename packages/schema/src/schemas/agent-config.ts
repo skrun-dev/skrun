@@ -40,11 +40,13 @@ export const AgentConfigSchema = z
       )
       .default([]),
     mcp_servers: z.array(McpServerSchema).default([]),
+    tool_choice: z.string().default("auto"),
+    parallel_tools: z.boolean().default(true),
     inputs: z.array(InputFieldSchema).min(1, "At least one input is required"),
     outputs: z.array(OutputFieldSchema).min(1, "At least one output is required"),
-    environment: EnvironmentConfigSchema.default({}),
+    environment: EnvironmentConfigSchema.prefault({}),
     context_mode: z.enum(["skill", "persistent"]).default("skill"),
-    state: StateConfigSchema.default({}),
+    state: StateConfigSchema.prefault({}),
     tests: z.array(TestCaseSchema).default([]),
   })
   .strict();

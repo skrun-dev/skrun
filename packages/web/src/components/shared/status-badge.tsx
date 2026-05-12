@@ -14,7 +14,7 @@ interface StatusBadgeProps {
 export function StatusBadge({ status }: StatusBadgeProps) {
   return (
     <span
-      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${statusStyles[status]}`}
+      className={`inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium ${statusStyles[status]}`}
     >
       {status}
     </span>
@@ -28,7 +28,7 @@ interface VerifiedBadgeProps {
 export function VerifiedBadge({ verified }: VerifiedBadgeProps) {
   if (!verified) return null;
   return (
-    <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
+    <span className="inline-flex items-center px-1.5 py-0.5 rounded-sm text-xs font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
       verified
     </span>
   );

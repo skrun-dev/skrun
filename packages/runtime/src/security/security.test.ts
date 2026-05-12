@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { checkCost } from "./cost-checker.js";
-import { TimeoutError, parseTimeout, withTimeout } from "./timeout.js";
+import { parseTimeout, TimeoutError, withTimeout } from "./timeout.js";
 
 describe("parseTimeout", () => {
   it("should parse seconds to milliseconds", () => {

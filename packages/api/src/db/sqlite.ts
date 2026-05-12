@@ -80,6 +80,9 @@ CREATE TABLE IF NOT EXISTS runs (
   usage_completion_tokens INTEGER NOT NULL DEFAULT 0,
   usage_total_tokens INTEGER NOT NULL DEFAULT 0,
   usage_estimated_cost REAL NOT NULL DEFAULT 0,
+  usage_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  usage_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+  usage_cache_savings_usd REAL NOT NULL DEFAULT 0,
   duration_ms INTEGER,
   files TEXT,
   created_at TEXT NOT NULL,
@@ -112,6 +115,23 @@ export class SqliteDb implements DbAdapter {
     // Migration: add agent_versions.notes (from #14c)
     if (!hasColumn("agent_versions", "notes")) {
       this.db.exec("ALTER TABLE agent_versions ADD COLUMN notes TEXT");
+    }
+
+    // Migration 004: add cache token + savings columns to runs (cache-cost-savings).
+    // Mirrors the .sql file targeting Postgres/Supabase. SQLite uses REAL for
+    // the fractional NUMERIC(10,6) usage_cache_savings_usd column.
+    if (!hasColumn("runs", "usage_cache_read_tokens")) {
+      this.db.exec(
+        "ALTER TABLE runs ADD COLUMN usage_cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (!hasColumn("runs", "usage_cache_write_tokens")) {
+      this.db.exec(
+        "ALTER TABLE runs ADD COLUMN usage_cache_write_tokens INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (!hasColumn("runs", "usage_cache_savings_usd")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN usage_cache_savings_usd REAL NOT NULL DEFAULT 0");
     }
   }
 
@@ -147,6 +167,12 @@ export class SqliteDb implements DbAdapter {
       input: this.jsonParse(row.input as string) as Record<string, unknown> | null,
       output: this.jsonParse(row.output as string) as Record<string, unknown> | null,
       files: this.jsonParse(row.files as string) as Record<string, unknown>[] | null,
+      // Defensive fallbacks for legacy DBs not yet migrated to 004 (cache columns).
+      // Once SqliteDb.migrate() runs, these are populated from row.*; the ?? 0
+      // handles the brief window where typecheck passes but values are absent.
+      usage_cache_read_tokens: (row.usage_cache_read_tokens as number | undefined) ?? 0,
+      usage_cache_write_tokens: (row.usage_cache_write_tokens as number | undefined) ?? 0,
+      usage_cache_savings_usd: (row.usage_cache_savings_usd as number | undefined) ?? 0,
     } as Run;
   }
 
@@ -188,16 +214,25 @@ export class SqliteDb implements DbAdapter {
   async listAgents(
     page: number,
     limit: number,
-  ): Promise<{ agents: (Agent & { run_count: number; token_count: number })[]; total: number }> {
+  ): Promise<{
+    agents: (Agent & { run_count: number; token_count: number; cost_total: number })[];
+    total: number;
+  }> {
     const total = (this.db.prepare("SELECT COUNT(*) as cnt FROM agents").get() as { cnt: number })
       .cnt;
     const offset = (page - 1) * limit;
     const rows = this.db
       .prepare(
-        `SELECT a.*, COALESCE(r.run_count, 0) as run_count, COALESCE(r.token_count, 0) as token_count
+        `SELECT a.*,
+         COALESCE(r.run_count, 0) as run_count,
+         COALESCE(r.token_count, 0) as token_count,
+         COALESCE(r.cost_total, 0) as cost_total
          FROM agents a
          LEFT JOIN (
-           SELECT agent_id, COUNT(*) as run_count, SUM(usage_total_tokens) as token_count
+           SELECT agent_id,
+             COUNT(*) as run_count,
+             SUM(usage_total_tokens) as token_count,
+             SUM(usage_estimated_cost) as cost_total
            FROM runs GROUP BY agent_id
          ) r ON r.agent_id = a.id
          LIMIT ? OFFSET ?`,
@@ -207,6 +242,7 @@ export class SqliteDb implements DbAdapter {
       ...this.toAgent(row),
       run_count: (row.run_count as number) ?? 0,
       token_count: (row.token_count as number) ?? 0,
+      cost_total: (row.cost_total as number) ?? 0,
     }));
     return { agents, total };
   }
@@ -283,6 +319,12 @@ export class SqliteDb implements DbAdapter {
       .prepare("SELECT * FROM agent_versions WHERE agent_id = ? AND version = ?")
       .get(agentId, version) as Record<string, unknown> | undefined;
     return row ? this.toVersion(row) : null;
+  }
+
+  async deleteVersion(agentId: string, version: string): Promise<void> {
+    this.db
+      .prepare("DELETE FROM agent_versions WHERE agent_id = ? AND version = ?")
+      .run(agentId, version);
   }
 
   // ── Agent State ───────────────────────────────────────────────────────
@@ -485,6 +527,9 @@ export class SqliteDb implements DbAdapter {
       usage_completion_tokens: 0,
       usage_total_tokens: 0,
       usage_estimated_cost: 0,
+      usage_cache_read_tokens: 0,
+      usage_cache_write_tokens: 0,
+      usage_cache_savings_usd: 0,
       duration_ms: null,
       files: null,
       created_at: now,
@@ -530,6 +575,9 @@ export class SqliteDb implements DbAdapter {
         | "usage_completion_tokens"
         | "usage_total_tokens"
         | "usage_estimated_cost"
+        | "usage_cache_read_tokens"
+        | "usage_cache_write_tokens"
+        | "usage_cache_savings_usd"
         | "duration_ms"
         | "files"
         | "completed_at"
@@ -590,7 +638,7 @@ export class SqliteDb implements DbAdapter {
 
   // ── Stats ─────────────────────────────────────────────────────────────
 
-  async getStats() {
+  async getStats(opts?: { userId?: string }) {
     const agents_count = (
       this.db.prepare("SELECT COUNT(*) as cnt FROM agents").get() as { cnt: number }
     ).cnt;
@@ -608,35 +656,68 @@ export class SqliteDb implements DbAdapter {
     sevenDaysAgo.setUTCDate(sevenDaysAgo.getUTCDate() - 6);
     const sevenDaysAgoISO = sevenDaysAgo.toISOString();
 
+    // Multi-tenancy: when userId provided, every aggregate filters WHERE user_id = ?
+    // Self-host single-tenant (dev-token mode) passes a deterministic userId so
+    // the filter narrows to that user; cloud mode isolates per-user stats.
+    const userClause = opts?.userId ? "AND user_id = ?" : "";
+    const userArg = opts?.userId ? [opts.userId] : [];
+
     const todayRow = this.db
       .prepare(
         `SELECT COUNT(*) as runs, COALESCE(SUM(usage_total_tokens), 0) as tokens,
-         COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed
-         FROM runs WHERE created_at >= ?`,
+         COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed,
+         COALESCE(SUM(usage_cache_savings_usd), 0) as cache_savings,
+         COALESCE(SUM(usage_estimated_cost), 0) as cost
+         FROM runs WHERE created_at >= ? ${userClause}`,
       )
-      .get(todayISO) as { runs: number; tokens: number; failed: number };
+      .get(todayISO, ...userArg) as {
+      runs: number;
+      tokens: number;
+      failed: number;
+      cache_savings: number;
+      cost: number;
+    };
 
     const yesterdayRow = this.db
       .prepare(
         `SELECT COUNT(*) as runs, COALESCE(SUM(usage_total_tokens), 0) as tokens,
-         COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed
-         FROM runs WHERE created_at >= ? AND created_at < ?`,
+         COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed,
+         COALESCE(SUM(usage_cache_savings_usd), 0) as cache_savings,
+         COALESCE(SUM(usage_estimated_cost), 0) as cost
+         FROM runs WHERE created_at >= ? AND created_at < ? ${userClause}`,
       )
-      .get(yesterdayISO, todayISO) as { runs: number; tokens: number; failed: number };
+      .get(yesterdayISO, todayISO, ...userArg) as {
+      runs: number;
+      tokens: number;
+      failed: number;
+      cache_savings: number;
+      cost: number;
+    };
 
     // Daily arrays (7 items)
     const dailyRows = this.db
       .prepare(
         `SELECT date(created_at) as day, COUNT(*) as runs,
          COALESCE(SUM(usage_total_tokens), 0) as tokens,
-         COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed
-         FROM runs WHERE created_at >= ? GROUP BY day ORDER BY day`,
+         COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed,
+         COALESCE(SUM(usage_cache_savings_usd), 0) as cache_savings,
+         COALESCE(SUM(usage_estimated_cost), 0) as cost
+         FROM runs WHERE created_at >= ? ${userClause} GROUP BY day ORDER BY day`,
       )
-      .all(sevenDaysAgoISO) as { day: string; runs: number; tokens: number; failed: number }[];
+      .all(sevenDaysAgoISO, ...userArg) as {
+      day: string;
+      runs: number;
+      tokens: number;
+      failed: number;
+      cache_savings: number;
+      cost: number;
+    }[];
 
     const dailyRuns = new Array<number>(7).fill(0);
     const dailyTokens = new Array<number>(7).fill(0);
     const dailyFailed = new Array<number>(7).fill(0);
+    const dailyCacheSavings = new Array<number>(7).fill(0);
+    const dailyCost = new Array<number>(7).fill(0);
 
     for (const row of dailyRows) {
       const rowDate = new Date(`${row.day}T00:00:00.000Z`);
@@ -647,6 +728,8 @@ export class SqliteDb implements DbAdapter {
         dailyRuns[dayIndex] = row.runs;
         dailyTokens[dayIndex] = row.tokens;
         dailyFailed[dayIndex] = row.failed;
+        dailyCacheSavings[dayIndex] = row.cache_savings;
+        dailyCost[dayIndex] = row.cost;
       }
     }
 
@@ -661,6 +744,12 @@ export class SqliteDb implements DbAdapter {
       daily_runs: dailyRuns,
       daily_tokens: dailyTokens,
       daily_failed: dailyFailed,
+      cache_savings_today: todayRow.cache_savings,
+      cache_savings_yesterday: yesterdayRow.cache_savings,
+      daily_cache_savings: dailyCacheSavings,
+      cost_today: todayRow.cost,
+      cost_yesterday: yesterdayRow.cost,
+      daily_cost: dailyCost,
     };
   }
 
@@ -682,17 +771,28 @@ export class SqliteDb implements DbAdapter {
       .prepare(
         `SELECT COUNT(*) as runs, COALESCE(SUM(usage_total_tokens), 0) as tokens,
          COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed,
-         COALESCE(AVG(CASE WHEN duration_ms IS NOT NULL THEN duration_ms END), 0) as avg_dur
+         COALESCE(AVG(CASE WHEN duration_ms IS NOT NULL THEN duration_ms END), 0) as avg_dur,
+         COALESCE(SUM(usage_cache_savings_usd), 0) as cache_savings,
+         COALESCE(SUM(usage_estimated_cost), 0) as cost
          FROM runs WHERE agent_id = ? AND created_at >= ?`,
       )
-      .get(agentId, periodISO) as { runs: number; tokens: number; failed: number; avg_dur: number };
+      .get(agentId, periodISO) as {
+      runs: number;
+      tokens: number;
+      failed: number;
+      avg_dur: number;
+      cache_savings: number;
+      cost: number;
+    };
 
     // Previous period
     const prev = this.db
       .prepare(
         `SELECT COUNT(*) as runs, COALESCE(SUM(usage_total_tokens), 0) as tokens,
          COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed,
-         COALESCE(AVG(CASE WHEN duration_ms IS NOT NULL THEN duration_ms END), 0) as avg_dur
+         COALESCE(AVG(CASE WHEN duration_ms IS NOT NULL THEN duration_ms END), 0) as avg_dur,
+         COALESCE(SUM(usage_cache_savings_usd), 0) as cache_savings,
+         COALESCE(SUM(usage_estimated_cost), 0) as cost
          FROM runs WHERE agent_id = ? AND created_at >= ? AND created_at < ?`,
       )
       .get(agentId, prevISO, periodISO) as {
@@ -700,6 +800,8 @@ export class SqliteDb implements DbAdapter {
       tokens: number;
       failed: number;
       avg_dur: number;
+      cache_savings: number;
+      cost: number;
     };
 
     // Daily arrays (always 7 items for sparklines)
@@ -740,6 +842,29 @@ export class SqliteDb implements DbAdapter {
       }
     }
 
+    // daily_cache_savings + daily_cost array lengths match the `days` parameter.
+    const dailyPeriodRows = this.db
+      .prepare(
+        `SELECT date(created_at) as day,
+         COALESCE(SUM(usage_cache_savings_usd), 0) as cache_savings,
+         COALESCE(SUM(usage_estimated_cost), 0) as cost
+         FROM runs WHERE agent_id = ? AND created_at >= ? GROUP BY day ORDER BY day`,
+      )
+      .all(agentId, periodISO) as { day: string; cache_savings: number; cost: number }[];
+
+    const dailyCacheSavings = new Array<number>(days).fill(0);
+    const dailyCost = new Array<number>(days).fill(0);
+    for (const row of dailyPeriodRows) {
+      const rowDate = new Date(`${row.day}T00:00:00.000Z`);
+      const dayIndex = Math.floor(
+        (rowDate.getTime() - periodStart.getTime()) / (24 * 60 * 60 * 1000),
+      );
+      if (dayIndex >= 0 && dayIndex < days) {
+        dailyCacheSavings[dayIndex] = row.cache_savings;
+        dailyCost[dayIndex] = row.cost;
+      }
+    }
+
     return {
       runs: cur.runs,
       tokens: cur.tokens,
@@ -753,6 +878,12 @@ export class SqliteDb implements DbAdapter {
       daily_tokens: dailyTokens,
       daily_failed: dailyFailed,
       daily_avg_duration_ms: dailyAvgDuration,
+      cache_savings: cur.cache_savings,
+      prev_cache_savings: prev.cache_savings,
+      daily_cache_savings: dailyCacheSavings,
+      cost: cur.cost,
+      prev_cost: prev.cost,
+      daily_cost: dailyCost,
     };
   }
 

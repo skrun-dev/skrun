@@ -1,4 +1,5 @@
 import { parseAgentYaml } from "@skrun-dev/schema";
+import { bundleCache } from "../cache/bundle-cache.js";
 import type { DbAdapter } from "../db/adapter.js";
 import type { AgentMetadata, AgentVersionInfo } from "../types.js";
 import { extractFiles } from "../utils/bundle.js";
@@ -163,14 +164,51 @@ export class RegistryService {
       throw new RegistryError("NOT_FOUND", `Agent ${namespace}/${name} not found`, 404);
     }
 
-    // Delete all version bundles from storage
+    // Evict bundle cache + delete all version bundles from storage
     const versions = await this.db.getVersions(agent.id);
     for (const v of versions) {
+      bundleCache.delete(`${namespace}/${name}/${v.version}`);
       await this.storage.delete(v.bundle_key).catch(() => {});
     }
 
     // Delete agent from DB (cascades to versions)
     await this.db.deleteAgent(namespace, name);
+  }
+
+  async deleteVersion(namespace: string, name: string, version: string): Promise<void> {
+    // Step 1: load agent → 404 NOT_FOUND
+    const agent = await this.db.getAgent(namespace, name);
+    if (!agent) {
+      throw new RegistryError("NOT_FOUND", `Agent ${namespace}/${name} not found`, 404);
+    }
+
+    // Step 2: load versions → 409 LAST_VERSION + 404 VERSION_NOT_FOUND
+    const versions = await this.db.getVersions(agent.id);
+    if (versions.length <= 1) {
+      throw new RegistryError(
+        "LAST_VERSION",
+        `Cannot delete the last version of ${namespace}/${name}. Use DELETE /api/agents/:namespace/:name to remove the agent entirely.`,
+        409,
+      );
+    }
+    const target = versions.find((v) => v.version === version);
+    if (!target) {
+      throw new RegistryError(
+        "VERSION_NOT_FOUND",
+        `Version ${version} not found for ${namespace}/${name}`,
+        404,
+      );
+    }
+
+    // Step 3: evict bundle cache (prevent 10-min stale serve via TTL)
+    bundleCache.delete(`${namespace}/${name}/${version}`);
+
+    // Step 4: delete bundle from storage (best-effort, mirror deleteAgent pattern).
+    // Order is mandatory: storage BEFORE db. Reverse order = silent storage leak forever.
+    await this.storage.delete(target.bundle_key).catch(() => {});
+
+    // Step 5: delete DB row (final commit)
+    await this.db.deleteVersion(agent.id, version);
   }
 
   async setVerified(namespace: string, name: string, verified: boolean): Promise<AgentMetadata> {

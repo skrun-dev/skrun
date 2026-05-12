@@ -22,6 +22,7 @@ export function ImportDialog({ open, onClose }: ImportDialogProps) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* biome-ignore lint/a11y/useKeyWithClickEvents: backdrop dismiss is mouse-only by design */}
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop is a non-interactive overlay; the close X-button + escape key are the keyboard paths */}
       <div className="fixed inset-0 bg-black/50" onClick={onClose} />
       <div className="relative bg-white dark:bg-gray-900 rounded-lg shadow-xl border border-gray-200 dark:border-gray-800 w-full max-w-lg mx-4 max-h-[90vh] flex flex-col">
         {/* Header */}
@@ -32,7 +33,7 @@ export function ImportDialog({ open, onClose }: ImportDialogProps) {
           <button
             type="button"
             onClick={onClose}
-            className="w-6 h-6 rounded text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center justify-center"
+            className="w-6 h-6 rounded-sm text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center justify-center"
           >
             <svg
               className="w-3.5 h-3.5"
@@ -96,9 +97,13 @@ function UploadTab({ onClose }: { onClose: () => void }) {
         return;
       }
 
-      const namespace = parts[0]!;
-      const version = parts[parts.length - 1]!;
+      const namespace = parts[0];
+      const version = parts[parts.length - 1];
       const name = parts.slice(1, -1).join("-");
+      if (!namespace || !version) {
+        setError("Filename must follow format: namespace-name-version.agent");
+        return;
+      }
 
       try {
         const buffer = await file.arrayBuffer();
@@ -133,6 +138,7 @@ function UploadTab({ onClose }: { onClose: () => void }) {
 
   return (
     <div>
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: drag-and-drop zone — file picker button below is the keyboard path */}
       <div
         onDragOver={(e) => {
           e.preventDefault();
@@ -148,7 +154,7 @@ function UploadTab({ onClose }: { onClose: () => void }) {
       >
         <p className="text-[12.5px] text-gray-500 dark:text-gray-400 mb-3">
           Drag & drop a{" "}
-          <code className="text-[11px] font-mono bg-gray-100 dark:bg-gray-800 px-1 rounded">
+          <code className="text-[11px] font-mono bg-gray-100 dark:bg-gray-800 px-1 rounded-sm">
             .agent
           </code>{" "}
           bundle here
@@ -185,7 +191,7 @@ function ScanTab() {
         {Array.from({ length: 3 }).map((_, i) => (
           <div
             key={`skel-${i}`}
-            className="h-12 bg-gray-100 dark:bg-gray-800 rounded animate-pulse"
+            className="h-12 bg-gray-100 dark:bg-gray-800 rounded-sm animate-pulse"
           />
         ))}
       </div>
@@ -201,7 +207,7 @@ function ScanTab() {
       <div className="text-center py-6">
         <p className="text-[12.5px] text-gray-500 dark:text-gray-400">
           Set{" "}
-          <code className="text-[11px] font-mono bg-gray-100 dark:bg-gray-800 px-1 rounded">
+          <code className="text-[11px] font-mono bg-gray-100 dark:bg-gray-800 px-1 rounded-sm">
             SKRUN_AGENTS_DIR
           </code>{" "}
           environment variable to enable folder scanning.

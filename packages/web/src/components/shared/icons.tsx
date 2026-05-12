@@ -313,3 +313,20 @@ export function IconSpark(p: IconProps) {
     </svg>
   );
 }
+
+// Cash / dollar icon — used by the cache cost-savings tile.
+export function IconCash(p: IconProps) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      {...p}
+    >
+      <path d="M8 2.5v11M10.5 5.5h-3.25a1.75 1.75 0 100 3.5h1.5a1.75 1.75 0 110 3.5H5.5" />
+    </svg>
+  );
+}

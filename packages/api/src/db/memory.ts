@@ -46,23 +46,32 @@ export class MemoryDb implements DbAdapter {
   async listAgents(
     page: number,
     limit: number,
-  ): Promise<{ agents: (Agent & { run_count: number; token_count: number })[]; total: number }> {
+  ): Promise<{
+    agents: (Agent & { run_count: number; token_count: number; cost_total: number })[];
+    total: number;
+  }> {
     const all = [...this.agents.values()];
     const start = (page - 1) * limit;
 
-    // Compute per-agent run_count and token_count
-    const agentCounts = new Map<string, { runs: number; tokens: number }>();
+    // Compute per-agent run_count, token_count, cost_total
+    const agentCounts = new Map<string, { runs: number; tokens: number; cost: number }>();
     for (const run of this.runs.values()) {
       if (!run.agent_id) continue;
-      const counts = agentCounts.get(run.agent_id) ?? { runs: 0, tokens: 0 };
+      const counts = agentCounts.get(run.agent_id) ?? { runs: 0, tokens: 0, cost: 0 };
       counts.runs++;
       counts.tokens += run.usage_total_tokens;
+      counts.cost += run.usage_estimated_cost ?? 0;
       agentCounts.set(run.agent_id, counts);
     }
 
     const agents = all.slice(start, start + limit).map((agent) => {
-      const counts = agentCounts.get(agent.id) ?? { runs: 0, tokens: 0 };
-      return { ...agent, run_count: counts.runs, token_count: counts.tokens };
+      const counts = agentCounts.get(agent.id) ?? { runs: 0, tokens: 0, cost: 0 };
+      return {
+        ...agent,
+        run_count: counts.runs,
+        token_count: counts.tokens,
+        cost_total: counts.cost,
+      };
     });
 
     return { agents, total: all.length };
@@ -133,6 +142,13 @@ export class MemoryDb implements DbAdapter {
   async getVersionByNumber(agentId: string, version: string): Promise<AgentVersion | null> {
     const versions = await this.getVersions(agentId);
     return versions.find((v) => v.version === version) ?? null;
+  }
+
+  async deleteVersion(agentId: string, version: string): Promise<void> {
+    const versions = this.versions.get(agentId);
+    if (!versions) return;
+    const filtered = versions.filter((v) => v.version !== version);
+    this.versions.set(agentId, filtered);
   }
 
   // --- Agent State ---
@@ -280,6 +296,9 @@ export class MemoryDb implements DbAdapter {
       usage_completion_tokens: 0,
       usage_total_tokens: 0,
       usage_estimated_cost: 0,
+      usage_cache_read_tokens: 0,
+      usage_cache_write_tokens: 0,
+      usage_cache_savings_usd: 0,
       duration_ms: null,
       files: null,
       created_at: new Date().toISOString(),
@@ -301,6 +320,9 @@ export class MemoryDb implements DbAdapter {
         | "usage_completion_tokens"
         | "usage_total_tokens"
         | "usage_estimated_cost"
+        | "usage_cache_read_tokens"
+        | "usage_cache_write_tokens"
+        | "usage_cache_savings_usd"
         | "duration_ms"
         | "files"
         | "completed_at"
@@ -342,7 +364,7 @@ export class MemoryDb implements DbAdapter {
 
   // --- Stats ---
 
-  async getStats() {
+  async getStats(opts?: { userId?: string }) {
     const agents_count = this.agents.size;
 
     const now = new Date();
@@ -357,6 +379,8 @@ export class MemoryDb implements DbAdapter {
     const dailyRuns = new Array<number>(7).fill(0);
     const dailyTokens = new Array<number>(7).fill(0);
     const dailyFailed = new Array<number>(7).fill(0);
+    const dailyCacheSavings = new Array<number>(7).fill(0);
+    const dailyCost = new Array<number>(7).fill(0);
     const sevenDaysAgo = new Date(todayStart);
     sevenDaysAgo.setUTCDate(sevenDaysAgo.getUTCDate() - 6);
     const sevenDaysAgoISO = sevenDaysAgo.toISOString();
@@ -367,16 +391,29 @@ export class MemoryDb implements DbAdapter {
     let runs_yesterday = 0;
     let tokens_yesterday = 0;
     let failed_yesterday = 0;
+    let cache_savings_today = 0;
+    let cache_savings_yesterday = 0;
+    let cost_today = 0;
+    let cost_yesterday = 0;
 
     for (const run of this.runs.values()) {
+      // Multi-tenancy filter: when userId provided, skip runs from other users
+      if (opts?.userId && run.user_id !== opts.userId) continue;
+
       const isFailed = run.status === "failed";
+      const cacheSavings = run.usage_cache_savings_usd ?? 0;
+      const cost = run.usage_estimated_cost ?? 0;
       if (run.created_at >= todayISO) {
         runs_today++;
         tokens_today += run.usage_total_tokens;
+        cache_savings_today += cacheSavings;
+        cost_today += cost;
         if (isFailed) failed_today++;
       } else if (run.created_at >= yesterdayISO) {
         runs_yesterday++;
         tokens_yesterday += run.usage_total_tokens;
+        cache_savings_yesterday += cacheSavings;
+        cost_yesterday += cost;
         if (isFailed) failed_yesterday++;
       }
 
@@ -388,6 +425,8 @@ export class MemoryDb implements DbAdapter {
         if (dayIndex >= 0 && dayIndex < 7) {
           dailyRuns[dayIndex]++;
           dailyTokens[dayIndex] += run.usage_total_tokens;
+          dailyCacheSavings[dayIndex] += cacheSavings;
+          dailyCost[dayIndex] += cost;
           if (isFailed) dailyFailed[dayIndex]++;
         }
       }
@@ -404,6 +443,12 @@ export class MemoryDb implements DbAdapter {
       daily_runs: dailyRuns,
       daily_tokens: dailyTokens,
       daily_failed: dailyFailed,
+      cache_savings_today,
+      cache_savings_yesterday,
+      daily_cache_savings: dailyCacheSavings,
+      cost_today,
+      cost_yesterday,
+      daily_cost: dailyCost,
     };
   }
 
@@ -424,39 +469,56 @@ export class MemoryDb implements DbAdapter {
     let tokens = 0;
     let failed = 0;
     let totalDuration = 0;
+    let cacheSavings = 0;
+    let cost = 0;
     let prevRuns = 0;
     let prevTokens = 0;
     let prevFailed = 0;
     let prevTotalDuration = 0;
+    let prevCacheSavings = 0;
+    let prevCost = 0;
 
-    // Daily arrays are always 7 items for sparkline rendering
+    // Existing daily arrays remain hardcoded to 7 for sparkline UX consistency
+    // (matches the home page's 7-day sparkline contract).
     const dailyRuns = new Array<number>(7).fill(0);
     const dailyTokens = new Array<number>(7).fill(0);
     const dailyFailed = new Array<number>(7).fill(0);
     const dailyDurTotal = new Array<number>(7).fill(0);
     const dailyDurCount = new Array<number>(7).fill(0);
 
-    // 7-day window for daily arrays (independent of the main period)
+    // daily_cache_savings + daily_cost array lengths match the `days` parameter
+    // (window starts `days` back from today). Other daily arrays remain at
+    // 7 for sparkline UX consistency on the home page.
+    const dailyCacheSavings = new Array<number>(days).fill(0);
+    const dailyCost = new Array<number>(days).fill(0);
+
+    // 7-day window for the existing daily arrays (independent of the main period)
     const dailyStart = new Date(todayStart);
     dailyStart.setUTCDate(dailyStart.getUTCDate() - 6);
 
     for (const run of this.runs.values()) {
       if (run.agent_id !== agentId) continue;
       const isFailed = run.status === "failed";
+      const runCacheSavings = run.usage_cache_savings_usd ?? 0;
+      const runCost = run.usage_estimated_cost ?? 0;
 
       if (run.created_at >= periodISO) {
         runs++;
         tokens += run.usage_total_tokens;
+        cacheSavings += runCacheSavings;
+        cost += runCost;
         if (isFailed) failed++;
         if (run.duration_ms !== null) totalDuration += run.duration_ms;
       } else if (run.created_at >= prevISO) {
         prevRuns++;
         prevTokens += run.usage_total_tokens;
+        prevCacheSavings += runCacheSavings;
+        prevCost += runCost;
         if (isFailed) prevFailed++;
         if (run.duration_ms !== null) prevTotalDuration += run.duration_ms;
       }
 
-      // Populate daily arrays from 7-day window
+      // Populate existing daily arrays from 7-day window
       if (run.created_at >= dailyStart.toISOString()) {
         const runDate = new Date(run.created_at);
         const dayIndex = Math.floor(
@@ -470,6 +532,18 @@ export class MemoryDb implements DbAdapter {
             dailyDurTotal[dayIndex] += run.duration_ms;
             dailyDurCount[dayIndex]++;
           }
+        }
+      }
+
+      // Populate daily_cache_savings + daily_cost using the parameterized window
+      if (run.created_at >= periodISO) {
+        const runDate = new Date(run.created_at);
+        const periodDayIndex = Math.floor(
+          (runDate.getTime() - periodStart.getTime()) / (24 * 60 * 60 * 1000),
+        );
+        if (periodDayIndex >= 0 && periodDayIndex < days) {
+          dailyCacheSavings[periodDayIndex] += runCacheSavings;
+          dailyCost[periodDayIndex] += runCost;
         }
       }
     }
@@ -489,6 +563,12 @@ export class MemoryDb implements DbAdapter {
       daily_avg_duration_ms: dailyDurCount.map((c, i) =>
         c > 0 ? Math.round(dailyDurTotal[i] / c) : 0,
       ),
+      cache_savings: cacheSavings,
+      prev_cache_savings: prevCacheSavings,
+      daily_cache_savings: dailyCacheSavings,
+      cost,
+      prev_cost: prevCost,
+      daily_cost: dailyCost,
     };
   }
 

@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-const LLM_PROVIDERS = ["anthropic", "openai", "google", "mistral", "groq", "meta"] as const;
+const LLM_PROVIDERS = ["anthropic", "openai", "google", "mistral", "groq", "xai", "meta"] as const;
 
 export const ModelProviderSchema = z.enum(LLM_PROVIDERS);
 

@@ -40,10 +40,10 @@ process.stdin.on("end", () => {
         const [hash, subject, author, date] = parts;
         return [
           {
-            hash: hash!.trim(),
-            subject: subject!.trim(),
-            author: author!.trim(),
-            date: date!.trim(),
+            hash: hash?.trim(),
+            subject: subject?.trim(),
+            author: author?.trim(),
+            date: date?.trim(),
           },
         ];
       });
@@ -72,7 +72,8 @@ process.stdin.on("end", () => {
           const parts = line.split("|");
           if (parts.length < 4) return [];
           const [hash, subject, author, date] = parts;
-          return [{ hash: hash!, subject: subject!, author: author!, date: date! }];
+          if (!hash || !subject || !author || !date) return [];
+          return [{ hash, subject, author, date }];
         });
     } else {
       throw new Error(`source is neither a file nor a directory: ${source}`);

@@ -1,6 +1,6 @@
 {
   "name": "@skrun-dev/runtime",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "exports": {
     ".": {
@@ -10,7 +10,9 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
@@ -18,18 +20,18 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
+    "@anthropic-ai/sdk": "^0.92.0",
     "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@skrun-dev/schema": "workspace:*",
-    "ajv": "^8.12.0",
-    "openai": "^4.104.0",
-    "pino": "^9.0.0"
+    "ajv": "^8.20.0",
+    "openai": "^6.35.0",
+    "pino": "^10.3.1"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
-    "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5"
   },
   "publishConfig": {
     "access": "public"
@@ -42,8 +44,12 @@
   },
   "homepage": "https://github.com/skrun-dev/skrun#readme",
   "bugs": "https://github.com/skrun-dev/skrun/issues",
-  "keywords": ["skrun", "agent-skills", "ai-agents"],
+  "keywords": [
+    "skrun",
+    "agent-skills",
+    "ai-agents"
+  ],
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   }
 }

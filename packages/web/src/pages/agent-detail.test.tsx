@@ -1,5 +1,5 @@
 import { screen, waitFor } from "@testing-library/react";
-import { http, HttpResponse } from "msw";
+import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import { Route, Routes } from "react-router-dom";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -44,6 +44,12 @@ const server = setupServer(
       daily_tokens: [0, 0, 0, 0, 0, 0, 0],
       daily_failed: [0, 0, 0, 0, 0, 0, 0],
       daily_avg_duration_ms: [0, 0, 0, 0, 0, 0, 0],
+      cache_savings: 0,
+      prev_cache_savings: 0,
+      daily_cache_savings: [0, 0, 0, 0, 0, 0, 0],
+      cost: 0,
+      prev_cost: 0,
+      daily_cost: [0, 0, 0, 0, 0, 0, 0],
     }),
   ),
   http.get("/api/runs", () => HttpResponse.json([])),
@@ -191,6 +197,51 @@ describe("AgentDetailPage", () => {
     });
   });
 
+  // ── Cache cost-savings ([005-cache-cost-savings-dashboard]) ───────────
+
+  it("VT-16: renders 'Cache savings 7d' cell with formatted USD value", async () => {
+    server.use(
+      http.get("/api/agents/dev/test-agent/stats", () =>
+        HttpResponse.json({
+          runs: 5,
+          tokens: 1000,
+          failed: 0,
+          avg_duration_ms: 1200,
+          prev_runs: 0,
+          prev_tokens: 0,
+          prev_failed: 0,
+          prev_avg_duration_ms: 0,
+          daily_runs: [0, 0, 0, 0, 0, 0, 5],
+          daily_tokens: [0, 0, 0, 0, 0, 0, 1000],
+          daily_failed: [0, 0, 0, 0, 0, 0, 0],
+          daily_avg_duration_ms: [0, 0, 0, 0, 0, 0, 1200],
+          cache_savings: 1.42,
+          prev_cache_savings: 0,
+          daily_cache_savings: [0, 0, 0, 0, 0, 0.5, 0.92],
+          cost: 0.05,
+          prev_cost: 0,
+          daily_cost: [0, 0, 0, 0, 0, 0.02, 0.03],
+        }),
+      ),
+    );
+    renderDetailPage();
+    await waitFor(() => {
+      const cell = screen.getByTestId("agent-cache-savings");
+      expect(cell).toBeInTheDocument();
+      expect(cell.textContent).toContain("Cache savings 7d");
+      expect(cell.textContent).toContain("$1.42");
+    });
+  });
+
+  it("Cache savings cell shows $0.00 when no cache activity", async () => {
+    // Default mock has cache_savings: 0
+    renderDetailPage();
+    await waitFor(() => {
+      const cell = screen.getByTestId("agent-cache-savings");
+      expect(cell.textContent).toContain("$0.00");
+    });
+  });
+
   it("preserves emoji when truncating (grapheme-safe)", async () => {
     // 79 'a' chars + 2 emoji = 81 graphemes → truncated to 80 without splitting the emoji
     const note = `${"a".repeat(79)}🚀🎉`;
@@ -211,8 +262,14 @@ describe("AgentDetailPage", () => {
     );
     const { container } = renderDetailPage();
     await waitFor(() => {
-      const noteEl = container.querySelector(`[title="${note}"]`);
-      expect(noteEl).not.toBeNull();
+      // Use getAttribute lookup rather than `[title="..."]` CSS selector:
+      // jsdom 29 tightened CSS attribute-selector parsing and emoji in the
+      // selector value match nothing. Pulling the elements then comparing
+      // attribute strings directly bypasses the selector parser.
+      const noteEl = Array.from(container.querySelectorAll("[title]")).find(
+        (el) => el.getAttribute("title") === note,
+      );
+      expect(noteEl).not.toBeUndefined();
       // Should contain exactly one intact emoji (the 🚀), not a broken surrogate half
       const text = noteEl?.textContent ?? "";
       expect(text).toContain("🚀");

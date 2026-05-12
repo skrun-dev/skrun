@@ -1,6 +1,6 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { http, HttpResponse } from "msw";
+import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { renderWithProviders } from "../test-utils";
@@ -22,6 +22,7 @@ const mockAgents = [
     verified: true,
     run_count: 0,
     token_count: 0,
+    cost_total: 0,
     created_at: "2026-04-20T00:00:00Z",
     updated_at: "2026-04-20T10:00:00Z",
   },
@@ -34,6 +35,7 @@ const mockAgents = [
     verified: false,
     run_count: 0,
     token_count: 0,
+    cost_total: 0,
     created_at: "2026-04-19T00:00:00Z",
     updated_at: "2026-04-19T10:00:00Z",
   },
@@ -46,6 +48,7 @@ const mockAgents = [
     verified: false,
     run_count: 0,
     token_count: 0,
+    cost_total: 0,
     created_at: "2026-04-18T00:00:00Z",
     updated_at: "2026-04-18T10:00:00Z",
   },

@@ -4,17 +4,53 @@ import { EmptyState } from "../components/shared/empty-state";
 import { IconChevRight, IconCopy, IconLock, IconPlay } from "../components/shared/icons";
 import { JsonViewer } from "../components/shared/json-viewer";
 import { Btn, Card, PageHeader, Pill } from "../components/shared/ui";
-import { type RunEvent, getAuthHeaders, useAgent, useAgentVersions } from "../lib/api-client";
+import { getAuthHeaders, type RunEvent, useAgent, useAgentVersions } from "../lib/api-client";
 
 const LLM_KEY_STORAGE = "skrun-llm-key";
 
 type PlaygroundStatus = "idle" | "running" | "completed" | "failed" | "error";
 
+type AgentInput = {
+  name: string;
+  type: string;
+  required?: boolean;
+  description?: string;
+  media?: "image" | "document" | "audio";
+  max_count?: number;
+  mime_types?: string[];
+};
+
+type AttachedFile = { file_id: string; name: string; size: number };
+
+function mediaToAcceptAttr(media?: string): string | undefined {
+  if (media === "image") return "image/*";
+  if (media === "document") return "application/pdf";
+  if (media === "audio") return "audio/*";
+  return undefined;
+}
+
+async function uploadFileToApi(file: File): Promise<AttachedFile> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await fetch("/api/files", {
+    method: "POST",
+    headers: { ...getAuthHeaders() },
+    credentials: "same-origin",
+    body: fd,
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
+    throw new Error(body.error?.message ?? `Upload failed: HTTP ${res.status}`);
+  }
+  const body = (await res.json()) as { file_id: string; size: number };
+  return { file_id: body.file_id, name: file.name, size: body.size };
+}
+
 export function PlaygroundPage() {
-  const { namespace, name } = useParams<{ namespace: string; name: string }>();
+  const { namespace = "", name = "" } = useParams<{ namespace: string; name: string }>();
   const [searchParams] = useSearchParams();
-  const { data: agent, isLoading: agentLoading, error: agentError } = useAgent(namespace!, name!);
-  const { data: versions } = useAgentVersions(namespace!, name!);
+  const { data: agent, isLoading: agentLoading, error: agentError } = useAgent(namespace, name);
+  const { data: versions } = useAgentVersions(namespace, name);
 
   const prefillInput = searchParams.get("input");
   const [input, setInput] = useState(() => {
@@ -37,6 +73,11 @@ export function PlaygroundPage() {
   const [error, setError] = useState<string | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
   const [inputMode, setInputMode] = useState<"json" | "form">("json");
+  const [fileAttachments, setFileAttachments] = useState<Record<string, AttachedFile[]>>({});
+  const [uploading, setUploading] = useState<Record<string, boolean>>({});
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const jsonAttachRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   // Persist LLM key
@@ -46,6 +87,7 @@ export function PlaygroundPage() {
     }
   }, [llmKey]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: agentProviders[0] is computed from props, stable per render
   const runAgent = useCallback(async () => {
     let parsedInput: Record<string, unknown>;
     try {
@@ -156,11 +198,95 @@ export function PlaygroundPage() {
     setStatus("idle");
   }, []);
 
+  const handleFormFileSelect = useCallback(
+    async (inputName: string, maxCount: number, files: FileList | null) => {
+      if (!files || files.length === 0) return;
+      setUploadError(null);
+      setUploading((p) => ({ ...p, [inputName]: true }));
+      try {
+        const arr = Array.from(files).slice(0, maxCount);
+        const uploaded = await Promise.all(arr.map(uploadFileToApi));
+        const wireValues = uploaded.map((u) => ({
+          type: "file",
+          source: "id",
+          file_id: u.file_id,
+        }));
+        setFileAttachments((prev) => ({ ...prev, [inputName]: uploaded }));
+        let obj: Record<string, unknown> = {};
+        try {
+          obj = JSON.parse(input);
+        } catch {
+          /* ignore */
+        }
+        obj[inputName] = maxCount === 1 ? wireValues[0] : wireValues;
+        setInput(JSON.stringify(obj, null, 2));
+      } catch (err) {
+        setUploadError(err instanceof Error ? err.message : "Upload failed");
+      } finally {
+        setUploading((p) => ({ ...p, [inputName]: false }));
+      }
+    },
+    [input],
+  );
+
+  const clearFormFile = useCallback(
+    (inputName: string) => {
+      setFileAttachments((prev) => {
+        const next = { ...prev };
+        delete next[inputName];
+        return next;
+      });
+      try {
+        const obj = JSON.parse(input);
+        delete obj[inputName];
+        setInput(JSON.stringify(obj, null, 2));
+      } catch {
+        /* ignore */
+      }
+    },
+    [input],
+  );
+
+  const handleJsonAttach = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setUploadError(null);
+    setUploading((p) => ({ ...p, __json__: true }));
+    try {
+      const uploaded = await Promise.all(Array.from(files).map(uploadFileToApi));
+      const refs = uploaded.map((u) => ({
+        type: "file",
+        source: "id",
+        file_id: u.file_id,
+      }));
+      const snippet =
+        refs.length === 1 ? JSON.stringify(refs[0], null, 2) : JSON.stringify(refs, null, 2);
+      const ta = textareaRef.current;
+      if (ta) {
+        const start = ta.selectionStart;
+        const end = ta.selectionEnd;
+        const before = ta.value.slice(0, start);
+        const after = ta.value.slice(end);
+        const next = before + snippet + after;
+        setInput(next);
+        requestAnimationFrame(() => {
+          ta.focus();
+          ta.setSelectionRange(start + snippet.length, start + snippet.length);
+        });
+      } else {
+        setInput((cur) => `${cur}\n${snippet}`);
+      }
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : "Upload failed");
+    } finally {
+      setUploading((p) => ({ ...p, __json__: false }));
+    }
+  }, []);
+
   if (agentLoading) {
     return (
       <div className="space-y-4">
-        <div className="h-8 w-64 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
-        <div className="h-32 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
+        <div className="h-8 w-64 bg-gray-100 dark:bg-gray-800 rounded-sm animate-pulse" />
+        <div className="h-32 bg-gray-100 dark:bg-gray-800 rounded-sm animate-pulse" />
       </div>
     );
   }
@@ -181,9 +307,7 @@ export function PlaygroundPage() {
 
   const latestVersion = versions && versions.length > 0 ? versions[versions.length - 1] : null;
   const agentInputs = (latestVersion?.config_snapshot as Record<string, unknown> | undefined)
-    ?.inputs as
-    | Array<{ name: string; type: string; required?: boolean; description?: string }>
-    | undefined;
+    ?.inputs as AgentInput[] | undefined;
   const modelConfig = (latestVersion?.config_snapshot as Record<string, unknown> | undefined)
     ?.model as
     | { provider?: string; name?: string; fallback?: { provider: string; name: string } }
@@ -249,7 +373,7 @@ export function PlaygroundPage() {
             title="Input"
             action={
               agentInputs && agentInputs.length > 0 ? (
-                <div className="flex items-center p-0.5 rounded bg-gray-100/60 dark:bg-gray-900 text-[10.5px]">
+                <div className="flex items-center p-0.5 rounded-sm bg-gray-100/60 dark:bg-gray-900 text-[10.5px]">
                   <button
                     type="button"
                     onClick={() => setInputMode("json")}
@@ -272,6 +396,75 @@ export function PlaygroundPage() {
             {inputMode === "form" && agentInputs ? (
               <div className="p-4 space-y-3">
                 {agentInputs.map((inp) => {
+                  if (inp.type === "file") {
+                    const maxCount = inp.max_count ?? 1;
+                    const accept = mediaToAcceptAttr(inp.media);
+                    const attached = fileAttachments[inp.name] ?? [];
+                    const isUploading = uploading[inp.name] === true;
+                    return (
+                      <div key={inp.name}>
+                        <label
+                          htmlFor={`input-${inp.name}`}
+                          className="text-[11.5px] font-medium text-gray-700 dark:text-gray-300 mb-1 block"
+                        >
+                          {inp.name} {inp.required && <span className="text-red-400">*</span>}
+                          <span className="ml-1.5 text-[10.5px] text-gray-400 font-normal">
+                            ({inp.media ?? "file"}
+                            {maxCount > 1 ? ` · up to ${maxCount}` : ""})
+                          </span>
+                        </label>
+                        {inp.description && (
+                          <p className="text-[10.5px] text-gray-400 mb-1.5">{inp.description}</p>
+                        )}
+                        <input
+                          id={`input-${inp.name}`}
+                          type="file"
+                          accept={accept}
+                          multiple={maxCount > 1}
+                          disabled={status === "running" || isUploading}
+                          onChange={(e) => {
+                            handleFormFileSelect(inp.name, maxCount, e.target.files);
+                            e.target.value = "";
+                          }}
+                          className="block w-full text-[11px] text-gray-600 dark:text-gray-400 file:mr-3 file:py-1 file:px-2.5 file:rounded-md file:border-0 file:text-[11px] file:font-medium file:bg-sky-50 dark:file:bg-sky-900/30 file:text-sky-700 dark:file:text-sky-300 hover:file:bg-sky-100 dark:hover:file:bg-sky-900/50 file:cursor-pointer disabled:opacity-50"
+                        />
+                        {isUploading && (
+                          <p className="text-[10.5px] text-amber-600 dark:text-amber-400 mt-1">
+                            Uploading…
+                          </p>
+                        )}
+                        {attached.length > 0 && (
+                          <ul className="mt-2 space-y-1">
+                            {attached.map((a) => (
+                              <li
+                                key={a.file_id}
+                                className="flex items-center justify-between gap-2 px-2 py-1 rounded-sm bg-gray-50 dark:bg-gray-900/60 text-[11px]"
+                              >
+                                <span className="flex-1 truncate text-gray-700 dark:text-gray-300">
+                                  {a.name}
+                                </span>
+                                <span className="text-gray-400 tabular-nums">
+                                  {(a.size / 1024).toFixed(0)} KB
+                                </span>
+                                <span className="font-mono text-[10px] text-gray-400">
+                                  {a.file_id.slice(0, 12)}…
+                                </span>
+                              </li>
+                            ))}
+                            <li>
+                              <button
+                                type="button"
+                                onClick={() => clearFormFile(inp.name)}
+                                className="text-[10.5px] text-gray-500 hover:text-red-600"
+                              >
+                                Clear
+                              </button>
+                            </li>
+                          </ul>
+                        )}
+                      </div>
+                    );
+                  }
                   let currentVal = "";
                   try {
                     currentVal = JSON.parse(input)[inp.name] ?? "";
@@ -303,21 +496,54 @@ export function PlaygroundPage() {
                           }
                         }}
                         disabled={status === "running"}
-                        className="w-full h-8 px-2.5 rounded-md border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 text-[12px] text-gray-800 dark:text-gray-200 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-500/15 disabled:opacity-50"
+                        className="w-full h-8 px-2.5 rounded-md border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 text-[12px] text-gray-800 dark:text-gray-200 outline-hidden focus:border-sky-400 focus:ring-2 focus:ring-sky-500/15 disabled:opacity-50"
                       />
                     </div>
                   );
                 })}
               </div>
             ) : (
-              <textarea
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                rows={10}
-                disabled={status === "running"}
-                className="w-full px-4 py-3 text-[11.5px] font-mono leading-[1.55] text-gray-700 dark:text-gray-300 bg-gray-50/40 dark:bg-gray-950/60 border-0 outline-none resize-none disabled:opacity-50"
-                spellCheck={false}
-              />
+              <div className="relative">
+                <textarea
+                  ref={textareaRef}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  rows={10}
+                  disabled={status === "running"}
+                  className="w-full px-4 py-3 pb-10 text-[11.5px] font-mono leading-[1.55] text-gray-700 dark:text-gray-300 bg-gray-50/40 dark:bg-gray-950/60 border-0 outline-hidden resize-none disabled:opacity-50"
+                  spellCheck={false}
+                />
+                <div className="absolute bottom-2 right-3 flex items-center gap-2">
+                  {uploading.__json__ && (
+                    <span className="text-[10.5px] text-amber-600 dark:text-amber-400">
+                      Uploading…
+                    </span>
+                  )}
+                  <input
+                    ref={jsonAttachRef}
+                    type="file"
+                    multiple
+                    className="hidden"
+                    onChange={(e) => {
+                      handleJsonAttach(e.target.files);
+                      e.target.value = "";
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => jsonAttachRef.current?.click()}
+                    disabled={status === "running" || uploading.__json__}
+                    className="px-2 py-0.5 rounded-md text-[10.5px] font-medium bg-sky-50 dark:bg-sky-900/30 text-sky-700 dark:text-sky-300 hover:bg-sky-100 dark:hover:bg-sky-900/50 disabled:opacity-50"
+                  >
+                    Attach file
+                  </button>
+                </div>
+              </div>
+            )}
+            {uploadError && (
+              <div className="px-4 py-2 border-t border-red-100 dark:border-red-900/40 text-[11px] text-red-600 dark:text-red-400">
+                {uploadError}
+              </div>
             )}
           </Card>
 
@@ -337,7 +563,7 @@ export function PlaygroundPage() {
                   value={selectedProvider || agentProviders[0]}
                   onChange={(e) => setSelectedProvider(e.target.value)}
                   disabled={status === "running"}
-                  className="w-full h-8 px-2.5 mb-2 rounded-md border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 text-[11.5px] text-gray-800 dark:text-gray-200 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-500/15 disabled:opacity-50"
+                  className="w-full h-8 px-2.5 mb-2 rounded-md border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 text-[11.5px] text-gray-800 dark:text-gray-200 outline-hidden focus:border-sky-400 focus:ring-2 focus:ring-sky-500/15 disabled:opacity-50"
                 >
                   {agentProviders.map((p) => (
                     <option key={p} value={p}>
@@ -355,7 +581,7 @@ export function PlaygroundPage() {
                   onChange={(e) => setLlmKey(e.target.value)}
                   placeholder={`API key for ${selectedProvider || agentProviders[0] || "LLM provider"}`}
                   disabled={status === "running"}
-                  className="flex-1 bg-transparent outline-none text-[11.5px] font-mono text-gray-700 dark:text-gray-300 placeholder:text-gray-400 disabled:opacity-50"
+                  className="flex-1 bg-transparent outline-hidden text-[11.5px] font-mono text-gray-700 dark:text-gray-300 placeholder:text-gray-400 disabled:opacity-50"
                 />
               </div>
               <p className="text-[10.5px] text-gray-400 mt-1">Key stored in browser only.</p>
@@ -375,7 +601,7 @@ export function PlaygroundPage() {
                   value={selectedVersion}
                   onChange={(e) => setSelectedVersion(e.target.value)}
                   disabled={status === "running"}
-                  className="w-full h-8 px-2.5 rounded-md border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 text-[11.5px] font-mono text-gray-800 dark:text-gray-200 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-500/15 disabled:opacity-50"
+                  className="w-full h-8 px-2.5 rounded-md border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 text-[11.5px] font-mono text-gray-800 dark:text-gray-200 outline-hidden focus:border-sky-400 focus:ring-2 focus:ring-sky-500/15 disabled:opacity-50"
                 >
                   <option value="">
                     latest{latestVersion ? ` (${latestVersion.version})` : ""}
@@ -459,7 +685,7 @@ export function PlaygroundPage() {
                 <div className="flex-1" />
                 <span className="text-[11px] text-gray-400">{events.length} events</span>
               </div>
-              <div className="px-4 py-3 space-y-1.5 font-mono text-[11.5px] leading-relaxed bg-gradient-to-b from-white to-gray-50/40 dark:from-gray-950/40 dark:to-gray-950/70 max-h-[300px] overflow-y-auto">
+              <div className="px-4 py-3 space-y-1.5 font-mono text-[11.5px] leading-relaxed bg-linear-to-b from-white to-gray-50/40 dark:from-gray-950/40 dark:to-gray-950/70 max-h-[300px] overflow-y-auto">
                 {events.map((e, i) => {
                   const color = getEventColor(e.type);
                   return (

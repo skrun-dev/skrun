@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { validateAgent } from "@skrun-dev/schema";
+import { validateAgent, validateAgentCapabilities } from "@skrun-dev/schema";
 import type { Command } from "commander";
 import { getRegistryUrl, getToken } from "../utils/auth.js";
 import * as format from "../utils/format.js";
@@ -38,6 +38,13 @@ export function registerPushCommand(program: Command): void {
       const [namespace, name] = config.name.split("/");
       const version = config.version;
       const slug = name ?? config.name;
+
+      // Capability check — refuse before any network call if model can't handle declared media
+      const capCheck = validateAgentCapabilities(config);
+      if (!capCheck.ok) {
+        for (const err of capCheck.errors) format.error(err);
+        process.exit(1);
+      }
 
       // Find or build .agent bundle
       const bundlePath = join(dir, `${slug}-${version}.agent`);

@@ -8,8 +8,8 @@ export function Pagination({ page, totalPages, onPageChange }: PaginationProps) 
   if (totalPages <= 1) return null;
 
   return (
-    <div className="flex items-center justify-between pt-4">
-      <span className="text-sm text-gray-500 dark:text-gray-400">
+    <div className="flex items-center gap-4">
+      <span className="text-sm text-gray-500 dark:text-gray-400 whitespace-nowrap">
         Page {page} of {totalPages}
       </span>
       <div className="flex gap-2">

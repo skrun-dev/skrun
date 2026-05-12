@@ -32,7 +32,7 @@ function ProfileSection() {
           {user?.avatar_url ? (
             <img src={user.avatar_url} alt="" className="w-14 h-14 rounded-full" />
           ) : (
-            <div className="w-14 h-14 rounded-full bg-gradient-to-br from-sky-400 to-violet-500 flex items-center justify-center">
+            <div className="w-14 h-14 rounded-full bg-linear-to-br from-sky-400 to-violet-500 flex items-center justify-center">
               <span className="text-xl font-semibold text-white">
                 {(user?.username ?? "D")[0]?.toUpperCase()}
               </span>
@@ -48,7 +48,7 @@ function ProfileSection() {
             <KV
               label="Plan"
               value={
-                <span className="px-2 py-0.5 text-[10.5px] font-medium rounded bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300">
+                <span className="px-2 py-0.5 text-[10.5px] font-medium rounded-sm bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300">
                   {user?.plan ?? "free"}
                 </span>
               }
@@ -88,7 +88,7 @@ function ApiKeysSection() {
           {Array.from({ length: 2 }).map((_, i) => (
             <div
               key={`skel-${i}`}
-              className="h-12 bg-gray-100 dark:bg-gray-800 rounded animate-pulse"
+              className="h-12 bg-gray-100 dark:bg-gray-800 rounded-sm animate-pulse"
             />
           ))}
         </div>
@@ -139,7 +139,7 @@ function ApiKeysSection() {
                   <button
                     type="button"
                     onClick={() => setRevokeTarget(key)}
-                    className="px-2.5 py-1 text-[11px] rounded bg-red-50 text-red-700 dark:bg-red-950/30 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-950/50 transition-colors"
+                    className="px-2.5 py-1 text-[11px] rounded-sm bg-red-50 text-red-700 dark:bg-red-950/30 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-950/50 transition-colors"
                   >
                     Revoke
                   </button>
@@ -218,6 +218,7 @@ function CreateKeyDialog({ open, onClose }: { open: boolean; onClose: () => void
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* biome-ignore lint/a11y/useKeyWithClickEvents: backdrop dismiss is mouse-only by design */}
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop is a non-interactive overlay; the Cancel button is the keyboard path */}
       <div className="fixed inset-0 bg-black/50" onClick={handleClose} />
       <div className="relative bg-white dark:bg-gray-900 rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 p-6 max-w-md w-full mx-4">
         <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100 mb-4">
@@ -260,7 +261,7 @@ function CreateKeyDialog({ open, onClose }: { open: boolean; onClose: () => void
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. CI pipeline, local dev..."
-              className="w-full px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-sky-500 mb-4"
+              className="w-full px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 focus:outline-hidden focus:ring-2 focus:ring-sky-500 mb-4"
             />
             <div className="flex gap-3 justify-end">
               <Btn variant="secondary" onClick={handleClose}>

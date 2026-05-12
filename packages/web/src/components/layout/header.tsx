@@ -10,7 +10,7 @@ export function Header() {
   const initials = (user?.username ?? "D")[0]?.toUpperCase() ?? "D";
 
   return (
-    <header className="h-14 shrink-0 border-b border-gray-200 dark:border-gray-900 bg-white/70 dark:bg-gray-950/70 backdrop-blur flex items-center px-5 gap-3">
+    <header className="h-14 shrink-0 border-b border-gray-200 dark:border-gray-900 bg-white/70 dark:bg-gray-950/70 backdrop-blur-sm flex items-center px-5 gap-3">
       <div className="flex-1" />
 
       {/* Theme toggle */}
@@ -37,7 +37,7 @@ export function Header() {
         {user?.avatar_url ? (
           <img src={user.avatar_url} alt="" className="w-6 h-6 rounded-full" />
         ) : (
-          <div className="w-6 h-6 rounded-full bg-gradient-to-br from-sky-400 to-violet-500 flex items-center justify-center text-white text-[10px] font-semibold">
+          <div className="w-6 h-6 rounded-full bg-linear-to-br from-sky-400 to-violet-500 flex items-center justify-center text-white text-[10px] font-semibold">
             {initials}
           </div>
         )}

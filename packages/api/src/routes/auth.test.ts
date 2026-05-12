@@ -22,9 +22,7 @@ describe("Auth Routes", () => {
     db = ctx.db;
     clearSessions();
     // Ensure OAuth is not configured by default in tests
-    // biome-ignore lint/performance/noDelete: must truly remove env vars (= undefined sets "undefined" string)
     delete process.env.GITHUB_CLIENT_ID;
-    // biome-ignore lint/performance/noDelete: must truly remove env vars
     delete process.env.GITHUB_CLIENT_SECRET;
   });
 
@@ -45,9 +43,7 @@ describe("Auth Routes", () => {
     expect(location).toContain("client_id=test-client-id");
     expect(location).toContain("scope=read%3Auser+user%3Aemail");
 
-    // biome-ignore lint/performance/noDelete: must truly remove env vars
     delete process.env.GITHUB_CLIENT_ID;
-    // biome-ignore lint/performance/noDelete: must truly remove env vars
     delete process.env.GITHUB_CLIENT_SECRET;
   });
 
@@ -121,9 +117,7 @@ describe("Auth Routes", () => {
     expect(user?.username).toBe("alice"); // lowercased
     expect(user?.email).toBe("alice@test.com");
 
-    // biome-ignore lint/performance/noDelete: must truly remove env vars
     delete process.env.GITHUB_CLIENT_ID;
-    // biome-ignore lint/performance/noDelete: must truly remove env vars
     delete process.env.GITHUB_CLIENT_SECRET;
   });
 
@@ -179,9 +173,7 @@ describe("Auth Routes", () => {
     expect(user?.email).toBe("new@test.com");
     expect(user?.avatar_url).toBe("https://new-avatar");
 
-    // biome-ignore lint/performance/noDelete: must truly remove env vars
     delete process.env.GITHUB_CLIENT_ID;
-    // biome-ignore lint/performance/noDelete: must truly remove env vars
     delete process.env.GITHUB_CLIENT_SECRET;
   });
 
@@ -342,9 +334,7 @@ describe("Auth Routes", () => {
     expect(html).toContain("Sign in with GitHub");
     expect(html).toContain("/auth/github");
 
-    // biome-ignore lint/performance/noDelete: must truly remove env vars
     delete process.env.GITHUB_CLIENT_ID;
-    // biome-ignore lint/performance/noDelete: must truly remove env vars
     delete process.env.GITHUB_CLIENT_SECRET;
   });
 

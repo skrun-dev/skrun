@@ -38,6 +38,7 @@ export function generateAgentYaml(skill: ParsedSkill): GeneratedAgentYaml {
       properties: {},
       additionalProperties: true,
     },
+    required: false,
   }));
 
   const config: Partial<AgentConfig> = {
@@ -70,6 +71,7 @@ export function generateAgentYaml(skill: ParsedSkill): GeneratedAgentYaml {
         "openai / gpt-4o",
         "mistral / mistral-large-latest",
         "groq / llama-3.3-70b-versatile",
+        "xai / grok-4.3",
       ],
       default: "anthropic / claude-sonnet-4-20250514",
     },

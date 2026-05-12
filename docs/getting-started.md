@@ -209,6 +209,20 @@ const client = new SkrunClient({
 const result = await client.run("dev/my-agent", { query: "hello" });
 console.log(result.output);
 
+// Inspect cost + caching info — `cache_read_tokens` is populated when the
+// provider served part of the prompt from its cache (typically on the 2nd+
+// call with a stable system prompt + tools). 30-90% input cost savings are
+// already reflected in `cost.estimated`; `cost.saved` reports the dollar
+// value of those savings (omitted when 0).
+console.log("Tokens:", result.usage.prompt_tokens, "+", result.usage.completion_tokens);
+if (result.usage.cache_read_tokens) {
+  console.log("Cache hit:", result.usage.cache_read_tokens, "tokens (billed at cached rate)");
+}
+console.log("Cost: $" + result.cost.estimated.toFixed(6));
+if (result.cost.saved) {
+  console.log("Saved: $" + result.cost.saved.toFixed(6));
+}
+
 // Stream
 for await (const event of client.stream("dev/my-agent", { query: "hello" })) {
   console.log(event.type, event);
@@ -223,6 +237,67 @@ const { run_id } = await client.runAsync(
 ```
 
 See the [SDK README](https://www.npmjs.com/package/@skrun-dev/sdk) for all 9 methods.
+
+---
+
+## 8. Vision quickstart — pass images to your agent
+
+Agents can declare `file`-typed inputs (image / PDF / audio) that the LLM reads directly via its native multimodal capability. The shipped [`receipts-to-expenses`](../agents/receipts-to-expenses/) demo is a good 2-minute walk-through.
+
+```bash
+cd agents/receipts-to-expenses
+skrun build && skrun push
+```
+
+(The agent declares `requirements.txt` at its bundle root — the runtime resolves `openpyxl` + `reportlab` + `pandas` automatically on first call and caches them at `~/.skrun/deps/<hash>/`. No manual `pip install` needed. See [Script dependencies](agent-yaml.md#script-dependencies).)
+
+Call it via the SDK with `Blob` inputs — uploads happen automatically:
+
+```ts
+import { SkrunClient } from "@skrun-dev/sdk";
+import { readFileSync } from "node:fs";
+
+const client = new SkrunClient({ baseUrl: "http://localhost:4000", token: "dev-token" });
+
+const result = await client.run("dev/receipts-to-expenses", {
+  receipts: [
+    new Blob([readFileSync("./fixtures/sample-receipts/01-restaurant.jpg")], { type: "image/jpeg" }),
+    new Blob([readFileSync("./fixtures/sample-receipts/02-uber.jpg")], { type: "image/jpeg" }),
+    new Blob([readFileSync("./fixtures/sample-receipts/03-saas.jpg")], { type: "image/jpeg" }),
+  ],
+  month: "2026-04",
+});
+
+console.log(result.output.total_amount);  // → e.g. 156.30
+console.log(result.output.expenses_xlsx_path);  // → "expenses.xlsx" (in run output dir)
+```
+
+Or via raw curl — upload first, then reference by `file_id`:
+
+```bash
+RECEIPT_1=$(curl -s -X POST http://localhost:4000/api/files \
+  -H "Authorization: Bearer dev-token" \
+  -F "file=@./fixtures/sample-receipts/01-restaurant.jpg" | jq -r .file_id)
+
+curl -X POST http://localhost:4000/api/agents/dev/receipts-to-expenses/run \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d "{\"input\": {\"receipts\": [{\"type\":\"file\",\"source\":\"id\",\"file_id\":\"$RECEIPT_1\"}], \"month\":\"2026-04\"}}"
+```
+
+To declare your own multimodal agent, add a `file`-typed input to `agent.yaml`:
+
+```yaml
+inputs:
+  - name: photo
+    type: file
+    media: image
+    mime_types: [image/jpeg, image/png, image/webp]
+    max_size: 5_000_000
+    required: true
+```
+
+See [`agent.yaml` → File inputs](./agent-yaml.md#inputs-required) for full details and [API → Uploading input files](./api.md#uploading-input-files) for the wire format.
 
 ---
 

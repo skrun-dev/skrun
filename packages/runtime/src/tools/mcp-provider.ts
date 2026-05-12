@@ -1,6 +1,6 @@
 import type { McpServer } from "@skrun-dev/schema";
-import { createLogger } from "../logger.js";
 import type { Logger } from "../logger.js";
+import { createLogger } from "../logger.js";
 import { isHostAllowed } from "../security/network.js";
 import type { ToolDefinition, ToolProvider, ToolResult } from "./types.js";
 

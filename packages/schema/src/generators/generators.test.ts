@@ -32,16 +32,19 @@ describe("generateAgentYaml", () => {
         name: "Bash",
         description: "Execute Bash script",
         input_schema: { type: "object", properties: {}, additionalProperties: true },
+        required: false,
       },
       {
         name: "Read",
         description: "Execute Read script",
         input_schema: { type: "object", properties: {}, additionalProperties: true },
+        required: false,
       },
       {
         name: "Write",
         description: "Execute Write script",
         input_schema: { type: "object", properties: {}, additionalProperties: true },
+        required: false,
       },
     ]);
     expect(result.config.environment?.timeout).toBe("300s");

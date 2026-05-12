@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   IconAgents,
+  IconCash,
   IconCheck,
   IconChevRight,
   IconError,
@@ -12,6 +13,7 @@ import {
 } from "../components/shared/icons";
 import { Btn, Card, MetricCard, PageHeader, Pill, StatusDot } from "../components/shared/ui";
 import { useAgents, useRecentRuns, useStats } from "../lib/api-client";
+import { computeDeltaPercent, formatUsd } from "../lib/format";
 
 export function HomePage() {
   const { data: stats, isLoading: statsLoading, error: statsError } = useStats();
@@ -33,9 +35,13 @@ export function HomePage() {
         runs: stats.runs_today,
         tokens: stats.tokens_today,
         failed: stats.failed_today,
+        cacheSavings: stats.cache_savings_today,
+        cost: stats.cost_today,
         prevRuns: stats.runs_yesterday,
         prevTokens: stats.tokens_yesterday,
         prevFailed: stats.failed_yesterday,
+        prevCacheSavings: stats.cache_savings_yesterday,
+        prevCost: stats.cost_yesterday,
       };
     }
     const sum = (arr: number[]) => arr.reduce((a, b) => a + b, 0);
@@ -43,11 +49,25 @@ export function HomePage() {
       runs: sum(stats.daily_runs),
       tokens: sum(stats.daily_tokens),
       failed: sum(stats.daily_failed),
+      cacheSavings: sum(stats.daily_cache_savings),
+      cost: sum(stats.daily_cost),
       prevRuns: 0,
       prevTokens: 0,
       prevFailed: 0,
+      prevCacheSavings: 0,
+      prevCost: 0,
     };
   }, [stats, statsDays]);
+
+  // Empty-state detection — no cache activity yet on this workspace
+  const noCacheActivity = useMemo(() => {
+    if (!stats) return true;
+    return (
+      stats.cache_savings_today === 0 &&
+      stats.cache_savings_yesterday === 0 &&
+      stats.daily_cache_savings.every((v) => v === 0)
+    );
+  }, [stats]);
 
   if (statsError) {
     return (
@@ -99,7 +119,7 @@ export function HomePage() {
                 onClick={() => setStatsDays(d)}
                 className={`px-2.5 h-6 rounded-[5px] transition-colors ${
                   statsDays === d
-                    ? "bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100 shadow-sm font-medium"
+                    ? "bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100 shadow-xs font-medium"
                     : "text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
                 }`}
               >
@@ -109,9 +129,11 @@ export function HomePage() {
           </div>
         </div>
       )}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
         {statsLoading ? (
           <>
+            <MetricSkeleton />
+            <MetricSkeleton />
             <MetricSkeleton />
             <MetricSkeleton />
             <MetricSkeleton />
@@ -131,7 +153,7 @@ export function HomePage() {
               delta={
                 statsDays === 1
                   ? computeDeltaPercent(metricValues.runs, metricValues.prevRuns)
-                  : undefined
+                  : "—"
               }
               icon={<IconRuns className="w-4 h-4" />}
               tone="emerald"
@@ -143,7 +165,7 @@ export function HomePage() {
               delta={
                 statsDays === 1
                   ? computeDeltaPercent(metricValues.tokens, metricValues.prevTokens)
-                  : undefined
+                  : "—"
               }
               icon={<IconSpark className="w-4 h-4" />}
               tone="violet"
@@ -157,12 +179,45 @@ export function HomePage() {
                   ? metricValues.failed === 0 && metricValues.prevFailed === 0
                     ? "0%"
                     : computeDeltaPercent(metricValues.failed, metricValues.prevFailed)
-                  : undefined
+                  : "—"
               }
               icon={<IconError className="w-4 h-4" />}
               tone={metricValues.failed > 0 ? "red" : "emerald"}
               spark={stats.daily_failed}
             />
+            <MetricCard
+              label="Cost"
+              value={formatUsd(metricValues.cost)}
+              delta={
+                statsDays === 1
+                  ? computeDeltaPercent(metricValues.cost, metricValues.prevCost)
+                  : "—"
+              }
+              icon={<IconCash className="w-4 h-4" />}
+              tone="sky"
+              spark={stats.daily_cost}
+            />
+            <div
+              data-testid="cost-saved-tile"
+              title={
+                noCacheActivity
+                  ? "Caching kicks in automatically on Anthropic, Gemini, OpenAI, xAI and Groq."
+                  : undefined
+              }
+            >
+              <MetricCard
+                label="Cost saved"
+                value={formatUsd(metricValues.cacheSavings)}
+                delta={
+                  statsDays === 1
+                    ? computeDeltaPercent(metricValues.cacheSavings, metricValues.prevCacheSavings)
+                    : "—"
+                }
+                icon={<IconCash className="w-4 h-4" />}
+                tone="amber"
+                spark={stats.daily_cache_savings}
+              />
+            </div>
           </>
         ) : null}
       </div>
@@ -190,7 +245,7 @@ export function HomePage() {
                 <div className="divide-y divide-gray-100 dark:divide-gray-900">
                   {Array.from({ length: 5 }).map((_, i) => (
                     <div key={`skel-${i}`} className="px-4 py-3">
-                      <div className="h-4 w-3/4 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
+                      <div className="h-4 w-3/4 bg-gray-100 dark:bg-gray-800 rounded-sm animate-pulse" />
                     </div>
                   ))}
                 </div>
@@ -354,7 +409,11 @@ function Step({
   number,
   title,
   description,
-}: { number: number; title: string; description: string }) {
+}: {
+  number: number;
+  title: string;
+  description: string;
+}) {
   return (
     <div>
       <div className="flex items-center gap-2 mb-1">
@@ -404,11 +463,4 @@ function extractAgentName(agentVersion: string): string {
   if (!agentVersion) return "unknown";
   const atIndex = agentVersion.indexOf("@");
   return atIndex > 0 ? agentVersion.slice(0, atIndex) : agentVersion;
-}
-
-function computeDeltaPercent(current: number, previous: number): string {
-  if (previous === 0) return "new";
-  const pct = Math.round(((current - previous) / previous) * 100);
-  if (pct === 0) return "0%";
-  return pct > 0 ? `+${pct}%` : `${pct}%`;
 }

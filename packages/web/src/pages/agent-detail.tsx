@@ -4,6 +4,7 @@ import { ConfirmDialog } from "../components/shared/confirm-dialog";
 import { EmptyState } from "../components/shared/empty-state";
 import {
   IconBook,
+  IconCash,
   IconChevRight,
   IconClock,
   IconCopy,
@@ -21,6 +22,7 @@ import {
   useRecentRuns,
   useVerifyAgent,
 } from "../lib/api-client";
+import { computeDeltaPercent as deltaPct, formatUsd } from "../lib/format";
 
 /**
  * Truncate a string at N graphemes (not UTF-16 code units), so emoji and CJK
@@ -44,13 +46,13 @@ function truncateGraphemes(str: string, max: number): string {
 }
 
 export function AgentDetailPage() {
-  const { namespace, name } = useParams<{ namespace: string; name: string }>();
+  const { namespace = "", name = "" } = useParams<{ namespace: string; name: string }>();
   const navigate = useNavigate();
 
   const [statsDays, setStatsDays] = useState(7);
-  const { data: agent, isLoading, error } = useAgent(namespace!, name!);
-  const { data: versions } = useAgentVersions(namespace!, name!);
-  const { data: agentStats } = useAgentStats(namespace!, name!, statsDays);
+  const { data: agent, isLoading, error } = useAgent(namespace, name);
+  const { data: versions } = useAgentVersions(namespace, name);
+  const { data: agentStats } = useAgentStats(namespace, name, statsDays);
   const { data: allRuns } = useRecentRuns(undefined, 50);
   const verifyAgent = useVerifyAgent();
   const deleteAgent = useDeleteAgent();
@@ -65,8 +67,8 @@ export function AgentDetailPage() {
   if (isLoading) {
     return (
       <div className="space-y-4">
-        <div className="h-8 w-64 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
-        <div className="h-32 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
+        <div className="h-8 w-64 bg-gray-100 dark:bg-gray-800 rounded-sm animate-pulse" />
+        <div className="h-32 bg-gray-100 dark:bg-gray-800 rounded-sm animate-pulse" />
       </div>
     );
   }
@@ -163,7 +165,7 @@ export function AgentDetailPage() {
                   onClick={() => setStatsDays(d)}
                   className={`px-2.5 h-6 rounded-[5px] transition-colors ${
                     statsDays === d
-                      ? "bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100 shadow-sm font-medium"
+                      ? "bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100 shadow-xs font-medium"
                       : "text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
                   }`}
                 >
@@ -172,7 +174,7 @@ export function AgentDetailPage() {
               ))}
             </div>
           </div>
-          <div className="grid grid-cols-4 gap-3 mb-6">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
             <MetricCard
               label="Runs"
               value={agentStats.runs.toLocaleString()}
@@ -209,6 +211,24 @@ export function AgentDetailPage() {
               tone="amber"
               spark={agentStats.daily_avg_duration_ms}
             />
+            <MetricCard
+              label={`Cost ${statsDays}d`}
+              value={formatUsd(agentStats.cost)}
+              delta={deltaPct(agentStats.cost, agentStats.prev_cost)}
+              icon={<IconCash className="w-4 h-4" />}
+              tone="sky"
+              spark={agentStats.daily_cost}
+            />
+            <div data-testid="agent-cache-savings">
+              <MetricCard
+                label={`Cache savings ${statsDays}d`}
+                value={formatUsd(agentStats.cache_savings)}
+                delta={deltaPct(agentStats.cache_savings, agentStats.prev_cache_savings)}
+                icon={<IconCash className="w-4 h-4" />}
+                tone="emerald"
+                spark={agentStats.daily_cache_savings}
+              />
+            </div>
           </div>
         </>
       )}
@@ -380,20 +400,20 @@ export function AgentDetailPage() {
                   value={
                     <div className="text-right">
                       <div className="font-mono text-[11.5px]">
-                        {(config!.model as { provider: string; name: string }).provider}/
-                        {(config!.model as { provider: string; name: string }).name}
+                        {(config?.model as { provider: string; name: string }).provider}/
+                        {(config?.model as { provider: string; name: string }).name}
                       </div>
-                      {(config!.model as { fallback?: { provider: string; name: string } })
+                      {(config?.model as { fallback?: { provider: string; name: string } })
                         .fallback && (
                         <div className="font-mono text-[10.5px] text-gray-400 dark:text-gray-500">
                           fallback:{" "}
                           {
-                            (config!.model as { fallback: { provider: string; name: string } })
+                            (config?.model as { fallback: { provider: string; name: string } })
                               .fallback.provider
                           }
                           /
                           {
-                            (config!.model as { fallback: { provider: string; name: string } })
+                            (config?.model as { fallback: { provider: string; name: string } })
                               .fallback.name
                           }
                         </div>
@@ -429,8 +449,8 @@ export function AgentDetailPage() {
                 className="w-full justify-center"
                 onClick={() =>
                   verifyAgent.mutate({
-                    namespace: namespace!,
-                    name: name!,
+                    namespace: namespace,
+                    name: name,
                     verified: !agent.verified,
                   })
                 }
@@ -458,7 +478,7 @@ export function AgentDetailPage() {
         variant="danger"
         onConfirm={async () => {
           try {
-            await deleteAgent.mutateAsync({ namespace: namespace!, name: name! });
+            await deleteAgent.mutateAsync({ namespace: namespace, name: name });
             navigate("/agents");
           } catch {
             // handled by mutation
@@ -500,11 +520,4 @@ function formatTokensShort(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
   if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`;
   return String(tokens);
-}
-
-function deltaPct(current: number, previous: number): string {
-  if (previous === 0) return "new";
-  const pct = Math.round(((current - previous) / previous) * 100);
-  if (pct === 0) return "0%";
-  return pct > 0 ? `+${pct}%` : `${pct}%`;
 }

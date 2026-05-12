@@ -1,8 +1,8 @@
 import { watch } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
-import { validateAgent } from "@skrun-dev/schema";
 import type { AgentConfig } from "@skrun-dev/schema";
+import { validateAgent } from "@skrun-dev/schema";
 import type { Command } from "commander";
 import * as format from "../utils/format.js";
 import { mockRun } from "../utils/mock-runner.js";

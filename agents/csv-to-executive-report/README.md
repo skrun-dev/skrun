@@ -18,14 +18,10 @@ This agent gives you a real PDF. Title page, opening narrative with the headline
 - Skrun running (`pnpm dev:registry` from the repo root)
 - One LLM API key (Google Gemini works on the free tier)
 - **Python 3.11+** locally
-- **`pip install -r requirements.txt`** from this directory once before first use
 
-```bash
-cd agents/csv-to-executive-report
-pip install -r requirements.txt
-```
+That's it. The agent's `requirements.txt` (pandas + matplotlib + reportlab) is resolved automatically by the Skrun runtime on first call and cached at `~/.skrun/deps/<hash>/` for subsequent runs. Cold-install takes ~30s; warm cache is instant.
 
-(This is the heaviest demo's pip footprint: pandas + matplotlib + reportlab. ~80 MB resolved. Once Skrun ships a managed cloud or a self-host container with Python deps pre-installed, this step disappears for hosted runs.)
+> Bumped to **v0.2.0** (was v0.1.0 with a manual `pip install -r requirements.txt`).
 
 ## How to run
 

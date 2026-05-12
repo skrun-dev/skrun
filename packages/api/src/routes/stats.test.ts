@@ -1,13 +1,23 @@
+import type { Context } from "hono";
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it } from "vitest";
 import { MemoryDb } from "../db/memory.js";
 import { createStatsRoutes } from "./stats.js";
 
-function createTestApp() {
+function createTestApp(userId = "test-user") {
   const db = new MemoryDb();
-  const noAuth = async (_c: unknown, next: () => Promise<void>) => next();
+  // Synthetic auth middleware: injects a user context so getUser(c) works.
+  // Real auth is exercised by integration tests in tests/e2e/.
+  const fakeAuth = async (c: Context, next: () => Promise<void>) => {
+    c.set("user", {
+      id: userId,
+      namespace: "test",
+      username: "test",
+    });
+    await next();
+  };
   const app = new Hono();
-  app.route("/api", createStatsRoutes(db, noAuth as never));
+  app.route("/api", createStatsRoutes(db, fakeAuth));
   return { app, db };
 }
 
@@ -69,12 +79,14 @@ describe("GET /api/stats", () => {
     await db.createAgent({ name: "a2", namespace: "dev", description: "", owner_id: "u1" });
     await db.createAgent({ name: "a3", namespace: "alice", description: "", owner_id: "u2" });
 
-    // Create 5 runs today (2 failed)
+    // Create 5 runs today (2 failed). Each run is owned by "test-user" so the
+    // multi-tenancy filter (driven by fakeAuth) doesn't exclude them.
     for (let i = 0; i < 3; i++) {
       const run = await db.createRun({
         id: `run-${i}`,
         agent_id: "a1",
         agent_version: "1.0.0",
+        user_id: "test-user",
         status: "completed",
       });
       await db.updateRun(run.id, { usage_total_tokens: 100 });
@@ -84,6 +96,7 @@ describe("GET /api/stats", () => {
         id: `run-${i}`,
         agent_id: "a1",
         agent_version: "1.0.0",
+        user_id: "test-user",
         status: "failed",
       });
       await db.updateRun(run.id, { usage_total_tokens: 50 });
@@ -107,5 +120,58 @@ describe("GET /api/stats", () => {
     // Today's runs should be in the last bucket (index 6)
     expect(body.daily_runs[6]).toBe(5);
     expect(body.daily_tokens[6]).toBe(400);
+  });
+
+  // ── Multi-tenancy ([005-cache-cost-savings-dashboard] VT-7) ────────────
+
+  describe("multi-tenancy", () => {
+    it("VT-7: User A only sees A's stats; User B only sees B's stats", async () => {
+      // Build 2 separate apps with different user contexts, sharing the same DB.
+      const sharedDb = new MemoryDb();
+      const buildApp = (userId: string) => {
+        const fakeAuth = async (c: Context, next: () => Promise<void>) => {
+          c.set("user", { id: userId, namespace: "test", username: "test" });
+          await next();
+        };
+        const a = new Hono();
+        a.route("/api", createStatsRoutes(sharedDb, fakeAuth));
+        return a;
+      };
+      const appA = buildApp("user-A");
+      const appB = buildApp("user-B");
+
+      // User A: 2 runs $0.42 each (today)
+      for (let i = 0; i < 2; i++) {
+        const run = await sharedDb.createRun({
+          id: `a-${i}`,
+          agent_id: "ag1",
+          agent_version: "1.0.0",
+          user_id: "user-A",
+          status: "completed",
+        });
+        await sharedDb.updateRun(run.id, { usage_cache_savings_usd: 0.42 });
+      }
+      // User B: 3 runs $1.00 each (today)
+      for (let i = 0; i < 3; i++) {
+        const run = await sharedDb.createRun({
+          id: `b-${i}`,
+          agent_id: "ag1",
+          agent_version: "1.0.0",
+          user_id: "user-B",
+          status: "completed",
+        });
+        await sharedDb.updateRun(run.id, { usage_cache_savings_usd: 1.0 });
+      }
+
+      const resA = await appA.request("/api/stats");
+      const bodyA = await resA.json();
+      expect(bodyA.cache_savings_today).toBeCloseTo(0.84, 6);
+      expect(bodyA.runs_today).toBe(2);
+
+      const resB = await appB.request("/api/stats");
+      const bodyB = await resB.json();
+      expect(bodyB.cache_savings_today).toBeCloseTo(3.0, 6);
+      expect(bodyB.runs_today).toBe(3);
+    });
   });
 });

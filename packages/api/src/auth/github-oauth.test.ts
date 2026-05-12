@@ -25,7 +25,6 @@ describe("GitHub OAuth", () => {
     });
 
     it("returns false when CLIENT_ID is missing", () => {
-      // biome-ignore lint/performance/noDelete: must truly remove env vars
       delete process.env.GITHUB_CLIENT_ID;
       process.env.GITHUB_CLIENT_SECRET = "secret456";
       expect(isOAuthConfigured()).toBe(false);
@@ -33,15 +32,12 @@ describe("GitHub OAuth", () => {
 
     it("returns false when CLIENT_SECRET is missing", () => {
       process.env.GITHUB_CLIENT_ID = "id123";
-      // biome-ignore lint/performance/noDelete: must truly remove env vars
       delete process.env.GITHUB_CLIENT_SECRET;
       expect(isOAuthConfigured()).toBe(false);
     });
 
     it("returns false when both are missing", () => {
-      // biome-ignore lint/performance/noDelete: must truly remove env vars
       delete process.env.GITHUB_CLIENT_ID;
-      // biome-ignore lint/performance/noDelete: must truly remove env vars
       delete process.env.GITHUB_CLIENT_SECRET;
       expect(isOAuthConfigured()).toBe(false);
     });

@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { bundleCache } from "../cache/bundle-cache.js";
 import { MemoryDb } from "../db/memory.js";
 import { MemoryStorage } from "../storage/memory.js";
 import { RegistryError, RegistryService } from "./registry.js";
@@ -12,6 +15,8 @@ describe("RegistryService", () => {
     storage = new MemoryStorage();
     db = new MemoryDb();
     service = new RegistryService(storage, db);
+    // Clear shared bundleCache singleton between tests to avoid cross-test pollution
+    bundleCache.clear();
   });
 
   it("should push and pull a bundle", async () => {
@@ -102,5 +107,154 @@ describe("RegistryService", () => {
     await service.push("acme", "agent", "1.0.0", Buffer.from("v1"), "u");
     const versions = await service.getVersions("acme", "agent");
     expect(versions[0].notes).toBeNull();
+  });
+
+  // ── deleteVersion (#77) ──────────────────────────────────────────────
+
+  describe("deleteVersion (#77)", () => {
+    // VT-7 LAST_VERSION
+    it("throws 409 LAST_VERSION when deleting the only remaining version", async () => {
+      await service.push("dev", "foo", "1.0.0", Buffer.from("v1"), "u");
+
+      await expect(service.deleteVersion("dev", "foo", "1.0.0")).rejects.toThrow(RegistryError);
+      try {
+        await service.deleteVersion("dev", "foo", "1.0.0");
+      } catch (err) {
+        expect(err).toBeInstanceOf(RegistryError);
+        expect((err as RegistryError).code).toBe("LAST_VERSION");
+        expect((err as RegistryError).status).toBe(409);
+      }
+      // Version still exists
+      const versions = await service.getVersions("dev", "foo");
+      expect(versions).toHaveLength(1);
+    });
+
+    // 404 NOT_FOUND (agent missing)
+    it("throws 404 NOT_FOUND when agent does not exist", async () => {
+      try {
+        await service.deleteVersion("dev", "missing", "1.0.0");
+        expect.fail("expected to throw");
+      } catch (err) {
+        expect((err as RegistryError).code).toBe("NOT_FOUND");
+        expect((err as RegistryError).status).toBe(404);
+      }
+    });
+
+    // 404 VERSION_NOT_FOUND (agent OK, version missing)
+    it("throws 404 VERSION_NOT_FOUND when version does not exist", async () => {
+      await service.push("dev", "foo", "1.0.0", Buffer.from("v1"), "u");
+      await service.push("dev", "foo", "2.0.0", Buffer.from("v2"), "u");
+
+      try {
+        await service.deleteVersion("dev", "foo", "9.9.9");
+        expect.fail("expected to throw");
+      } catch (err) {
+        expect((err as RegistryError).code).toBe("VERSION_NOT_FOUND");
+        expect((err as RegistryError).status).toBe(404);
+      }
+      // Both existing versions still present
+      const versions = await service.getVersions("dev", "foo");
+      expect(versions.map((v) => v.version)).toEqual(["1.0.0", "2.0.0"]);
+    });
+
+    // VT-9 past run preserved
+    it("preserves past runs referencing the deleted version (text column, no FK cascade)", async () => {
+      await service.push("dev", "foo", "1.0.0", Buffer.from("v1"), "u");
+      await service.push("dev", "foo", "9.9.999", Buffer.from("v2"), "u");
+      const agent = await db.getAgent("dev", "foo");
+      const run = await db.createRun({
+        id: "run-vt9",
+        agent_id: agent?.id ?? null,
+        agent_version: "9.9.999",
+        status: "completed",
+      });
+
+      await service.deleteVersion("dev", "foo", "9.9.999");
+
+      const persistedRun = await db.getRun(run.id);
+      expect(persistedRun).not.toBeNull();
+      expect(persistedRun?.agent_version).toBe("9.9.999");
+      expect(persistedRun?.agent_id).toBe(agent?.id);
+    });
+
+    // VT-10 bundleCache eviction
+    it("evicts the bundleCache entry for the deleted version", async () => {
+      await service.push("dev", "foo", "1.0.0", Buffer.from("v1"), "u");
+      await service.push("dev", "foo", "2.0.0", Buffer.from("v2"), "u");
+
+      // Pre-populate cache as if a pull just extracted this version
+      bundleCache.set("dev/foo/1.0.0", { dir: "/tmp/skrun-test-vt10", files: {} });
+      expect(bundleCache.get("dev/foo/1.0.0")).toBeDefined();
+
+      await service.deleteVersion("dev", "foo", "1.0.0");
+
+      expect(bundleCache.get("dev/foo/1.0.0")).toBeUndefined();
+    });
+
+    // VT-11 getMetadata returns new latest after delete
+    it("getMetadata returns the new latest version after deleting the previous latest", async () => {
+      await service.push("dev", "foo", "1.0.0", Buffer.from("v1"), "u");
+      await service.push("dev", "foo", "2.0.0", Buffer.from("v2"), "u");
+
+      const before = await service.getMetadata("dev", "foo");
+      expect(before.latest_version).toBe("2.0.0");
+
+      await service.deleteVersion("dev", "foo", "2.0.0");
+
+      const after = await service.getMetadata("dev", "foo");
+      expect(after.latest_version).toBe("1.0.0");
+    });
+
+    // VT-12 failure-mode order (storage throws, db delete still happens)
+    it("storage delete failure is swallowed but DB row still removed (storage-before-db order)", async () => {
+      await service.push("dev", "foo", "1.0.0", Buffer.from("v1"), "u");
+      await service.push("dev", "foo", "2.0.0", Buffer.from("v2"), "u");
+
+      // Mock storage.delete to throw
+      const storageSpy = vi
+        .spyOn(storage, "delete")
+        .mockRejectedValueOnce(new Error("R2 unavailable"));
+
+      // Should NOT throw — the .catch(()=>{}) swallows the storage error
+      await service.deleteVersion("dev", "foo", "1.0.0");
+
+      expect(storageSpy).toHaveBeenCalled();
+      // DB row removed despite storage failure → orphan storage entry, recoverable later
+      const versions = await service.getVersions("dev", "foo");
+      expect(versions).toHaveLength(1);
+      expect(versions[0].version).toBe("2.0.0");
+
+      storageSpy.mockRestore();
+    });
+
+    // VT-13 static guard: storage.delete appears before db.deleteVersion in source
+    it("source guarantees storage.delete is called BEFORE db.deleteVersion (regression guard)", () => {
+      const src = readFileSync(resolve(import.meta.dirname, "registry.ts"), "utf-8");
+      const methodAnchor = src.indexOf("async deleteVersion(");
+      expect(methodAnchor).toBeGreaterThan(-1);
+
+      const storageIdx = src.indexOf("this.storage.delete", methodAnchor);
+      const dbIdx = src.indexOf("this.db.deleteVersion", methodAnchor);
+      expect(storageIdx).toBeGreaterThan(-1);
+      expect(dbIdx).toBeGreaterThan(-1);
+      // storage delete must appear before db delete in source code order
+      expect(storageIdx).toBeLessThan(dbIdx);
+    });
+
+    // Bonus B-4: deleteAgent evicts bundleCache for all versions
+    it("deleteAgent evicts the bundleCache for all versions of the agent (closes Q-10 asymmetry)", async () => {
+      await service.push("dev", "multi", "1.0.0", Buffer.from("v1"), "u");
+      await service.push("dev", "multi", "2.0.0", Buffer.from("v2"), "u");
+
+      bundleCache.set("dev/multi/1.0.0", { dir: "/tmp/skrun-test-b4-1", files: {} });
+      bundleCache.set("dev/multi/2.0.0", { dir: "/tmp/skrun-test-b4-2", files: {} });
+      expect(bundleCache.get("dev/multi/1.0.0")).toBeDefined();
+      expect(bundleCache.get("dev/multi/2.0.0")).toBeDefined();
+
+      await service.deleteAgent("dev", "multi");
+
+      expect(bundleCache.get("dev/multi/1.0.0")).toBeUndefined();
+      expect(bundleCache.get("dev/multi/2.0.0")).toBeUndefined();
+    });
   });
 });

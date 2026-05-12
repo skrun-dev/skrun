@@ -2,7 +2,7 @@
  * E2E: SDK — test @skrun-dev/sdk against a real local HTTP server.
  * Uses Node's http.createServer + Hono's fetch handler.
  */
-import { type Server, createServer } from "node:http";
+import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MemoryDb } from "../../packages/api/src/db/memory.js";
 import { createApp } from "../../packages/api/src/index.js";

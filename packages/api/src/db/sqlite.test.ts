@@ -157,6 +157,29 @@ describe("SqliteDb", () => {
       expect(await db.getVersionByNumber(agent.id, "9.9.9")).toBeNull();
     });
 
+    // VT-2 (#77): deleteVersion happy path — sqlite impl
+    it("deleteVersion removes exactly one row from agent_versions", async () => {
+      const agent = await db.createAgent({
+        name: "del-v",
+        namespace: "ns",
+        description: "",
+        owner_id: "u",
+      });
+      await db.createVersion(agent.id, { version: "1.0.0", size: 100, bundle_key: "k1" });
+      await db.createVersion(agent.id, { version: "2.0.0", size: 200, bundle_key: "k2" });
+
+      const before = (await db.getVersions(agent.id)).length;
+      expect(before).toBe(2);
+
+      await db.deleteVersion(agent.id, "1.0.0");
+
+      const remaining = await db.getVersions(agent.id);
+      expect(remaining).toHaveLength(before - 1);
+      expect(remaining[0].version).toBe("2.0.0");
+      // VERSION_NOT_FOUND lookup still works after delete
+      expect(await db.getVersionByNumber(agent.id, "1.0.0")).toBeNull();
+    });
+
     it("should round-trip config_snapshot as JSON", async () => {
       const agent = await db.createAgent({
         name: "cfg",
@@ -491,6 +514,97 @@ describe("SqliteDb", () => {
       expect(stats.daily_avg_duration_ms).toHaveLength(7);
     });
   });
+
+  // ── Cache cost-savings ([005-cache-cost-savings-dashboard]) ──────────
+
+  describe("cache cost-savings", () => {
+    it("RT-5 sqlite: round-trip preserves all 3 cache fields via update→get", async () => {
+      await db.createRun({
+        id: "r-rt-sqlite",
+        agent_id: "agent-A",
+        agent_version: "1.0.0",
+        status: "running",
+      });
+      await db.updateRun("r-rt-sqlite", {
+        status: "completed",
+        usage_cache_read_tokens: 7143,
+        usage_cache_write_tokens: 0,
+        usage_cache_savings_usd: 0.000964,
+      });
+      const run = await db.getRun("r-rt-sqlite");
+      expect(run?.usage_cache_read_tokens).toBe(7143);
+      expect(run?.usage_cache_write_tokens).toBe(0);
+      // SQLite stores REAL as IEEE 754 double — use toBeCloseTo for safety
+      expect(run?.usage_cache_savings_usd).toBeCloseTo(0.000964, 6);
+    });
+
+    it("createRun initializes cache fields to 0 (DEFAULT)", async () => {
+      await db.createRun({
+        id: "r-default",
+        agent_id: "agent-A",
+        agent_version: "1.0.0",
+        status: "running",
+      });
+      const run = await db.getRun("r-default");
+      expect(run?.usage_cache_read_tokens).toBe(0);
+      expect(run?.usage_cache_write_tokens).toBe(0);
+      expect(run?.usage_cache_savings_usd).toBe(0);
+    });
+
+    it("VT-7 sqlite: multi-tenant userId filter isolates getStats aggregates", async () => {
+      // User A: 2 runs × $0.42, User B: 3 runs × $1.00 (all today)
+      for (let i = 0; i < 2; i++) {
+        const id = `a${i}`;
+        await db.createRun({
+          id,
+          agent_id: "ag1",
+          agent_version: "1.0.0",
+          user_id: "user-A",
+          status: "running",
+        });
+        await db.updateRun(id, { usage_cache_savings_usd: 0.42 });
+      }
+      for (let i = 0; i < 3; i++) {
+        const id = `b${i}`;
+        await db.createRun({
+          id,
+          agent_id: "ag1",
+          agent_version: "1.0.0",
+          user_id: "user-B",
+          status: "running",
+        });
+        await db.updateRun(id, { usage_cache_savings_usd: 1.0 });
+      }
+
+      const statsA = await db.getStats({ userId: "user-A" });
+      expect(statsA.cache_savings_today).toBeCloseTo(0.84, 6);
+
+      const statsB = await db.getStats({ userId: "user-B" });
+      expect(statsB.cache_savings_today).toBeCloseTo(3.0, 6);
+
+      // No filter — instance-wide
+      const statsAll = await db.getStats();
+      expect(statsAll.cache_savings_today).toBeCloseTo(3.84, 6);
+    });
+
+    it("getAgentStats: daily_cache_savings.length matches days param", async () => {
+      await db.createRun({
+        id: "r-days",
+        agent_id: "agent-A",
+        agent_version: "1.0.0",
+        status: "running",
+      });
+      await db.updateRun("r-days", { usage_cache_savings_usd: 0.5 });
+
+      const stats7 = await db.getAgentStats("agent-A", 7);
+      expect(stats7.daily_cache_savings).toHaveLength(7);
+      expect(stats7.cache_savings).toBeCloseTo(0.5, 6);
+
+      const stats30 = await db.getAgentStats("agent-A", 30);
+      expect(stats30.daily_cache_savings).toHaveLength(30);
+      expect(stats30.cache_savings).toBeCloseTo(0.5, 6);
+    });
+  });
 });
 
 // ── Migrations (file-backed so we can close + reopen) ───────────────
@@ -536,6 +650,34 @@ describe("SqliteDb migrations", () => {
     const db3 = new SqliteDb(dbPath);
     const v2 = await db3.getLatestVersion(agent.id);
     expect(v2?.notes).toBe("before close");
+    db3.close();
+  });
+
+  it("VT-1: migration 004 (cache columns) is idempotent across reopens", async () => {
+    // First open — fresh DB; SCHEMA already has the 3 cache columns from
+    // migration 004 baked in, AND migrate() PRAGMA hasColumn() check finds
+    // them already present so the ALTER blocks short-circuit (no-op).
+    const db1 = new SqliteDb(dbPath);
+    await db1.createRun({
+      id: "r-mig",
+      agent_id: "a",
+      agent_version: "1.0.0",
+      status: "running",
+    });
+    await db1.updateRun("r-mig", { usage_cache_savings_usd: 0.123456 });
+    db1.close();
+
+    // Reopen — migrate() should detect all 3 columns exist and skip ALL
+    // ALTER blocks. No error, data preserved.
+    const db2 = new SqliteDb(dbPath);
+    const run = await db2.getRun("r-mig");
+    expect(run?.usage_cache_savings_usd).toBeCloseTo(0.123456, 6);
+
+    // Third open — same idempotency check.
+    db2.close();
+    const db3 = new SqliteDb(dbPath);
+    const run3 = await db3.getRun("r-mig");
+    expect(run3?.usage_cache_savings_usd).toBeCloseTo(0.123456, 6);
     db3.close();
   });
 });

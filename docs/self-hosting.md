@@ -11,7 +11,7 @@ Deploy Skrun on your own infrastructure. Works on any cloud (AWS, GCP, Fly.io, H
 
 - **Privacy / compliance** — your data and agent executions stay in your infrastructure. No third party sees prompts, outputs, or LLM keys.
 - **Cost** — you pay cloud infra only (~$5-50/mo for small scale). No SaaS fees, no per-run markup.
-- **Control** — pick your storage backend (SQLite or Supabase), your LLM providers (any of 6 + any OpenAI-compatible endpoint), your authentication, your monitoring.
+- **Control** — pick your storage backend (SQLite or Supabase), your LLM providers (any of 6 first-class providers + any OpenAI-compatible endpoint), your authentication, your monitoring.
 - **MIT license** — fork it, modify it, run it forever.
 
 If you'd rather not operate it yourself, a managed version at `skrun.sh` is coming soon — same runtime, our infra, plus billing and marketplace.
@@ -88,6 +88,22 @@ All migrations use `IF NOT EXISTS` so they're safe to re-apply.
 
 `MemoryDb` lives in `packages/api/src/db/memory.ts` and is used by the test suite. Don't use it in production — everything is lost on restart.
 
+### Script dependency cache
+
+When agents declare a `package.json` / `requirements.txt` / `pyproject.toml` at the bundle root, Skrun resolves the deps on first call and caches them under `~/.skrun/deps/<hash>/` (or `$SKRUN_DEPS_DIR` if overridden). The cache is **content-addressable** — two agents whose manifests have identical text share the same cache entry, so 5 agents using `pandas==2.2.3` only consume ~80 MB of disk once.
+
+**Disk planning**: typical Python data agents (pandas, matplotlib, reportlab) resolve to ~80–100 MB per unique manifest hash. Heavy ML stacks (`transformers` + `torch`) reach several GB. Plan ~500 MB / 1 GB of headroom for typical mixed deployments; more if your fleet runs many distinct ML manifests.
+
+**Operator tools**:
+
+```bash
+skrun cache list           # hash + size + package count + last-used per entry
+skrun cache clear          # delete all entries (prompts above 100 MB)
+skrun cache clear --yes    # bypass the prompt for cron / CI cleanups
+```
+
+The cache is **safe to delete** at any time — the runtime re-resolves on the next call. Only `~/.skrun/deps/.tmp-*/` directories represent in-flight installs from a crashed previous run; `cache clear` removes them silently.
+
 ---
 
 ## Authentication
@@ -158,6 +174,7 @@ OPENAI_API_KEY=sk-...
 GOOGLE_API_KEY=AIza...
 MISTRAL_API_KEY=...
 GROQ_API_KEY=gsk_...
+XAI_API_KEY=xai-...
 ```
 
 Good for: you're the only caller, or you want to absorb LLM costs centrally.
@@ -236,6 +253,7 @@ server {
 | `GITHUB_CLIENT_ID` | — | GitHub OAuth App client ID. If set, enables OAuth auth mode. |
 | `GITHUB_CLIENT_SECRET` | — | GitHub OAuth App client secret |
 | `SKRUN_OUTPUT_DIR` | `/tmp/skrun-outputs` | Base dir for agent-produced files (Files API) |
+| `SKRUN_DEPS_DIR` | `~/.skrun/deps` | Script-deps cache root (per-host). Same hash drives cloud Docker BuildKit layer cache. |
 | `SKRUN_ALLOWED_HOSTS` | — | Global outbound host allowlist (advisory for scripts) |
 | `SKRUN_AGENTS_DIR` | — | Dashboard scan directory for importing agents via UI |
 | `LOG_LEVEL` | `info` | pino log level: `debug`/`info`/`warn`/`error` |
@@ -246,7 +264,7 @@ server {
 | `FILES_MAX_SIZE_MB` | `10` | Max file size for Files API (MB) |
 | `FILES_MAX_COUNT` | `20` | Max files per run |
 | `FILES_RETENTION_S` | `3600` | How long agent-produced files stay available (seconds) |
-| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY` / `MISTRAL_API_KEY` / `GROQ_API_KEY` | — | Server-side LLM keys (optional — callers can provide their own) |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY` / `MISTRAL_API_KEY` / `GROQ_API_KEY` / `XAI_API_KEY` | — | Server-side LLM keys (optional — callers can provide their own) |
 
 ---
 
@@ -280,9 +298,12 @@ Every log entry during a POST /run includes `run_id`, `agent`, and `agent_versio
 - **Run failure rate** (`failed_today` / `runs_today` from `GET /api/stats`) — catches LLM provider outages, bad agent changes, quota issues.
 - **Average run duration** — regressions here usually mean a bad prompt or tool loop.
 - **Token usage** — cost tracking, per-agent and per-user.
+- **Cache savings** (`cache_savings_today`, `daily_cache_savings[]` from `GET /api/stats`; `usage_cache_savings_usd` per run) — dollar value of prompt-caching across the workspace. The dashboard's "Cost saved" tile + per-run `saved $X.XX` line render these.
 - **Active MCP connections** — leaks would show up here (bounded by `MCP_CACHE_MAX`).
 
 The dashboard at `/dashboard` shows all of this in real time.
+
+> **Multi-tenancy note**: `GET /api/stats` filters aggregates by the authenticated user. On a single-tenant deploy (dev-token mode or one-user OAuth instance), you see effectively the same instance-wide stats you saw before — the auth middleware synthesizes a deterministic user id, and the filter narrows to that single user. On a shared deploy where multiple operators have API keys, each user sees only their own runs in the dashboard. If you previously relied on shared-instance aggregates with multiple users sharing one API key, that stays unchanged (one key → one user → one bucket).
 
 ---
 

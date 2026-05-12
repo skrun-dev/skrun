@@ -1,5 +1,5 @@
 import { screen, waitFor } from "@testing-library/react";
-import { http, HttpResponse } from "msw";
+import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import { Route, Routes } from "react-router-dom";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -18,6 +18,9 @@ const mockRun = {
   usage_completion_tokens: 300,
   usage_total_tokens: 500,
   usage_estimated_cost: 0.0025,
+  usage_cache_read_tokens: 0,
+  usage_cache_write_tokens: 0,
+  usage_cache_savings_usd: 0,
   duration_ms: 1500,
   created_at: "2026-04-21T10:00:00Z",
   completed_at: "2026-04-21T10:00:01Z",
@@ -74,5 +77,58 @@ describe("RunDetailPage", () => {
       expect(screen.getByText("Run not found")).toBeInTheDocument();
       expect(screen.getByText("Back to runs")).toBeInTheDocument();
     });
+  });
+
+  // ── Cache cost-savings ([005-cache-cost-savings-dashboard]) ───────────
+
+  it("VT-14: shows 'saved $X.XX' line on completed run with savings > 0", async () => {
+    server.use(
+      http.get("/api/runs/run-with-savings", () =>
+        HttpResponse.json({
+          ...mockRun,
+          id: "run-with-savings",
+          status: "completed",
+          usage_cache_read_tokens: 7143,
+          usage_cache_savings_usd: 0.12,
+        }),
+      ),
+    );
+    renderRunDetail("run-with-savings");
+    await waitFor(() => {
+      const savedLine = screen.getByTestId("cost-cell-saved");
+      expect(savedLine).toBeInTheDocument();
+      expect(savedLine.textContent).toContain("saved $0.12");
+    });
+  });
+
+  it("VT-15: hides 'saved $X.XX' line on failed run (no partial accounting)", async () => {
+    server.use(
+      http.get("/api/runs/run-failed", () =>
+        HttpResponse.json({
+          ...mockRun,
+          id: "run-failed",
+          status: "failed",
+          error: "LLM timeout",
+          // Even if savings were somehow non-zero, the UI hides the line
+          // for non-completed status.
+          usage_cache_savings_usd: 0.5,
+        }),
+      ),
+    );
+    renderRunDetail("run-failed");
+    await waitFor(() => {
+      // Page rendered (assert via Re-run button presence)
+      expect(screen.getByText("Re-run")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("cost-cell-saved")).not.toBeInTheDocument();
+  });
+
+  it("hides 'saved $X.XX' when savings = 0 (no cache activity)", async () => {
+    // mockRun has usage_cache_savings_usd: 0 → no saved line should render
+    renderRunDetail("run-abc-123-def-456");
+    await waitFor(() => {
+      expect(screen.getByText("Re-run")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("cost-cell-saved")).not.toBeInTheDocument();
   });
 });

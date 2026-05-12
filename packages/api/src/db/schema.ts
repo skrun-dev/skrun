@@ -66,6 +66,9 @@ export interface Run {
   usage_completion_tokens: number;
   usage_total_tokens: number;
   usage_estimated_cost: number;
+  usage_cache_read_tokens: number;
+  usage_cache_write_tokens: number;
+  usage_cache_savings_usd: number;
   duration_ms: number | null;
   files: Record<string, unknown>[] | null;
   created_at: string;

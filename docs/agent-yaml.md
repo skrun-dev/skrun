@@ -18,7 +18,7 @@ The `agent.yaml` file is Skrun's extension to the Agent Skills standard. It decl
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `provider` | enum | Yes | `anthropic`, `openai`, `google`, `mistral`, `groq`, `meta` |
+| `provider` | enum | Yes | `anthropic`, `openai`, `google`, `mistral`, `groq`, `xai`, `meta` |
 | `name` | string | Yes | Model name (e.g., `claude-sonnet-4-20250514`) |
 | `temperature` | number | No | 0-2, controls randomness |
 | `base_url` | string | No | Custom API endpoint (for self-hosted models — Ollama, vLLM, LocalAI). Any OpenAI-compatible endpoint. |
@@ -61,6 +61,40 @@ model:
 ```
 
 Set the API key via `X-LLM-API-Key` header or the `OPENAI_API_KEY` env var (it's used for any OpenAI-compatible endpoint when `base_url` is set).
+
+**Models per provider** (capabilities: image / document / audio / cache). Source of truth: `packages/schema/src/capability.ts`. Refreshed against authoritative provider docs May 2026. Models are grouped by identical capability flags. Snapshot / dated model IDs (e.g. `claude-opus-4-7-20260416`) resolve to their base entry via longest-prefix matching, so they don't need their own row here.
+
+The `cache` column indicates whether the model supports the runtime's prompt-caching wire-up (Anthropic explicit `cache_control`, OpenAI / xAI `prompt_cache_key`, Gemini implicit, Groq implicit on selected models). When `cache=✓`, repeated calls with stable system + tools content benefit from 30-90% input-token discount automatically — no agent.yaml change required. See [docs/concepts.md → Cost & caching](./concepts.md#cost--caching) for the full story.
+
+| Provider | Model | image | document | audio | cache |
+|----------|-------|-------|----------|-------|-------|
+| anthropic | claude-opus-4-7 / claude-opus-4-6 / claude-opus-4 / claude-sonnet-4-6 / claude-sonnet-4-5 / claude-sonnet-4 / claude-haiku-4-5 / claude-haiku-4 / claude-3-7-sonnet / claude-3-5-sonnet / claude-3-5-haiku / claude-3-opus | ✓ | ✓ | — | ✓ |
+| anthropic | claude-3-haiku | ✓ | — | — | ✓ |
+| google | gemini-3.1-pro-preview / gemini-3.1-flash-preview / gemini-3.1-flash-lite-preview / gemini-3-flash-preview / gemini-3-deep-think-preview / gemini-2.5-pro / gemini-2.5-flash / gemini-2.5-flash-lite | ✓ | ✓ | ✓ | ✓ |
+| openai | gpt-5.5-pro / gpt-5.5 / gpt-5.4-pro / gpt-5.4-mini / gpt-5.4-nano / gpt-5.4 / gpt-5.3-codex / gpt-5-pro / gpt-5 / gpt-4o / gpt-4o-mini | ✓ | ✓ | — | ✓ |
+| openai | gpt-4-turbo / o1 | ✓ | — | — | ✓ |
+| openai | o1-mini | — | — | — | ✓ |
+| openai | gpt-audio / gpt-audio-1.5 / gpt-4o-audio-preview | — | — | ✓ | ✓ |
+| mistral | mistral-large-3 / mistral-large-2512 / mistral-medium-3.5 / mistral-medium-2508 / mistral-medium-3 / mistral-small-3.2 / mistral-small-2506 / mistral-small-3.1 / ministral-14b-2512 / ministral-8b-2512 / ministral-3b-2512 | ✓ | — | — | — |
+| mistral | mistral-small-4 / mistral-large-latest / ministral-8b / magistral-medium-1.2 | — | — | — | — |
+| groq | llama-4-scout-17b-16e-instruct | ✓ | — | — | — |
+| groq | openai/gpt-oss-120b / openai/gpt-oss-20b / openai/gpt-oss-safeguard-20b / gpt-oss-120b / gpt-oss-20b | — | — | — | ✓ |
+| groq | meta-llama/llama-4-maverick-17b-128e-instruct / qwen/qwen3-32b / llama-3.3-70b-versatile / llama-3.1-8b-instant / groq/compound / groq/compound-mini | — | — | — | — |
+| xai | grok-4.3 / grok-4.1-fast / grok-4.20-multi-agent | ✓ | — | — | ✓ |
+
+Notes:
+- Snapshot IDs (e.g. `claude-opus-4-7-20260416`, `gpt-5.5-2026-04-23`, `gemini-3-flash-preview-001`) resolve to the base entry via longest-prefix matching — declare them in your `agent.yaml` as-is.
+- Anthropic PDF support: every active Claude 4.x / 3.5+ model accepts PDFs via the `document` content block (URL / base64 / Files API). Claude 3 Haiku is the only entry without doc support.
+- OpenAI PDF support: vision-capable models accept PDFs via the Files API (`purpose: user_data`); the system extracts text+images server-side. `o1-mini` and the gpt-audio family are text/audio only.
+- Gemini accepts video natively (mp4/mpeg/mov/avi/flv/mpg/webm/wmv/3gpp, plus YouTube URLs); Skrun's runtime does not yet wire video as an input modality. Wiring it is tracked on the runtime backlog.
+- xAI Grok 4.3 also accepts video natively (mp4/mov/webm, ≤5 min, ≤1080p) — same backlog item as above.
+- **Specialist models on dedicated endpoints** are intentionally NOT in the matrix because the Skrun runtime currently calls `/v1/chat/completions` only. Multi-endpoint routing is on the runtime backlog:
+    - Mistral Voxtral (audio chat + STT + realtime + TTS) — `/v1/chat/completions` for the chat variant; `/v1/audio/transcriptions` and `/v1/audio/speech` for STT/TTS.
+    - Mistral OCR 3 (document parsing) — `/v1/ocr`.
+    - Groq Whisper (audio transcription) — `whisper-large-v3`, `whisper-large-v3-turbo` on `/v1/audio/transcriptions`.
+    - OpenAI `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` on `/v1/audio/transcriptions`; `gpt-realtime`, `gpt-realtime-1.5` on `/v1/realtime`; `gpt-image-2`, `gpt-image-1.5` on `/v1/images/*`.
+    - xAI Voice API (STT/TTS) and Imagine API (image + video generation).
+- Self-hosted models accessed via `base_url` are not in this table — capability validation is skipped for unknown model names (the runtime treats them as opaque pass-through).
 
 ### `tools` (optional)
 - **Type**: array of objects
@@ -120,6 +154,180 @@ Scripts are bundled into the `.agent` archive at build time and available on the
 
 > **Note**: On multi-user instances, `scripts/` only execute for **verified agents**. Non-verified agents can still run (LLM + MCP), but scripts are skipped. Operators verify agents via `PATCH /api/agents/:ns/:name/verify` (see [API reference](api.md#verify-an-agent)). In dev mode (`dev-token`), verification is bypassed — all scripts execute locally.
 
+### `tool_choice` (optional)
+- **Type**: string
+- **Default**: `auto`
+- **Values**: `auto` | `required` | `none` | `<tool-name>`
+
+Forces the LLM to invoke (or skip) tools rather than relying on prompt phrasing. Useful when a model would otherwise satisfy the output schema without calling a side-effecting tool — observed frequently on Gemini Flash with artifact-writing agents.
+
+| Value | Behavior |
+|-------|----------|
+| `auto` (default) | LLM decides whether and which tools to call (current behavior, no provider directive sent). |
+| `required` | LLM must call **at least one** declared tool before producing a final response. |
+| `none` | LLM must not call any tool. |
+| `<tool-name>` | LLM must call the named tool (must match a declared tool). |
+
+```yaml
+tools:
+  - name: write_artifact
+    description: Write a Markdown file to the run output directory.
+    input_schema: { ... }
+
+tool_choice: write_artifact   # force this exact tool every run
+```
+
+### `parallel_tools` (optional)
+- **Type**: boolean
+- **Default**: `true`
+
+Whether the model may emit multiple tool calls in parallel within one response. Set to `false` to force at-most-one tool call per turn (useful for ordered workflows or rate-limited tools).
+
+```yaml
+parallel_tools: false
+```
+
+### Per-tool `required` flag
+
+In addition to top-level `tool_choice`, individual tools can declare `required: true` to model a "this tool must always fire" invariant (e.g., an audit-log tool that should run regardless of caller intent):
+
+```yaml
+tools:
+  - name: audit_log
+    description: Append an audit entry. Always called.
+    input_schema: { ... }
+    required: true       # this tool must be called
+  - name: search
+    description: Search docs (optional).
+    input_schema: { ... }
+```
+
+**Precedence rules** (when both top-level and per-tool flags are set):
+- Top-level `tool_choice: none` or a specific tool name **wins** outright; per-tool `required: true` is ignored.
+- Top-level `tool_choice: required` + per-tool `required: true` → **subset** semantics (the LLM must call at least one tool from the required subset).
+- Top-level absent or `auto` + per-tool `required: true` → behaves like `tool_choice: <that-tool>` (or subset for multiple).
+
+### Provider support matrix
+
+Each provider implements tool-choice differently — Skrun translates to the native API shape:
+
+| Capability | Anthropic | Gemini | OpenAI | xAI |
+|------------|-----------|--------|--------|-----|
+| `auto` / `required` / `none` / specific tool | ✓ | ✓ | ✓ | ✓ |
+| Subset of N tools (multiple `required: true`) | ✗ → soft fallback to `required` + warning | ✓ native (`allowed_function_names`) | ✗ → soft fallback | ✗ → soft fallback |
+| `parallel_tools: false` | ✓ (`disable_parallel_tool_use`) | ✗ → no-op + warning | ✓ (`parallel_tool_calls: false`) | ✓ (OpenAI compat) |
+
+When a directive isn't natively supported, the runtime degrades gracefully (collapses to the closest supported mode + structured warning in logs) rather than rejecting the agent.
+
+### Script dependencies
+
+If your `scripts/` import third-party libraries, declare them in a standard manifest file at the bundle root. Skrun's runtime detects the manifest, resolves the dependencies once, and caches them at `~/.skrun/deps/<hash>/` for every subsequent run.
+
+**No new `agent.yaml` field.** Detection is filesystem-based: the runtime scans the bundle root for one of the manifests below.
+
+#### Supported manifests
+
+| File at bundle root | Ecosystem | Resolver |
+|---------------------|-----------|----------|
+| `package.json` | Node | `npm` (default) — `npm install --prefix=<cache>` |
+| `requirements.txt` | Python | `pip install -r requirements.txt` (pinned versions in the file = the lock) |
+| `pyproject.toml` (PEP 621) | Python | `pip install <bundle>` (PEP 517) |
+
+**Lockfile precedence** (auto-detected, all optional):
+
+| Lockfile | Triggers | Resolver invocation |
+|----------|----------|---------------------|
+| `pnpm-lock.yaml` | Node | `pnpm install --frozen-lockfile --dir=<cache>` |
+| `yarn.lock` | Node | `yarn install --frozen-lockfile --cwd=<cache>` |
+| `package-lock.json` | Node | `npm ci --prefix=<cache>` |
+| `uv.lock` | Python (with `pyproject.toml`) | `uv sync --frozen` (uv bootstrapped via pip) |
+| `poetry.lock` | Python (with `pyproject.toml`) | `poetry install --no-root` (poetry bootstrapped via pip) |
+
+When both Python manifests are present, `pyproject.toml` wins and `requirements.txt` is ignored. For Node lockfile precedence: `pnpm-lock.yaml` > `yarn.lock` > `package-lock.json`.
+
+#### Reproducible builds
+
+Without a lockfile, the install resolves the latest version satisfying each declared range. The runtime emits a `non-reproducible build` warning to install logs (visible in `skrun logs`). **Add a lockfile to your bundle for reproducible installs.**
+
+#### Caching
+
+Resolved dependencies live at `~/.skrun/deps/<sha256>/`, where the hash is `SHA-256(<ecosystem>\n<manifestKind?>\n<manifestContent>\n[lockfileKind?]\n[lockfileContent])`. The hash is **content-only** — two bundles with identical manifest text on different machines produce the same hash, so cache entries are shareable across hosts (and across container build layers in cloud setups).
+
+Manage the cache with the [`skrun cache`](cli.md#skrun-cache) CLI subcommands (`list`, `clear`).
+
+#### Install network policy
+
+Install-time network access is **separate** from your agent's runtime `environment.networking.allowed_hosts`. The install allowlist is fixed in code (security perimeter, not user-configurable in v1):
+
+- `registry.npmjs.org` (npm / pnpm)
+- `registry.yarnpkg.com` (yarn)
+- `pypi.org` + `files.pythonhosted.org` (pip / uv / poetry)
+
+Your agent's `environment.networking.allowed_hosts` continues to govern what scripts may reach **at runtime**, after the install completes.
+
+#### Example: Python with pinned `requirements.txt`
+
+```
+my-agent/
+├── SKILL.md
+├── agent.yaml
+├── requirements.txt        ← pandas==2.2.3 / matplotlib==3.10.0
+└── scripts/
+    └── analyze.py          ← imports pandas
+```
+
+```text
+# requirements.txt
+pandas==2.2.3
+matplotlib==3.10.0
+```
+
+#### Example: Node with pnpm lockfile
+
+```
+my-agent/
+├── SKILL.md
+├── agent.yaml
+├── package.json            ← declares jszip
+├── pnpm-lock.yaml          ← reproducible install
+└── scripts/
+    └── build_zip.js        ← imports jszip
+```
+
+```json
+{
+  "name": "my-agent-deps",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "jszip": "^3.10.1" }
+}
+```
+
+#### Build-time exclusions
+
+`skrun build` automatically excludes `node_modules/`, `venv/`, `.venv/`, `__pycache__/`, and `.pytest_cache/` from the produced `.agent` tar. Only the manifest + lockfile travels in the bundle; the install happens on the runtime host (or in a Docker layer for cloud).
+
+If your `scripts/` directory contains imports beyond the language stdlib but no manifest is found, `skrun build` emits a `SCRIPTS_NO_MANIFEST` warning so you can add the manifest before deploy.
+
+#### Cold start vs warm cache
+
+| Run | Behavior | Latency |
+|-----|----------|---------|
+| First run for a given hash | Resolver downloads + installs deps | ~30s for typical Python (pandas) / ~5s for Node (jszip) |
+| Subsequent runs | Cache hit, path lookup only | < 5 ms |
+
+#### Failure handling
+
+If the install fails (registry down, package not found, network error), the runtime raises `SCRIPT_DEPS_INSTALL_FAILED` and the script does **not** spawn. The error surfaces to the LLM tool-call loop with `isError: true`. The failed install is **memoized** for the lifetime of the runtime instance — subsequent calls return the cached rejection without retrying (avoids hammering the registry on persistent failure).
+
+#### Out of scope (for now)
+
+- `uv` as the default resolver (use `pip` for universality; `uv` opt-in via `uv.lock`)
+- Other languages: Go modules, Cargo, Ruby gems, Composer
+- Lockfile auto-generation (Skrun reads lockfiles, never writes them)
+- System packages (`apt-get`) — runtime image's job
+- Private registries (npm Enterprise, internal PyPI)
+
 ### `mcp_servers` (optional)
 - **Type**: array of objects
 - **Default**: `[]`
@@ -173,6 +381,10 @@ mcp_servers:
 ### `inputs` (required)
 - **Type**: array (min 1)
 
+Two input shapes are supported: **primitive** (text/JSON) and **file** (binary — image/PDF/audio).
+
+**Primitive inputs**
+
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Input field name |
@@ -180,6 +392,69 @@ mcp_servers:
 | `required` | boolean | No | Default: `true` |
 | `description` | string | No | Human-readable description |
 | `default` | any | No | Default value |
+
+**File inputs** (image / PDF / audio)
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Input field name |
+| `type` | const | Yes | Must be `file` |
+| `media` | enum | Yes | `image`, `document` (PDF), or `audio` |
+| `mime_types` | string[] | No | MIME allowlist (e.g. `[image/jpeg, image/png]`). Defaults below. |
+| `max_size` | integer | No | Max bytes per file. Defaults below. |
+| `max_count` | integer | No | Max number of files in this field (1 = single file, >1 = array). Default: `1` |
+| `required` | boolean | No | Default: `true` |
+| `description` | string | No | Human-readable description |
+
+**Defaults per `media`**
+
+| Media | Default `mime_types` | Default `max_size` |
+|-------|---------------------|---------------------|
+| `image` | `image/jpeg`, `image/png`, `image/webp`, `image/heic` | 5 MB |
+| `document` | `application/pdf` | 25 MB |
+| `audio` | `audio/wav`, `audio/mp3`, `audio/mp4`, `audio/m4a`, `audio/webm` | 25 MB |
+
+> **Capability check at deploy/push**: if any `file` input declares a `media` type the chosen model (or its fallback) cannot process — e.g. `media: audio` with `model: anthropic/claude-3-7-sonnet` — `skrun push` and `skrun deploy` refuse the operation with a clear error before any network call. The matrix lives in `@skrun-dev/schema/capability.ts`. Self-hosted models bypass the check (operator's responsibility).
+
+**Wire format on `POST /run`**: file inputs always use an array of source descriptors — see [API → Uploading input files](api.md#uploading-input-files). The SDK auto-uploads `Blob` / `File` / `Uint8Array` values transparently.
+
+**Examples**
+
+```yaml
+inputs:
+  # Primitive
+  - name: question
+    type: string
+    required: true
+
+  # Single image (e.g., a screenshot)
+  - name: screenshot
+    type: file
+    media: image
+    mime_types: [image/png, image/jpeg]
+    max_size: 5_000_000
+    required: true
+
+  # Up to 20 receipt photos
+  - name: receipts
+    type: file
+    media: image
+    max_count: 20
+    description: Receipt photos to read and tabulate.
+
+  # A PDF report
+  - name: report
+    type: file
+    media: document
+    mime_types: [application/pdf]
+    max_size: 25_000_000
+
+  # Voice memo (Gemini / gpt-4o-audio only)
+  - name: memo
+    type: file
+    media: audio
+    max_size: 10_000_000
+```
 
 ### `outputs` (required)
 - **Type**: array (min 1)

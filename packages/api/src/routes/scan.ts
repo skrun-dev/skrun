@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import type { MiddlewareHandler } from "hono";
@@ -53,7 +53,7 @@ function createTarEntry(filePath: string, content: Buffer): Buffer {
   Buffer.from("        ").copy(header, 148);
   let checksum = 0;
   for (let i = 0; i < 512; i++) {
-    checksum += header[i]!;
+    checksum += header[i] ?? 0;
   }
   Buffer.from(`${checksum.toString(8).padStart(6, "0")}\0 `).copy(header, 148);
 

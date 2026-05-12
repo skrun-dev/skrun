@@ -15,12 +15,8 @@ This agent takes a Markdown outline and produces a polished `.pptx` — title sl
 - Skrun running (`pnpm dev:registry` from the repo root)
 - One LLM API key (Google Gemini works on the free tier)
 - **Python 3.11+** locally
-- **`pip install -r requirements.txt`** from this directory once before first use
 
-```bash
-cd agents/slide-deck-generator
-pip install -r requirements.txt
-```
+That's it. The agent's `requirements.txt` (`python-pptx`) is resolved automatically by the Skrun runtime on first call and cached at `~/.skrun/deps/<hash>/`.
 
 (Windows: this agent's tools run under the local Python — Skrun runtime invokes `python` on Windows and `python3` on macOS/Linux. Standard for both.)
 
@@ -33,7 +29,7 @@ From the repo root:
 cd agents/slide-deck-generator
 skrun build && skrun push
 
-# 2. Call it (quick-try with the bundled outline — 6-slide Q2 roadmap)
+# 2. Call it (quick-try with the bundled outline — 6-slide Q2 update)
 curl -X POST http://localhost:4000/api/agents/dev/slide-deck-generator/run \
   -H "Authorization: Bearer dev-token" \
   -H "Content-Type: application/json" \
@@ -41,7 +37,7 @@ curl -X POST http://localhost:4000/api/agents/dev/slide-deck-generator/run \
 {
   "input": {
     "outline_md": "<paste the contents of fixtures/outline.md here>",
-    "deck_title": "Q2 Engineering Roadmap",
+    "deck_title": "Q2 Engineering Update",
     "brand_primary_color": "#0366d6"
   }
 }
@@ -98,6 +94,6 @@ Tips:
 - Generate Google Slides via the Slides API for cloud-native delivery (requires OAuth / service account — secondary API key, deliberately avoided in this demo).
 - Ship a `.docx` variant with the same outline format using `python-docx`.
 
-## Dependency note
+## Version note
 
-This demo currently requires `pip install python-pptx` locally. Once Skrun ships a managed cloud or a self-host container with Python deps pre-installed, this step will disappear for hosted runs.
+v0.2.0 bumped from v0.1.0 — the manual `pip install python-pptx` step disappeared once Skrun's runtime gained `requirements.txt` resolution.

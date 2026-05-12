@@ -348,4 +348,129 @@ describe("Registry Routes", () => {
     expect(versions[0].notes).toBe("v1 note");
     expect(versions[1].notes).toBeNull();
   });
+
+  // ── DELETE /api/agents/:ns/:name/versions/:version (#77) ───────────────
+
+  describe("DELETE /versions/:version (#77)", () => {
+    // VT-4 403 wrong namespace
+    it("returns 403 FORBIDDEN when caller's namespace differs from path namespace", async () => {
+      await pushAgent("dev", "owned", "1.0.0");
+      await pushAgent("dev", "owned", "2.0.0");
+
+      const res = await app.request("/api/agents/other/owned/versions/1.0.0", {
+        method: "DELETE",
+        headers: authHeader,
+      });
+      expect(res.status).toBe(403);
+      const body = await res.json();
+      expect(body.error.code).toBe("FORBIDDEN");
+    });
+
+    // VT-5 404 NOT_FOUND (agent missing)
+    it("returns 404 NOT_FOUND when agent does not exist", async () => {
+      const res = await app.request("/api/agents/dev/missing-agent/versions/1.0.0", {
+        method: "DELETE",
+        headers: authHeader,
+      });
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error.code).toBe("NOT_FOUND");
+    });
+
+    // VT-6 404 VERSION_NOT_FOUND (agent OK, version missing)
+    it("returns 404 VERSION_NOT_FOUND when version does not exist", async () => {
+      await pushAgent("dev", "foo", "1.0.0");
+      await pushAgent("dev", "foo", "2.0.0");
+
+      const res = await app.request("/api/agents/dev/foo/versions/9.9.9", {
+        method: "DELETE",
+        headers: authHeader,
+      });
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error.code).toBe("VERSION_NOT_FOUND");
+
+      // Both existing versions still present
+      const versionsRes = await app.request("/api/agents/dev/foo/versions");
+      const { versions } = await versionsRes.json();
+      expect(versions).toHaveLength(2);
+    });
+
+    // VT-8 204 + bundle removed end-to-end
+    it("returns 204 on success and the deleted version's bundle becomes unpullable", async () => {
+      await pushAgent("dev", "foo", "1.0.0");
+      await pushAgent("dev", "foo", "2.0.0");
+
+      // Pre-condition: pulling 1.0.0 returns the bundle
+      const prePull = await app.request("/api/agents/dev/foo/pull/1.0.0", {
+        headers: authHeader,
+      });
+      expect(prePull.status).toBe(200);
+
+      const delRes = await app.request("/api/agents/dev/foo/versions/1.0.0", {
+        method: "DELETE",
+        headers: authHeader,
+      });
+      expect(delRes.status).toBe(204);
+      // Body is empty
+      const text = await delRes.text();
+      expect(text).toBe("");
+
+      // Post-condition: pulling 1.0.0 now 404s (bundle removed from storage AND db row gone)
+      const postPull = await app.request("/api/agents/dev/foo/pull/1.0.0", {
+        headers: authHeader,
+      });
+      expect(postPull.status).toBe(404);
+
+      // Other version still works
+      const otherPull = await app.request("/api/agents/dev/foo/pull/2.0.0", {
+        headers: authHeader,
+      });
+      expect(otherPull.status).toBe(200);
+
+      // Versions list reflects the delete
+      const versionsRes = await app.request("/api/agents/dev/foo/versions");
+      const { versions } = await versionsRes.json();
+      expect(versions).toHaveLength(1);
+      expect(versions[0].version).toBe("2.0.0");
+    });
+
+    // 409 LAST_VERSION (single-version agent)
+    it("returns 409 LAST_VERSION when deleting would leave the agent with no versions", async () => {
+      await pushAgent("dev", "solo", "1.0.0");
+
+      const res = await app.request("/api/agents/dev/solo/versions/1.0.0", {
+        method: "DELETE",
+        headers: authHeader,
+      });
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error.code).toBe("LAST_VERSION");
+    });
+
+    // 401 auth missing
+    it("returns 401 when auth is missing", async () => {
+      const res = await app.request("/api/agents/dev/foo/versions/1.0.0", {
+        method: "DELETE",
+      });
+      expect(res.status).toBe(401);
+    });
+
+    // Route-order static guard (B-1): the new route must appear BEFORE the wildcard
+    it("source registers /versions/:version DELETE before whole-agent DELETE (B-1 guard)", async () => {
+      const { readFileSync } = await import("node:fs");
+      const { resolve } = await import("node:path");
+      const src = readFileSync(resolve(import.meta.dirname, "registry.ts"), "utf-8");
+
+      const versionDeleteIdx = src.indexOf(
+        'router.delete("/agents/:namespace/:name/versions/:version"',
+      );
+      const wholeAgentDeleteIdx = src.indexOf('router.delete("/agents/:namespace/:name"');
+
+      expect(versionDeleteIdx).toBeGreaterThan(-1);
+      expect(wholeAgentDeleteIdx).toBeGreaterThan(-1);
+      // Specific path must be registered first to guarantee Hono first-match-wins safety
+      expect(versionDeleteIdx).toBeLessThan(wholeAgentDeleteIdx);
+    });
+  });
 });

@@ -2,12 +2,18 @@ import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import type { DbAdapter } from "../db/adapter.js";
 import type { RunStatus } from "../db/schema.js";
+import { getUser } from "../middleware/auth.js";
 
 export function createStatsRoutes(db: DbAdapter, authMiddleware: MiddlewareHandler): Hono {
   const router = new Hono();
 
   router.get("/stats", authMiddleware, async (c) => {
-    const stats = await db.getStats();
+    // Multi-tenancy: filter aggregates by the authenticated user. In dev-token
+    // / single-tenant self-host the user id is deterministic so the filter
+    // narrows to that user (effectively instance-wide). In cloud / shared
+    // instances each user sees only their own runs.
+    const user = getUser(c);
+    const stats = await db.getStats({ userId: user.id });
     return c.json(stats);
   });
 

@@ -1,5 +1,5 @@
 import { screen, waitFor } from "@testing-library/react";
-import { http, HttpResponse } from "msw";
+import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { renderWithProviders } from "../test-utils";
@@ -18,6 +18,12 @@ const server = setupServer(
       daily_runs: [0, 0, 0, 0, 0, 0, 5],
       daily_tokens: [0, 0, 0, 0, 0, 0, 12500],
       daily_failed: [0, 0, 0, 0, 0, 0, 1],
+      cache_savings_today: 1.42,
+      cache_savings_yesterday: 0.5,
+      daily_cache_savings: [0, 0, 0, 0, 0, 0.5, 1.42],
+      cost_today: 0.05,
+      cost_yesterday: 0.03,
+      daily_cost: [0, 0, 0, 0, 0, 0.03, 0.05],
     }),
   ),
   http.get("/api/agents", () => HttpResponse.json({ agents: [], total: 0 })),
@@ -94,6 +100,12 @@ describe("HomePage", () => {
           daily_runs: [0, 0, 0, 0, 0, 0, 0],
           daily_tokens: [0, 0, 0, 0, 0, 0, 0],
           daily_failed: [0, 0, 0, 0, 0, 0, 0],
+          cache_savings_today: 0,
+          cache_savings_yesterday: 0,
+          daily_cache_savings: [0, 0, 0, 0, 0, 0, 0],
+          cost_today: 0,
+          cost_yesterday: 0,
+          daily_cost: [0, 0, 0, 0, 0, 0, 0],
         }),
       ),
       http.get("/api/runs", () => HttpResponse.json([])),
@@ -101,6 +113,51 @@ describe("HomePage", () => {
     renderWithProviders(<HomePage />);
     await waitFor(() => {
       expect(screen.getByText("Welcome to Skrun")).toBeInTheDocument();
+    });
+  });
+
+  it("renders 'Cost saved' tile with formatted USD when cache_savings_today > 0", async () => {
+    renderWithProviders(<HomePage />);
+    await waitFor(() => {
+      expect(screen.getByText("Cost saved")).toBeInTheDocument();
+      // formatUsd(1.42) -> "$1.42"
+      expect(screen.getByText("$1.42")).toBeInTheDocument();
+    });
+  });
+
+  it("'Cost saved' tile shows tooltip when no cache activity", async () => {
+    server.use(
+      http.get("/api/stats", () =>
+        HttpResponse.json({
+          agents_count: 1,
+          runs_today: 1,
+          tokens_today: 100,
+          failed_today: 0,
+          runs_yesterday: 0,
+          tokens_yesterday: 0,
+          failed_yesterday: 0,
+          daily_runs: [0, 0, 0, 0, 0, 0, 1],
+          daily_tokens: [0, 0, 0, 0, 0, 0, 100],
+          daily_failed: [0, 0, 0, 0, 0, 0, 0],
+          cache_savings_today: 0,
+          cache_savings_yesterday: 0,
+          daily_cache_savings: [0, 0, 0, 0, 0, 0, 0],
+          cost_today: 0,
+          cost_yesterday: 0,
+          daily_cost: [0, 0, 0, 0, 0, 0, 0],
+        }),
+      ),
+    );
+    renderWithProviders(<HomePage />);
+    await waitFor(() => {
+      const tile = screen.getByTestId("cost-saved-tile");
+      expect(tile).toBeInTheDocument();
+      expect(tile.getAttribute("title")).toContain(
+        "Caching kicks in automatically on Anthropic, Gemini, OpenAI, xAI and Groq",
+      );
+      // The Cost saved tile itself shows $0.00 (the Cost tile may also show
+      // $0.00 — scope the assertion to the Cost saved wrapper).
+      expect(tile.textContent).toContain("$0.00");
     });
   });
 });

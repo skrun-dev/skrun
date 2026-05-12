@@ -101,7 +101,7 @@ interface PillProps {
 export function Pill({ tone = "neutral", dot = false, children }: PillProps) {
   return (
     <span
-      className={`inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded text-[10.5px] font-medium ${pillTones[tone]}`}
+      className={`inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded-sm text-[10.5px] font-medium ${pillTones[tone]}`}
     >
       {dot && (
         <span
@@ -273,6 +273,8 @@ interface MetricCardProps {
   label: string;
   value: string | number;
   delta?: string;
+  /** Optional muted second line under the label (e.g., "saved $0.12"). */
+  subtitle?: string;
   tone?: MetricTone;
   icon?: ReactNode;
   spark?: number[];
@@ -284,6 +286,7 @@ export function MetricCard({
   label,
   value,
   delta,
+  subtitle,
   tone = "sky",
   icon,
   spark,
@@ -316,6 +319,9 @@ export function MetricCard({
       <div className="flex items-center mt-1.5">
         <span className="text-[11.5px] text-gray-500 dark:text-gray-500">{label}</span>
       </div>
+      {subtitle && (
+        <div className="text-[11px] text-gray-400 dark:text-gray-600 mt-0.5">{subtitle}</div>
+      )}
       {spark && <Spark data={spark} tone={tone} />}
     </div>
   );

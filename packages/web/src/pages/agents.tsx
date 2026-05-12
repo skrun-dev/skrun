@@ -7,6 +7,7 @@ import { IconCheck, IconPlay, IconPlus, IconSearch } from "../components/shared/
 import { Pagination } from "../components/shared/pagination";
 import { Btn, PageHeader, Pill } from "../components/shared/ui";
 import { useAgents, useDeleteAgent } from "../lib/api-client";
+import { formatUsd } from "../lib/format";
 
 const PAGE_SIZE = 50;
 
@@ -14,9 +15,9 @@ export function AgentsPage() {
   const [page, setPage] = useState(1);
   const [namespaceFilter, setNamespaceFilter] = useState("");
   const [verifiedFilter, setVerifiedFilter] = useState<"all" | "verified" | "unverified">("all");
-  const [sortKey, setSortKey] = useState<"name" | "run_count" | "token_count" | "updated_at">(
-    "name",
-  );
+  const [sortKey, setSortKey] = useState<
+    "name" | "run_count" | "token_count" | "cost_total" | "updated_at"
+  >("name");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [deleteTarget, setDeleteTarget] = useState<{ namespace: string; name: string } | null>(
     null,
@@ -52,6 +53,7 @@ export function AgentsPage() {
         cmp = `${a.namespace}/${a.name}`.localeCompare(`${b.namespace}/${b.name}`);
       else if (sortKey === "run_count") cmp = a.run_count - b.run_count;
       else if (sortKey === "token_count") cmp = a.token_count - b.token_count;
+      else if (sortKey === "cost_total") cmp = a.cost_total - b.cost_total;
       else if (sortKey === "updated_at") cmp = a.updated_at.localeCompare(b.updated_at);
       return sortDir === "asc" ? cmp : -cmp;
     });
@@ -85,7 +87,7 @@ export function AgentsPage() {
         <div className="flex items-center gap-2 h-8 w-[280px] px-2.5 rounded-md border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 focus-within:border-sky-400 focus-within:ring-2 focus-within:ring-sky-500/15 transition">
           <IconSearch className="w-[13px] h-[13px] text-gray-400" />
           <input
-            className="flex-1 bg-transparent outline-none text-[12.5px] text-gray-800 dark:text-gray-200 placeholder:text-gray-400"
+            className="flex-1 bg-transparent outline-hidden text-[12.5px] text-gray-800 dark:text-gray-200 placeholder:text-gray-400"
             placeholder="Filter agents..."
             value={namespaceFilter}
             onChange={(e) => setNamespaceFilter(e.target.value)}
@@ -100,7 +102,7 @@ export function AgentsPage() {
               onClick={() => setVerifiedFilter(t)}
               className={`px-2.5 h-6 rounded-[5px] transition-colors capitalize ${
                 verifiedFilter === t
-                  ? "bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100 shadow-sm font-medium"
+                  ? "bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100 shadow-xs font-medium"
                   : "text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
               }`}
             >
@@ -119,7 +121,7 @@ export function AgentsPage() {
           <div className="divide-y divide-gray-100 dark:divide-gray-900">
             {Array.from({ length: 5 }).map((_, i) => (
               <div key={`skel-${i}`} className="px-4 py-3.5">
-                <div className="h-4 w-1/2 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
+                <div className="h-4 w-1/2 bg-gray-100 dark:bg-gray-800 rounded-sm animate-pulse" />
               </div>
             ))}
           </div>
@@ -137,7 +139,7 @@ export function AgentsPage() {
       ) : (
         <div className="rounded-lg border border-gray-200 dark:border-gray-900 overflow-hidden bg-white dark:bg-gray-950/40">
           {/* Header row */}
-          <div className="grid grid-cols-[1fr_90px_90px_80px_100px] gap-4 px-4 h-9 bg-gray-50/60 dark:bg-gray-900/40 border-b border-gray-200 dark:border-gray-900 text-[10.5px] font-medium uppercase tracking-[0.06em] text-gray-500 dark:text-gray-500 items-center">
+          <div className="grid grid-cols-[1fr_90px_90px_90px_80px_100px] gap-4 px-4 h-9 bg-gray-50/60 dark:bg-gray-900/40 border-b border-gray-200 dark:border-gray-900 text-[10.5px] font-medium uppercase tracking-[0.06em] text-gray-500 dark:text-gray-500 items-center">
             <SortHeader
               label="Agent"
               sortKey="name"
@@ -161,6 +163,14 @@ export function AgentsPage() {
               onSort={toggleSort}
               className="text-right tabular-nums"
             />
+            <SortHeader
+              label="Cost"
+              sortKey="cost_total"
+              current={sortKey}
+              dir={sortDir}
+              onSort={toggleSort}
+              className="text-right tabular-nums"
+            />
             <span>Status</span>
             <SortHeader
               label="Updated"
@@ -176,11 +186,11 @@ export function AgentsPage() {
             {filteredAgents.map((agent) => (
               <div
                 key={agent.id}
-                className="grid grid-cols-[1fr_90px_90px_80px_100px] gap-4 px-4 h-14 items-center hover:bg-gray-50/60 dark:hover:bg-gray-900/30 group"
+                className="grid grid-cols-[1fr_90px_90px_90px_80px_100px] gap-4 px-4 h-14 items-center hover:bg-gray-50/60 dark:hover:bg-gray-900/30 group"
               >
                 {/* Agent cell */}
                 <div className="flex items-center gap-2.5 min-w-0">
-                  <div className="w-7 h-7 rounded-md bg-gradient-to-br from-sky-100 to-sky-50 dark:from-sky-950/60 dark:to-sky-950/20 ring-1 ring-sky-100 dark:ring-sky-900/40 flex items-center justify-center text-[10.5px] font-mono font-semibold text-sky-700 dark:text-sky-300 shrink-0">
+                  <div className="w-7 h-7 rounded-md bg-linear-to-br from-sky-100 to-sky-50 dark:from-sky-950/60 dark:to-sky-950/20 ring-1 ring-sky-100 dark:ring-sky-900/40 flex items-center justify-center text-[10.5px] font-mono font-semibold text-sky-700 dark:text-sky-300 shrink-0">
                     {agent.name.slice(0, 2)}
                   </div>
                   <div className="min-w-0">
@@ -215,6 +225,11 @@ export function AgentsPage() {
                   {formatTokens(agent.token_count)}
                 </span>
 
+                {/* Cost */}
+                <span className="text-[12px] tabular-nums text-gray-700 dark:text-gray-300 text-right">
+                  {formatUsd(agent.cost_total)}
+                </span>
+
                 {/* Status */}
                 <span>
                   {agent.verified ? (
@@ -233,7 +248,7 @@ export function AgentsPage() {
                     <button
                       type="button"
                       onClick={() => navigate(`/agents/${agent.namespace}/${agent.name}/run`)}
-                      className="h-6 px-2 rounded text-[11px] font-medium text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 dark:hover:bg-emerald-950/70 inline-flex items-center gap-1"
+                      className="h-6 px-2 rounded-sm text-[11px] font-medium text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 dark:hover:bg-emerald-950/70 inline-flex items-center gap-1"
                     >
                       <IconPlay className="w-2.5 h-2.5" /> Try
                     </button>
@@ -287,10 +302,10 @@ function SortHeader({
   className = "",
 }: {
   label: string;
-  sortKey: "name" | "run_count" | "token_count" | "updated_at";
+  sortKey: "name" | "run_count" | "token_count" | "cost_total" | "updated_at";
   current: string;
   dir: "asc" | "desc";
-  onSort: (key: "name" | "run_count" | "token_count" | "updated_at") => void;
+  onSort: (key: "name" | "run_count" | "token_count" | "cost_total" | "updated_at") => void;
   className?: string;
 }) {
   const isActive = current === sortKey;

@@ -1,0 +1,8 @@
+{
+  "name": "script-deps-node-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "jszip": "^3.10.1"
+  }
+}

@@ -225,7 +225,41 @@ export function createRegistryRoutes(
     }
   });
 
-  // Delete — auth required, namespace owner only
+  // Delete a single version — auth required, namespace owner only.
+  // MUST be registered BEFORE the whole-agent DELETE below: Hono is first-match-wins
+  // and the more-specific path with /versions/:version must be registered first to
+  // guarantee future-proofing against shadowing (see #77 plan B-1).
+  router.delete("/agents/:namespace/:name/versions/:version", authMiddleware, async (c) => {
+    const { namespace, name, version } = c.req.param();
+    const user = getUser(c);
+
+    if (namespace !== user.namespace) {
+      return c.json(
+        {
+          error: {
+            code: "FORBIDDEN",
+            message: `You don't have permission to delete versions in namespace '${namespace}'`,
+          },
+        },
+        403,
+      );
+    }
+
+    try {
+      await service.deleteVersion(namespace, name, version);
+      return c.body(null, 204);
+    } catch (err) {
+      if (err instanceof RegistryError) {
+        return c.json(
+          { error: { code: err.code, message: err.message } },
+          err.status as 400 | 404 | 409 | 500,
+        );
+      }
+      throw err;
+    }
+  });
+
+  // Delete whole agent — auth required, namespace owner only
   router.delete("/agents/:namespace/:name", authMiddleware, async (c) => {
     const { namespace, name } = c.req.param();
     const user = getUser(c);

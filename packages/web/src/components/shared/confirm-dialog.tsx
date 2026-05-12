@@ -24,6 +24,7 @@ export function ConfirmDialog({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* biome-ignore lint/a11y/useKeyWithClickEvents: backdrop dismiss is mouse-only by design */}
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop is a non-interactive overlay; the Cancel button is the keyboard path */}
       <div className="fixed inset-0 bg-black/50" onClick={onCancel} />
       <div className="relative bg-white dark:bg-gray-900 rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 p-6 max-w-sm w-full mx-4">
         <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100 mb-2">{title}</h3>

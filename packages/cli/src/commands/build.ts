@@ -12,7 +12,23 @@ import { getValidatedConfig } from "../utils/validated-config.js";
 const MAX_BUNDLE_SIZE = 50 * 1024 * 1024; // 50MB
 const WARN_BUNDLE_SIZE = 10 * 1024 * 1024; // 10MB
 
-const EXCLUDE_PATTERNS = new Set(["node_modules", ".git", "dist", ".env", ".DS_Store"]);
+// Directories and filenames excluded from the .agent bundle.
+//
+// `__pycache__` / `.pytest_cache` / `venv` / `.venv` were added in #57 so that
+// dev-machine venvs and Python build caches never leak into the tar — agents
+// declare `requirements.txt` / `pyproject.toml` and the runtime resolves deps
+// from the manifest at first run, not from a bundled venv.
+export const EXCLUDE_PATTERNS = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  ".env",
+  ".DS_Store",
+  "__pycache__",
+  ".pytest_cache",
+  "venv",
+  ".venv",
+]);
 
 function isExcluded(name: string): boolean {
   if (EXCLUDE_PATTERNS.has(name)) return true;
@@ -21,7 +37,7 @@ function isExcluded(name: string): boolean {
   return false;
 }
 
-async function collectFiles(dir: string, base: string = dir): Promise<string[]> {
+export async function collectFiles(dir: string, base: string = dir): Promise<string[]> {
   const files: string[] = [];
   const entries = await readdir(dir, { withFileTypes: true });
 

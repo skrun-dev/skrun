@@ -1,0 +1,15 @@
+name: dev/script-deps-none-fixture
+version: 0.1.0
+
+model:
+  provider: anthropic
+  name: claude-3-7-sonnet
+
+inputs:
+  - name: q
+    type: string
+    required: true
+
+outputs:
+  - name: answer
+    type: string

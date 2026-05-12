@@ -1,0 +1,9 @@
+{
+  "name": "knowledge-base-from-vault-deps",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Script-time dependencies for the knowledge-base-from-vault Skrun agent. Resolved by the runtime via #57.",
+  "dependencies": {
+    "jszip": "^3.10.1"
+  }
+}

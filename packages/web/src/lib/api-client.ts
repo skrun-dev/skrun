@@ -13,6 +13,18 @@ export interface Stats {
   daily_runs: number[];
   daily_tokens: number[];
   daily_failed: number[];
+  /** Total dollar savings (USD) produced by prompt-caching today. */
+  cache_savings_today: number;
+  /** Total dollar savings (USD) produced by prompt-caching yesterday. */
+  cache_savings_yesterday: number;
+  /** 7-day daily savings array (USD), oldest first; index 6 = today. */
+  daily_cache_savings: number[];
+  /** Total estimated cost (USD) today. */
+  cost_today: number;
+  /** Total estimated cost (USD) yesterday. */
+  cost_yesterday: number;
+  /** 7-day daily cost array (USD), oldest first; index 6 = today. */
+  daily_cost: number[];
 }
 
 export interface AgentStats {
@@ -28,6 +40,18 @@ export interface AgentStats {
   daily_tokens: number[];
   daily_failed: number[];
   daily_avg_duration_ms: number[];
+  /** Total cache savings (USD) over the current period. */
+  cache_savings: number;
+  /** Cache savings over the previous period (same window length). */
+  prev_cache_savings: number;
+  /** Daily cache savings array (USD); length matches the `days` query param. */
+  daily_cache_savings: number[];
+  /** Total estimated cost (USD) over the current period. */
+  cost: number;
+  /** Cost over the previous period (same window length). */
+  prev_cost: number;
+  /** Daily cost array (USD); length matches the `days` query param. */
+  daily_cost: number[];
 }
 
 export interface Agent {
@@ -41,6 +65,8 @@ export interface Agent {
   updated_at: string;
   run_count: number;
   token_count: number;
+  /** Total estimated cost (USD) across all runs of this agent. */
+  cost_total: number;
 }
 
 export interface AgentVersion {
@@ -67,6 +93,15 @@ export interface Run {
   usage_completion_tokens: number;
   usage_total_tokens: number;
   usage_estimated_cost: number;
+  /** Tokens served from the provider's prompt cache. 0 when no cache activity. */
+  usage_cache_read_tokens: number;
+  /** Tokens written to the provider's prompt cache (Anthropic only). */
+  usage_cache_write_tokens: number;
+  /**
+   * Dollar savings (USD) produced by prompt-caching on this run. Snapshot at
+   * write time; 0 for failed runs (no partial accounting).
+   */
+  usage_cache_savings_usd: number;
   model: string | null;
   duration_ms: number | null;
   created_at: string;
@@ -106,7 +141,7 @@ export class ApiError extends Error {
 
 // --- Auth token ---
 // "none" = use cookies (OAuth mode), string = use Bearer token, undefined = not yet set
-let _authToken: string | "none" | undefined = undefined;
+let _authToken: string | "none" | undefined;
 
 export function setAuthToken(token: string | "none") {
   _authToken = token;
@@ -294,7 +329,11 @@ export function useVerifyAgent() {
       namespace,
       name,
       verified,
-    }: { namespace: string; name: string; verified: boolean }) =>
+    }: {
+      namespace: string;
+      name: string;
+      verified: boolean;
+    }) =>
       apiFetch(`/agents/${namespace}/${name}/verify`, {
         method: "PATCH",
         body: JSON.stringify({ verified }),
@@ -314,7 +353,12 @@ export function useImportAgent() {
       name,
       version,
       bundle,
-    }: { namespace: string; name: string; version: string; bundle: ArrayBuffer }) => {
+    }: {
+      namespace: string;
+      name: string;
+      version: string;
+      bundle: ArrayBuffer;
+    }) => {
       await apiFetchRaw(`/agents/${namespace}/${name}/push?version=${version}`, {
         method: "POST",
         body: bundle,

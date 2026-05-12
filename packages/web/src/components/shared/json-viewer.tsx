@@ -17,7 +17,7 @@ export function JsonViewer({ data, maxCollapsedLines = 10 }: JsonViewerProps) {
 
   return (
     <div className="relative">
-      <pre className="text-xs font-mono bg-gray-50 dark:bg-gray-800 rounded-lg p-4 overflow-x-auto text-gray-800 dark:text-gray-200 whitespace-pre-wrap break-words">
+      <pre className="text-xs font-mono bg-gray-50 dark:bg-gray-800 rounded-lg p-4 overflow-x-auto text-gray-800 dark:text-gray-200 whitespace-pre-wrap wrap-break-word">
         {displayText}
       </pre>
       {shouldCollapse && (

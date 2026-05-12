@@ -4,7 +4,7 @@
 // Input  (stdin JSON): { vault_dir }
 // Output (stdout JSON): { files: [{ path, slug, title, frontmatter, headings, internal_links, content_preview }] }
 
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, extname, join, relative } from "node:path";
 
 interface VaultFile {
@@ -41,18 +41,18 @@ function parseFrontmatter(content: string): { fm: Record<string, string>; body: 
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
   if (!match) return { fm: {}, body: content };
   const fm: Record<string, string> = {};
-  for (const line of match[1]!.split(/\r?\n/)) {
+  for (const line of (match[1] ?? "").split(/\r?\n/)) {
     const m = line.match(/^([a-zA-Z0-9_-]+):\s*(.*)$/);
-    if (m) fm[m[1]!] = m[2]!.trim().replace(/^["']|["']$/g, "");
+    if (m?.[1]) fm[m[1]] = m[2]?.trim().replace(/^["']|["']$/g, "") ?? "";
   }
-  return { fm, body: match[2]! };
+  return { fm, body: match[2] ?? "" };
 }
 
 function extractHeadings(body: string): { level: number; text: string }[] {
   const out: { level: number; text: string }[] = [];
   for (const line of body.split(/\r?\n/)) {
     const m = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
-    if (m) out.push({ level: m[1]!.length, text: m[2]!.trim() });
+    if (m) out.push({ level: m[1]?.length, text: m[2]?.trim() });
   }
   return out;
 }
@@ -61,11 +61,11 @@ function extractInternalLinks(body: string): string[] {
   const out = new Set<string>();
   // [[wiki-style]] and [[wiki|alias]]
   for (const m of body.matchAll(/\[\[([^\]|\n]+?)(?:\|[^\]\n]*)?\]\]/g)) {
-    out.add(m[1]!.trim());
+    out.add(m[1]?.trim());
   }
   // [text](url) — only relative .md links
   for (const m of body.matchAll(/\[([^\]\n]+?)\]\(([^)\n]+?\.md)(?:#[^)\n]*)?\)/g)) {
-    out.add(m[2]!.replace(/\\/g, "/"));
+    out.add(m[2]?.replace(/\\/g, "/"));
   }
   return [...out];
 }

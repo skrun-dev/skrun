@@ -5,10 +5,7 @@ import type { MiddlewareHandler } from "hono";
  * Limits requests per IP per window (sliding window counter).
  * For MVP — production should use Redis-backed limiter.
  */
-export function rateLimiter(opts: {
-  windowMs: number;
-  max: number;
-}): MiddlewareHandler {
+export function rateLimiter(opts: { windowMs: number; max: number }): MiddlewareHandler {
   const hits = new Map<string, { count: number; resetAt: number }>();
 
   return async (c, next) => {

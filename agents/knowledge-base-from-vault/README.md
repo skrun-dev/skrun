@@ -72,7 +72,7 @@ The state is keyed by agent name, so `dev/knowledge-base-from-vault` accumulates
 
 Themes:
 - `light` (default) — classic GitHub-style readable
-- `dark` — softer than #000, easier on the eyes
+- `dark` — softer than pure black, easier on the eyes
 - `sepia` — paper-warm
 
 ## Bring your own input (BYOI)
@@ -102,6 +102,11 @@ Supported markdown features (rendered to HTML):
 
 - Wire to a webhook from your Obsidian/Notion sync — every commit triggers `POST /run` and republishes `kb.zip`.
 - Add a `publish_to_s3` parameter + an S3 MCP tool to auto-deploy (out of scope here — secondary API key).
-- Replace the manual ZIP writer with a streaming variant for vaults of 1000+ notes.
+- Replace `jszip` with a streaming variant (e.g. `archiver`) for vaults of 1000+ notes.
 - Add a `concept_threshold: number` input to filter the index (only show concepts with count > N).
 - Persist the concept graph to a separate `state_dump.json` artifact so it can be replayed/audited offline.
+
+## Version history
+
+- **0.2.0** (2026-05-02) — `package.json` declares `jszip`; the runtime resolves the dep automatically. Removed the 95-line hand-rolled STORE-method ZIP writer (~5 lines of jszip API in its place). Output is functionally identical.
+- **0.1.0** — initial release. Hand-rolled ZIP writer (CRC-32 + STORE method) because the runtime could not bundle or resolve npm deps.

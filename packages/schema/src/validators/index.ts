@@ -1,1 +1,1 @@
-export { validateAgent, type ValidationResult } from "./combined.js";
+export { type ValidationResult, validateAgent } from "./combined.js";

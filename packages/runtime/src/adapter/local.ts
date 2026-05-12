@@ -2,10 +2,12 @@ import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { collectOutputFiles } from "../files/output-collector.js";
+import type { SkrunPart } from "../llm/parts.js";
 import type { ToolCallRequest, ToolCallResult } from "../llm/providers/types.js";
 import type { LLMRouter } from "../llm/router.js";
-import { createLogger } from "../logger.js";
+import { resolveToolChoice } from "../llm/tool-choice.js";
 import type { Logger } from "../logger.js";
+import { createLogger } from "../logger.js";
 import { checkCost } from "../security/cost-checker.js";
 import { parseTimeout, withTimeout } from "../security/timeout.js";
 import type { ToolRegistry } from "../tools/registry.js";
@@ -44,6 +46,12 @@ export class LocalAdapter implements RuntimeAdapter {
             completionTokens: event.usage.completion_tokens,
             totalTokens: event.usage.total_tokens,
             estimatedCost: event.cost.estimated,
+            ...(event.usage.cache_read_tokens !== undefined && {
+              cacheReadTokens: event.usage.cache_read_tokens,
+            }),
+            ...(event.usage.cache_write_tokens !== undefined && {
+              cacheWriteTokens: event.usage.cache_write_tokens,
+            }),
           },
           durationMs: event.duration_ms,
           files: event.files,
@@ -156,13 +164,29 @@ export class LocalAdapter implements RuntimeAdapter {
         ? request.agentsMdContent
         : request.skillContent;
 
-    let userMessage = `Input: ${JSON.stringify(request.input)}`;
+    // Build text portion from non-file inputs only (file fields go in userContent as SkrunParts).
+    const fileFieldNames = new Set(
+      config.inputs.filter((f) => f.type === "file").map((f) => f.name),
+    );
+    const textOnlyInput: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(request.input)) {
+      if (!fileFieldNames.has(k)) textOnlyInput[k] = v;
+    }
+    let userMessage = `Input: ${JSON.stringify(textOnlyInput)}`;
     if (currentState) {
       userMessage += `\n\nPrevious state: ${JSON.stringify(currentState)}`;
     }
     userMessage += `\n\nRespond with a JSON object containing the output fields: ${config.outputs.map((o) => o.name).join(", ")}.`;
     if (config.state.type === "kv") {
       userMessage += `\nAlso include a "_state" field with any state to persist for future runs.`;
+    }
+
+    // Build SkrunPart[]: single text part + file parts from resolvedInputs.
+    const userContent: SkrunPart[] = [{ kind: "text", text: userMessage }];
+    if (request.resolvedInputs) {
+      for (const parts of request.resolvedInputs.values()) {
+        userContent.push(...parts);
+      }
     }
 
     const toolDefs = await this.tools.listTools();
@@ -204,14 +228,28 @@ export class LocalAdapter implements RuntimeAdapter {
       return { name: call.name, result: result.content, id: call.id };
     };
 
+    const toolChoice = resolveToolChoice(config);
+
+    // Build agentContext for prompt-cache routing. Agent name + version
+    // come from the resolved config + request; environmentId defaults to
+    // "default" when not provided (caching is then per agent+version only).
+    const agentContext = {
+      name: config.name,
+      version: request.agent_version ?? "unknown",
+      environmentId: request.environmentId ?? "default",
+    };
+
     const llmResponse = await this.router.call(
       config.model,
       systemPrompt,
-      userMessage,
+      userContent,
       llmTools.length > 0 ? llmTools : undefined,
       llmTools.length > 0 ? onToolCall : undefined,
       config.model.temperature,
       request.callerKeys,
+      toolChoice,
+      config.parallel_tools,
+      agentContext,
     );
 
     events.push({
@@ -291,6 +329,12 @@ export class LocalAdapter implements RuntimeAdapter {
         prompt_tokens: llmResponse.usage.promptTokens,
         completion_tokens: llmResponse.usage.completionTokens,
         total_tokens: llmResponse.usage.totalTokens,
+        ...(llmResponse.usage.cacheReadTokens !== undefined && {
+          cache_read_tokens: llmResponse.usage.cacheReadTokens,
+        }),
+        ...(llmResponse.usage.cacheWriteTokens !== undefined && {
+          cache_write_tokens: llmResponse.usage.cacheWriteTokens,
+        }),
       },
       cost: { estimated: llmResponse.estimatedCost },
       duration_ms: durationMs,

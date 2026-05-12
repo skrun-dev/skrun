@@ -59,9 +59,7 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
 
   it("authenticates via dev-token when OAuth not configured", async () => {
     // Ensure OAuth env vars are NOT set
-    // biome-ignore lint/performance/noDelete: must truly remove env vars
     delete process.env.GITHUB_CLIENT_ID;
-    // biome-ignore lint/performance/noDelete: must truly remove env vars
     delete process.env.GITHUB_CLIENT_SECRET;
 
     const res = await app.request("/protected/me", {

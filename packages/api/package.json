@@ -1,6 +1,6 @@
 {
   "name": "@skrun-dev/api",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "exports": {
     ".": {
@@ -10,7 +10,9 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
@@ -18,20 +20,20 @@
     "dev": "node --env-file=../../.env --import tsx src/dev.ts"
   },
   "dependencies": {
-    "@hono/node-server": "^1.19.14",
-    "@scalar/hono-api-reference": "^0.10.7",
+    "@hono/node-server": "^2.0.1",
+    "@scalar/hono-api-reference": "^0.10.13",
     "@skrun-dev/runtime": "workspace:*",
     "@skrun-dev/schema": "workspace:*",
-    "@supabase/supabase-js": "^2.103.3",
+    "@supabase/supabase-js": "^2.105.1",
     "better-sqlite3": "^12.9.0",
-    "hono": "^4.12.14"
+    "hono": "^4.12.18"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.6.0",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5"
   },
   "publishConfig": {
     "access": "public"
@@ -44,8 +46,12 @@
   },
   "homepage": "https://github.com/skrun-dev/skrun#readme",
   "bugs": "https://github.com/skrun-dev/skrun/issues",
-  "keywords": ["skrun", "agent-skills", "ai-agents"],
+  "keywords": [
+    "skrun",
+    "agent-skills",
+    "ai-agents"
+  ],
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   }
 }

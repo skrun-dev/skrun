@@ -272,6 +272,31 @@ describe("AgentConfigSchema", () => {
     expect(result.environment.timeout).toBe("300s");
     expect(result.state.type).toBe("kv");
     expect(result.context_mode).toBe("skill");
+    expect(result.tool_choice).toBe("auto");
+    expect(result.parallel_tools).toBe(true);
+  });
+
+  it("should accept tool_choice: required and parallel_tools: false", () => {
+    const result = AgentConfigSchema.parse({
+      ...validConfig,
+      tool_choice: "required",
+      parallel_tools: false,
+    });
+    expect(result.tool_choice).toBe("required");
+    expect(result.parallel_tools).toBe(false);
+  });
+
+  it("should accept tool_choice as a tool name", () => {
+    const result = AgentConfigSchema.parse({
+      ...validConfig,
+      tool_choice: "write_artifact",
+    });
+    expect(result.tool_choice).toBe("write_artifact");
+  });
+
+  it("should accept tool_choice: none", () => {
+    const result = AgentConfigSchema.parse({ ...validConfig, tool_choice: "none" });
+    expect(result.tool_choice).toBe("none");
   });
 
   it("should validate a full config", () => {
@@ -404,6 +429,16 @@ describe("ToolConfigSchema", () => {
     expect(result.description).toBe("Extract text from a PDF file.");
     expect(result.input_schema.type).toBe("object");
     expect(result.input_schema.required).toEqual(["path"]);
+  });
+
+  it("should default ToolConfig.required to false when absent", () => {
+    const result = ToolConfigSchema.parse(validTool);
+    expect(result.required).toBe(false);
+  });
+
+  it("should accept ToolConfig.required: true", () => {
+    const result = ToolConfigSchema.parse({ ...validTool, required: true });
+    expect(result.required).toBe(true);
   });
 
   it("should reject missing name", () => {

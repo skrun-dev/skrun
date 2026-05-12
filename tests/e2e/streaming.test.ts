@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { createApp } from "../../packages/api/src/index.js";
 import {
-  DEV_TOKEN,
   createTestApp,
+  DEV_TOKEN,
   pushAgent,
   runAgent,
   runAgentSSE,

@@ -15,6 +15,7 @@ function createMemoryState(): StateCallbacks {
     },
   };
 }
+
 import { ToolRegistry } from "../tools/registry.js";
 import type { RunEvent, RunRequest } from "../types.js";
 import { LocalAdapter } from "./local.js";
@@ -146,6 +147,83 @@ describe("LocalAdapter.executeStream", () => {
       expect(complete.cost.estimated).toBeGreaterThanOrEqual(0);
       expect(complete.duration_ms).toBeGreaterThanOrEqual(0);
     }
+  });
+
+  // VT-10 (#68 prompt-caching) — run_complete event surfaces cache_read_tokens
+  // + cache_write_tokens in snake_case wire format when the provider returned
+  // them. RunResult similarly exposes them in camelCase. Asserts the
+  // adapter's plumbing from LLMRouterResponse through RunCompleteEvent and
+  // RunResult.usage. Together with the response-builder change in
+  // packages/api/src/routes/run.ts, this proves cache fields propagate
+  // end-to-end into the POST /run JSON response.
+  it("VT-10: run_complete surfaces cache_read_tokens + cache_write_tokens (snake_case)", async () => {
+    const cachingProvider: LLMProvider = {
+      name: "mock",
+      call: vi.fn().mockResolvedValue({
+        content: '{"result": "cached output"}',
+        usage: {
+          promptTokens: 100,
+          completionTokens: 50,
+          cacheReadTokens: 2048,
+          cacheWriteTokens: 1024,
+        },
+      }),
+    };
+    router.registerProvider("mock", cachingProvider);
+    const adapter = new LocalAdapter(router, tools, state);
+
+    // Stream path: RunCompleteEvent has snake_case cache fields.
+    const events = await collectEvents(adapter.executeStream(createRunRequest()));
+    const complete = events.find((e) => e.type === "run_complete");
+    expect(complete).toBeDefined();
+    if (complete?.type === "run_complete") {
+      expect(complete.usage.cache_read_tokens).toBe(2048);
+      expect(complete.usage.cache_write_tokens).toBe(1024);
+    }
+
+    // execute() path: RunResult has camelCase cache fields.
+    const result = await adapter.execute(createRunRequest());
+    expect(result.usage.cacheReadTokens).toBe(2048);
+    expect(result.usage.cacheWriteTokens).toBe(1024);
+  });
+
+  // VT-10 — when no cache activity, fields are absent from both shapes.
+  it("VT-10: run_complete omits cache fields when provider reports no cache activity", async () => {
+    router.registerProvider("mock", createMockProvider('{"result": "no cache"}'));
+    const adapter = new LocalAdapter(router, tools, state);
+    const events = await collectEvents(adapter.executeStream(createRunRequest()));
+
+    const complete = events.find((e) => e.type === "run_complete");
+    expect(complete).toBeDefined();
+    if (complete?.type === "run_complete") {
+      expect(complete.usage.cache_read_tokens).toBeUndefined();
+      expect(complete.usage.cache_write_tokens).toBeUndefined();
+    }
+
+    const result = await adapter.execute(createRunRequest());
+    expect(result.usage.cacheReadTokens).toBeUndefined();
+    expect(result.usage.cacheWriteTokens).toBeUndefined();
+  });
+
+  // VT-10 — agentContext is built from agent name + version + environmentId
+  // and threaded into the router. Verifies the plumbing from RunRequest
+  // through to LLMProvider.call() receives a properly-derived cacheKey.
+  it("VT-10: adapter passes agentContext to router → provider receives cacheKey", async () => {
+    const provider: LLMProvider = {
+      name: "mock",
+      call: vi.fn().mockResolvedValue({
+        content: '{"result": "ok"}',
+        usage: { promptTokens: 10, completionTokens: 5 },
+      }),
+    };
+    router.registerProvider("mock", provider);
+    const adapter = new LocalAdapter(router, tools, state);
+    await adapter.execute(createRunRequest({ agent_version: "1.2.3", environmentId: "prod-us" }));
+
+    const callArgs = (provider.call as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    // cacheKey is hashed → 64-char hex digest of `${name}@${version}+${envId}`.
+    expect(callArgs.cacheKey).toBeDefined();
+    expect(callArgs.cacheKey).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("yields run_error on LLM failure", async () => {

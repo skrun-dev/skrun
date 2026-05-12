@@ -1,5 +1,7 @@
 name: dev/slide-deck-generator
-version: 0.1.0
+version: 0.2.0
+# v0.2.0: deps now auto-resolved by Skrun runtime via requirements.txt (#57).
+# v0.1.0 required a manual `pip install -r requirements.txt` before first use.
 
 model:
   provider: google

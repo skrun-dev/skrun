@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SkrunClient } from "./client.js";
-import { SkrunApiError } from "./errors.js";
+import { SkrunApiError, SkrunFileUploadError } from "./errors.js";
 
 const BASE_URL = "http://localhost:4000";
 const TOKEN = "test-token";
@@ -34,6 +34,155 @@ describe("SkrunClient", () => {
 
   it("accepts valid baseUrl", () => {
     expect(() => new SkrunClient({ baseUrl: BASE_URL, token: TOKEN })).not.toThrow();
+  });
+
+  // --- Binary input upload (Tasks 7.1+7.2+7.3) ---
+
+  it("VT-24: run() with Blob input auto-uploads via /api/files and substitutes file_id", async () => {
+    const fetchMock = vi.fn();
+    // First call: POST /api/files → returns {file_id, ...}
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          file_id: "fil_uploaded_xyz",
+          size: 4,
+          media_type: "image/jpeg",
+          purpose: "input",
+          expires_at: new Date(Date.now() + 86_400_000).toISOString(),
+        }),
+        { status: 201 },
+      ),
+    );
+    // Second call: POST /run → returns the run result
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ run_id: "run_1", status: "completed", output: {} }), {
+        status: 200,
+      }),
+    );
+    globalThis.fetch = fetchMock;
+
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+    const blob = new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: "image/jpeg" });
+    await client.run("dev/agent", { photo: blob, question: "what?" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // First call hits /api/files
+    const firstCall = fetchMock.mock.calls[0];
+    expect(firstCall[0]).toBe(`${BASE_URL}/api/files`);
+    expect((firstCall[1] as RequestInit).method).toBe("POST");
+
+    // Second call hits /run with file_id substitution
+    const secondCall = fetchMock.mock.calls[1];
+    expect(secondCall[0]).toBe(`${BASE_URL}/api/agents/dev/agent/run`);
+    const sentBody = JSON.parse((secondCall[1] as RequestInit).body as string);
+    expect(sentBody.input).toEqual({
+      photo: { type: "file", source: "id", file_id: "fil_uploaded_xyz" },
+      question: "what?",
+    });
+  });
+
+  it("RT-8: text-only input does not call /api/files", async () => {
+    const fetchMock = mockFetchJson({ run_id: "r", status: "completed", output: {} });
+    globalThis.fetch = fetchMock;
+
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+    await client.run("dev/agent", { question: "hello" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toBe(`${BASE_URL}/api/agents/dev/agent/run`);
+  });
+
+  it("auto-uploads array of Blobs and substitutes each with file_id ref", async () => {
+    const fetchMock = vi.fn();
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          file_id: "fil_a",
+          size: 1,
+          media_type: "image/jpeg",
+          purpose: "input",
+          expires_at: "2026-04-30T00:00:00Z",
+        }),
+        { status: 201 },
+      ),
+    );
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          file_id: "fil_b",
+          size: 1,
+          media_type: "image/jpeg",
+          purpose: "input",
+          expires_at: "2026-04-30T00:00:00Z",
+        }),
+        { status: 201 },
+      ),
+    );
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ run_id: "r", status: "completed", output: {} }), {
+        status: 200,
+      }),
+    );
+    globalThis.fetch = fetchMock;
+
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+    await client.run("dev/agent", {
+      receipts: [
+        new Blob([new Uint8Array([1])], { type: "image/jpeg" }),
+        new Blob([new Uint8Array([2])], { type: "image/jpeg" }),
+      ],
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const runBody = JSON.parse((fetchMock.mock.calls[2][1] as RequestInit).body as string);
+    expect(runBody.input.receipts).toEqual([
+      { type: "file", source: "id", file_id: "fil_a" },
+      { type: "file", source: "id", file_id: "fil_b" },
+    ]);
+  });
+
+  it("throws SkrunFileUploadError when /api/files returns an error", async () => {
+    globalThis.fetch = mockFetchError({ code: "FILE_TOO_LARGE", message: "too big" }, 413);
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+    const blob = new Blob([new Uint8Array(10)], { type: "image/jpeg" });
+    await expect(client.run("dev/agent", { photo: blob })).rejects.toBeInstanceOf(
+      SkrunFileUploadError,
+    );
+  });
+
+  it("supports Uint8Array input (Node-friendly path)", async () => {
+    const fetchMock = vi.fn();
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          file_id: "fil_buf",
+          size: 4,
+          media_type: "application/octet-stream",
+          purpose: "input",
+          expires_at: "2026-04-30T00:00:00Z",
+        }),
+        { status: 201 },
+      ),
+    );
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ run_id: "r", status: "completed", output: {} }), {
+        status: 200,
+      }),
+    );
+    globalThis.fetch = fetchMock;
+
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+    const bytes = new Uint8Array([0x25, 0x50, 0x44, 0x46]); // %PDF
+    await client.run("dev/agent", { document: bytes });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const runBody = JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string);
+    expect(runBody.input.document).toEqual({
+      type: "file",
+      source: "id",
+      file_id: "fil_buf",
+    });
   });
 
   // --- run() ---
@@ -361,5 +510,63 @@ describe("SkrunClient", () => {
     const { resolve } = await import("node:path");
     const pkg = JSON.parse(readFileSync(resolve(import.meta.dirname, "../package.json"), "utf-8"));
     expect(pkg.dependencies).toBeUndefined();
+  });
+
+  // --- Prompt-caching fields (#68) ---
+
+  it("SdkRunResult.usage exposes optional cache_read_tokens + cache_write_tokens", async () => {
+    // Server returns the wire-format cache fields → SDK passes them through.
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "Content-Type": "application/json" }),
+      json: async () => ({
+        run_id: "r",
+        status: "completed",
+        agent_version: "1.0.0",
+        output: {},
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 50,
+          total_tokens: 150,
+          cache_read_tokens: 2048,
+          cache_write_tokens: 1024,
+        },
+        cost: { estimated: 0.01 },
+        duration_ms: 500,
+      }),
+    });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+    const result = await client.run("dev/agent", {});
+
+    // Cache fields surfaced through the SDK return type unchanged.
+    expect(result.usage.cache_read_tokens).toBe(2048);
+    expect(result.usage.cache_write_tokens).toBe(1024);
+    // Pre-#68 fields preserved.
+    expect(result.usage.prompt_tokens).toBe(100);
+    expect(result.usage.completion_tokens).toBe(50);
+    expect(result.usage.total_tokens).toBe(150);
+  });
+
+  it("SdkRunResult.usage omits cache fields when server doesn't return them (back-compat)", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "Content-Type": "application/json" }),
+      json: async () => ({
+        run_id: "r",
+        status: "completed",
+        agent_version: "1.0.0",
+        output: {},
+        usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+        cost: { estimated: 0.01 },
+        duration_ms: 500,
+      }),
+    });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+    const result = await client.run("dev/agent", {});
+
+    expect(result.usage.cache_read_tokens).toBeUndefined();
+    expect(result.usage.cache_write_tokens).toBeUndefined();
   });
 });

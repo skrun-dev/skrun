@@ -79,7 +79,7 @@ export function RunsPage() {
         <div className="flex items-center gap-2 h-8 w-[240px] px-2.5 rounded-md border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 focus-within:border-sky-400 focus-within:ring-2 focus-within:ring-sky-500/15 transition">
           <IconSearch className="w-[13px] h-[13px] text-gray-400" />
           <input
-            className="flex-1 bg-transparent outline-none text-[12.5px] text-gray-800 dark:text-gray-200 placeholder:text-gray-400"
+            className="flex-1 bg-transparent outline-hidden text-[12.5px] text-gray-800 dark:text-gray-200 placeholder:text-gray-400"
             placeholder="Filter by agent, ID, model..."
             value={searchFilter}
             onChange={(e) => {
@@ -143,7 +143,7 @@ export function RunsPage() {
           <div className="divide-y divide-gray-100 dark:divide-gray-900">
             {Array.from({ length: 8 }).map((_, i) => (
               <div key={`skel-${i}`} className="px-4 py-3.5">
-                <div className="h-4 w-3/4 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
+                <div className="h-4 w-3/4 bg-gray-100 dark:bg-gray-800 rounded-sm animate-pulse" />
               </div>
             ))}
           </div>

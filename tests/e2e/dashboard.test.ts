@@ -62,7 +62,6 @@ describe("E2E: Dashboard API", () => {
   it("GET /api/agents/scan returns configured:false when env not set", async () => {
     const { app } = createTestApp();
     const originalEnv = process.env.SKRUN_AGENTS_DIR;
-    // biome-ignore lint/performance/noDelete: Node.js requires delete to truly unset env vars
     delete process.env.SKRUN_AGENTS_DIR;
 
     const res = await app.request("/api/agents/scan", { headers: devAuth });
@@ -124,14 +123,14 @@ describe("E2E: Dashboard API", () => {
     // Create runs for this agent
     const run1 = await db.createRun({
       id: "cnt-run-1",
-      agent_id: agent!.id,
+      agent_id: agent?.id,
       agent_version: "dev/counted-agent@1.0.0",
       status: "completed",
     });
     await db.updateRun(run1.id, { usage_total_tokens: 500 });
     const run2 = await db.createRun({
       id: "cnt-run-2",
-      agent_id: agent!.id,
+      agent_id: agent?.id,
       agent_version: "dev/counted-agent@1.0.0",
       status: "completed",
     });
@@ -157,7 +156,7 @@ describe("E2E: Dashboard API", () => {
     for (let i = 0; i < 3; i++) {
       const run = await db.createRun({
         id: `sa-run-${i}`,
-        agent_id: agent!.id,
+        agent_id: agent?.id,
         agent_version: "dev/stats-agent@1.0.0",
         status: "completed",
       });
@@ -165,7 +164,7 @@ describe("E2E: Dashboard API", () => {
     }
     const failedRun = await db.createRun({
       id: "sa-run-fail",
-      agent_id: agent!.id,
+      agent_id: agent?.id,
       agent_version: "dev/stats-agent@1.0.0",
       status: "failed",
     });

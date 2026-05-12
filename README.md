@@ -65,14 +65,14 @@ You shipped an AI capability. It works on your machine. But every user, every cu
 - ✅ Compatible with the [Agent Skills open standard](https://agentskills.io) (`SKILL.md`) and [AGENTS.md](https://agents.md) (Linux Foundation). Your existing skill works.
 - ✅ Users bring their own LLM keys. You're never on the hook for their costs.
 - ✅ Self-host on your infrastructure (Node 20+, SQLite or Postgres). [Self-hosting guide](docs/self-hosting.md). Cloud (coming soon).
-- ✅ MIT. Multi-model: Claude, GPT, Gemini, Mistral, Groq, Ollama.
+- ✅ MIT. Multi-model: Claude, GPT, Gemini, Mistral, Groq, Grok, Ollama.
 - ✅ Wrap existing scripts gradually. No big-bang rewrite required.
 
 ### Skrun vs vendor runtimes
 
 | | Skrun | CMA / GEAP / Vendor runtimes |
 |--|-------|-----------------|
-| **Models** | Claude, GPT, Gemini, Mistral, Groq + any OpenAI-compatible endpoint (DeepSeek, Kimi, Qwen, Ollama, vLLM…) | One provider only |
+| **Models** | Claude, GPT, Gemini, Mistral, Groq, Grok + any OpenAI-compatible endpoint (DeepSeek, Kimi, Qwen, Ollama, vLLM…) | One provider only |
 | **Deployment** | Self-hosted (Node + SQLite/Postgres) or our cloud (coming soon) | Vendor cloud only |
 | **Format** | `SKILL.md` ([agentskills.io](https://agentskills.io), 40+ platforms), `AGENTS.md` ([Linux Foundation](https://agents.md)), or your own | Proprietary |
 | **Streaming** | SSE + async webhooks | Varies |
@@ -110,7 +110,7 @@ Each new client means 2-3 weeks of build. You glue Express + Anthropic SDK + Ver
 
 What skill would you turn into an API tomorrow? What's missing in your current agent setup?
 
-**[Tell us in Discussions](https://github.com/skrun-dev/skrun/discussions)** — we read every post, and it shapes the roadmap.
+**[Tell us in Discussions](https://github.com/skrun-dev/skrun/discussions)** — we read every post, and it shapes what we build next.
 
 ---
 
@@ -200,7 +200,7 @@ await client.push("dev/code-review", bundle, "1.3.0", { message: "Added retry lo
 
 | Feature | Description |
 |---------|-------------|
-| 🤖 **Multi-model** | 5 built-in providers + any OpenAI-compatible endpoint (DeepSeek, Kimi, Qwen, Ollama, vLLM…) — with automatic fallback |
+| 🤖 **Multi-model** | 6 built-in providers (Anthropic, OpenAI, Google, Mistral, Groq, xAI) + any OpenAI-compatible endpoint (DeepSeek, Kimi, Qwen, Ollama, vLLM…) — with automatic fallback |
 | 🔧 **Tool calling** | Local scripts (`scripts/`) + MCP servers (`npx`) — same ecosystem as Claude Desktop |
 | 💾 **Stateful** | Agents remember across runs via key-value state |
 | 📡 **Streaming** | SSE real-time events (`run_start` → `tool_call` → `run_complete`) + async webhooks |
@@ -213,7 +213,11 @@ await client.push("dev/code-review", bundle, "1.3.0", { message: "Added retry lo
 | ✅ **Agent verification** | Verified flag controls script execution — safe for third-party agents |
 | 📌 **Version pinning + notes** | Pin a specific agent version per call (`version: "1.2.0"`) or attach a note at push (`-m "..."`) — reproducible integrations, visible changelog |
 | 🌍 **Environment separation** | Agent behavior (model, tools) separated from runtime environment (networking, timeout, sandbox). Per-run overrides via POST /run body |
-| 📁 **Files API** | Agents produce files (PDF, images, data) — callers download via `GET /api/runs/:run_id/files/:filename` |
+| 📁 **Files API** | Unified `/api/files` namespace for both directions — upload binary inputs (image/PDF/audio) via `POST /api/files`, download agent-produced artifacts via `GET /api/files/:id/content` |
+| 🖼️ **Multimodal inputs** | Declare `type: file` inputs (image / PDF / audio) in `agent.yaml`. Agents read images directly via vision (no OCR upstream). 3 transports: file_id ref, base64 inline, URL. Capability check at `skrun deploy/push` refuses incompatible model+media. |
+| 📦 **Script dependencies** | Drop a standard `package.json` (Node) or `requirements.txt` / `pyproject.toml` (Python) at the bundle root. Skrun resolves deps on first run, caches at `~/.skrun/deps/<hash>/` for instant subsequent runs. Auto-detects pnpm/yarn/npm + uv/poetry lockfiles for reproducible installs. |
+| 🎯 **Tool choice** | Force the LLM to invoke a specific tool (top-level `tool_choice: <name>`), require any tool (`tool_choice: required`), block tool use (`none`), or mark per-tool invariants with `required: true`. Native cross-provider support (Anthropic / Gemini / OpenAI / xAI) with graceful soft-fallback when a directive isn't natively supported. |
+| 💸 **Native prompt caching** | Automatic across 5 providers (Anthropic / OpenAI / Gemini / xAI / Groq) — 30-90% input cost savings on repeated content (system prompts + tools + reference documents). Anthropic gets explicit `cache_control` injection on the system + tools prefixes; OpenAI / xAI / Groq / Gemini benefit from implicit caching. Cost-tracking accuracy improves to ±5% of provider invoice via the new `cache_read_tokens` / `cache_write_tokens` fields in `usage`. Track dollar savings live (`cost.saved`) and on the dashboard. |
 | 📊 **Structured logs** | JSON to stdout via pino — pipe to Axiom, Datadog, ELK. `LOG_LEVEL` env var controls verbosity |
 
 ---
@@ -242,7 +246,7 @@ Eight runnable demos under [`agents/`](./agents/) — each produces a real, down
 |-------|--------------|----------|
 | 📊 [csv-to-executive-report](agents/csv-to-executive-report/) | CSV → analyzed multi-page PDF with charts + narrative + summary table | `report.pdf` |
 | 🎤 [slide-deck-generator](agents/slide-deck-generator/) | Markdown outline → polished `.pptx` with brand color, title/content/closing layouts, speaker notes | `deck.pptx` |
-| 🧾 [receipts-to-expenses](agents/receipts-to-expenses/) | Folder of receipt text files + optional bank statement → categorized expense workbook + summary PDF | `expenses.xlsx` + `monthly.pdf` |
+| 🧾 [receipts-to-expenses](agents/receipts-to-expenses/) | Receipt photos (vision-native) + optional bank statement → categorized expense workbook + summary PDF | `expenses.xlsx` + `monthly.pdf` |
 
 ### Universal
 
@@ -284,7 +288,7 @@ curl http://localhost:4000/api/runs/<run_id>/files/CHANGELOG.md \
 ```
 
 > **Windows (PowerShell):** use `curl.exe` instead of `curl`, and pass `-d "@input.json"` for the body.
-> **Python demos** (slide-deck-generator, csv-to-executive-report, receipts-to-expenses): run `pip install -r requirements.txt` once in the agent's directory before pushing.
+> **Python demos** (slide-deck-generator, csv-to-executive-report, receipts-to-expenses) and the **Node demo** (knowledge-base-from-vault): no manual install. Skrun's runtime auto-resolves each agent's `requirements.txt` / `package.json` on first call and caches at `~/.skrun/deps/<hash>/`. See the [Script dependencies](docs/agent-yaml.md#script-dependencies) reference.
 
 </details>
 

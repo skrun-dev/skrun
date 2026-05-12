@@ -5,7 +5,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { generateApiKey } from "../../packages/api/src/auth/api-key.js";
 import { clearSessions, createSession } from "../../packages/api/src/auth/session.js";
-import { DEV_TOKEN, createTestApp, pushAgent } from "./setup.js";
+import { createTestApp, DEV_TOKEN, pushAgent } from "./setup.js";
 
 describe("E2E: Auth", () => {
   let app: ReturnType<typeof createTestApp>["app"];
