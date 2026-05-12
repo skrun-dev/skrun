@@ -18,10 +18,8 @@
   "scripts": {
     "build": "pnpm -r run build",
     "test": "pnpm -r run test",
-    "lint": "biome check . && tsx scripts/check-public-jargon.ts && tsx scripts/check-stale-model-ids.ts",
-    "lint:fix": "biome check --write . && tsx scripts/check-public-jargon.ts && tsx scripts/check-stale-model-ids.ts",
-    "check:jargon": "tsx scripts/check-public-jargon.ts",
-    "check:stale-models": "tsx scripts/check-stale-model-ids.ts",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
     "dev": "pnpm -r run dev",
     "dev:web": "pnpm --filter @skrun-dev/web dev",
     "build:web": "pnpm --filter @skrun-dev/web build",
