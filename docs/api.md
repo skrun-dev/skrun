@@ -6,6 +6,20 @@ Base URL: `http://localhost:4000` (local dev) or your deployed instance.
 > **OpenAPI schema**: `GET /openapi.json` — import into Postman, Insomnia, or use for SDK generation.
 > **Prefer the SDK?** Use `@skrun-dev/sdk` for a typed client instead of raw HTTP calls: `npm install @skrun-dev/sdk`
 
+## Breaking changes in v0.8.0
+
+v0.8.0 tightened five surfaces that previously had insecure defaults or missing checks. **Self-host operators upgrading from v0.7.x must update their environment + workflows accordingly.** All changes are documented in detail at the referenced sections below.
+
+| # | Change | Action required | Section |
+|---|---|---|---|
+| 1 | `WEBHOOK_SIGNING_KEY` env required for webhook delivery | Generate via `openssl rand -hex 32` and set in env | [Run an agent — async webhook mode](#run-an-agent) |
+| 2 | `CORS_ORIGIN` env required in production | Set to your dashboard / client origin | (API boot — fails fast at startup without it) |
+| 3 | Verification is now **per version** + admin-only. Legacy `PATCH /api/agents/:ns/:name/verify` is **removed**. Use the new `PATCH /api/agents/:ns/:name/versions/:version/verify`. `POST /run` returns `403 AGENT_NOT_VERIFIED` for unverified versions. | Promote first admin via SQL: `UPDATE users SET role='admin' WHERE username='you'`, then verify each pushed version | [Verify a version](#verify-a-version-admin-only) |
+| 4 | File-content endpoints require authentication + ownership | Send `Authorization` header on `GET /api/files/:id`, `GET /api/files/:id/content`, `GET /api/runs/:run_id/files/:filename` | [GET /api/files/:id](#get-apifilesid--file-metadata) |
+| 5 | All pre-existing `verified=true` agents reset to `verified=false` (migration 007) + agent-level `verified` column dropped (migration 009 — moved to `agent_versions.verified`) | Re-verify each version of trusted agents after upgrade (admin only) | (one-time migrations 007 + 009) |
+
+See `CHANGELOG.md` for the full per-change detail.
+
 ## Authentication
 
 Skrun has three authentication modes. The mode is **auto-detected** based on whether GitHub OAuth env vars are configured.
@@ -87,11 +101,11 @@ When moving from local dev to a self-hosted or cloud instance:
 | | Local dev | Production |
 |--|-----------|------------|
 | Auth | `Bearer dev-token` | `Bearer sk_live_...` (API key) or session cookie |
-| Namespace | `dev` | Your GitHub username (e.g., `alice`) |
-| Agent names | `dev/my-agent` | `alice/my-agent` |
-| `agent.yaml` name | `name: dev/my-agent` | `name: alice/my-agent` |
+| Namespace (assigned by registry) | `dev` | Your GitHub username (e.g., `alice`) |
+| Registry URL form | `dev/my-agent` | `alice/my-agent` |
+| `agent.yaml` `name` | `my-agent` | `my-agent` |
 
-Update the `name` field in your `agent.yaml` to match your production namespace, then `skrun build && skrun push`.
+The `agent.yaml` is identical across environments — the slug-only `name` field travels with the bundle, and the registry assigns the namespace at push time based on your auth context. You don't edit `agent.yaml` when switching from `dev-token` to OAuth; just `skrun build && skrun push` and the right namespace is used.
 
 ### Namespaces
 
@@ -229,7 +243,7 @@ Execute an agent and return the result. Supports three modes:
 | `usage.total_tokens` | number | Sum of `prompt_tokens + completion_tokens` (excludes cached portion — preserves the legacy pre-caching semantic) |
 | `usage.cache_read_tokens` | number? | Optional. Tokens served from the provider's prompt cache. Billed at the cached-read rate (typically 0.10× input on Anthropic / GPT-5.x / Gemini 2.5+, 0.5× on Groq gpt-oss / OpenAI gpt-4o legacy). Only present when the provider returned cache activity. |
 | `usage.cache_write_tokens` | number? | Optional. Tokens written to the provider's prompt cache. Anthropic only — other providers do not expose a separate cache write surcharge. Billed at the cached-write rate (1.25× input at 5min TTL). |
-| `warnings` | string[] | Warnings (only present if non-empty). E.g., `["agent_not_verified_scripts_disabled"]` |
+| `warnings` | string[] | Warnings (only present if non-empty). Reserved for future advisory signals — no specific code is currently emitted. |
 | `cost.estimated` | number | Estimated cost in USD. Applies the per-model cached-read rate to `cache_read_tokens` and cached-write rate to `cache_write_tokens` so the value matches what the provider invoice will show within ±5%. |
 | `cost.saved` | number? | Optional. Dollar savings (USD) produced by prompt-caching on this run, computed as `cache_read_tokens × (full_input_rate - cached_rate) / 1_000_000`. Surfaced only when > 0 (omitted when no cache activity, model has no caching, or savings round to 0). Aligned with NUMERIC(10,6) DB precision (6 decimals). Same value persisted in the `runs.usage_cache_savings_usd` column. |
 | `duration_ms` | number | Total execution time in milliseconds |
@@ -240,7 +254,18 @@ Execute an agent and return the result. Supports three modes:
 | Status | Code | When |
 |--------|------|------|
 | `400` | `INVALID_VERSION_FORMAT` | `version` is not strict semver (e.g. `"1.0"`, `"^1.0.0"`, `"latest"`, `""`) |
+| `403` | `AGENT_NOT_VERIFIED` | The resolved version (pinned or latest) is not verified by an admin. Returned before any LLM call, MCP connection, file allocation, or DB write happens. The message includes the resolved version so the caller can either pin a verified version or ask an admin to verify the current one. Catch typed via `SkrunNotVerifiedError` in the SDK. |
 | `404` | `VERSION_NOT_FOUND` | Pinned version does not exist. Response body includes `available: string[]` — up to 10 most recent versions (newest first) for quick recovery |
+
+Example 403:
+```json
+{
+  "error": {
+    "code": "AGENT_NOT_VERIFIED",
+    "message": "Agent acme/seo-audit version 1.2.0 must be verified by an admin before it can run."
+  }
+}
+```
 
 Example 404:
 ```json
@@ -275,12 +300,18 @@ curl -N -X POST http://localhost:4000/api/agents/dev/my-agent/run \
 |-------|-------------|-------------|
 | `run_start` | Agent execution started | `run_id`, `agent`, `agent_version`, `timestamp` |
 | `tool_call` | Agent is calling a tool | `run_id`, `tool`, `args`, `timestamp` |
+| `tool_call_error` | A tool returned an error result (informational — see note below) | `run_id`, `tool`, `message`, `code?`, `timestamp` |
 | `tool_result` | Tool returned a result | `run_id`, `tool`, `result`, `is_error`, `timestamp` |
 | `llm_complete` | LLM finished generating | `run_id`, `provider`, `model`, `tokens`, `timestamp` |
+| `output_validation_warning` | Final output failed schema validation — repair retry follows (see note below) | `run_id`, `errors`, `timestamp` |
 | `run_complete` | Execution finished successfully | `run_id`, `output`, `usage`, `cost`, `duration_ms`, `timestamp` |
 | `run_error` | Execution failed | `run_id`, `error.code`, `error.message`, `timestamp` |
 
 Events follow the W3C SSE spec (`event: <type>\ndata: <json>\n\n`). The stream closes after `run_complete` or `run_error`.
+
+**About `tool_call_error`** (added in v0.8.0): emitted **before** the matching `tool_result` whenever a tool returns `is_error: true`. It is **informational only** — the `tool_result` content still flows back to the LLM, which decides how to react (retry, fallback, graceful failure). Skrun does NOT abort the run on tool failure by default, aligning with the industry permissive contract (AWS Bedrock AgentCore, Claude Managed Agents, Google Vertex Agent Builder all behave the same way). Operators get failure visibility (e.g. red event in the dashboard timeline) without losing the LLM's recovery capability.
+
+**About `output_validation_warning` and `OUTPUT_SCHEMA_INVALID`** (added in v0.8.0): emitted when the LLM's final JSON output fails validation against the agent's declared `outputs` schema (declared top-level fields missing or of the wrong type). Skrun then issues a single isolated repair call to the LLM, asking it to re-emit a compliant output. The retry's token usage is summed into the final `usage` regardless of outcome. If the repair succeeds, the run terminates normally via `run_complete` with the corrected output. If the repair still fails (schema mismatch or non-JSON response), the run terminates via `run_error` with `error.code: OUTPUT_SCHEMA_INVALID` — same terminus pattern as `TIMEOUT`/`EXECUTION_FAILED`, no `run_complete` is emitted.
 
 Validation errors (401, 400, etc.) return normal JSON responses, not SSE streams.
 
@@ -316,11 +347,24 @@ The server executes the agent in the background and POSTs the full result to `we
 - Header `X-Skrun-Signature`: `sha256=<hmac>` — HMAC-SHA256 of the body using the server's signing key
 - Retries: up to 3 times with exponential backoff (1s, 4s, 16s) on non-2xx responses
 
+**Server requirement: `WEBHOOK_SIGNING_KEY`** (added in v0.8.0)
+
+The server signs every delivery with `WEBHOOK_SIGNING_KEY`. If the env var is unset, the runtime **refuses to deliver** the webhook (no insecure default). Generate one and set it before enabling webhook mode:
+
+```bash
+# Generate a 32-byte random hex key
+echo "WEBHOOK_SIGNING_KEY=$(openssl rand -hex 32)" >> .env
+```
+
+The receiver verifies the signature by computing `HMAC-SHA256(body, WEBHOOK_SIGNING_KEY)` and comparing to the `sha256=...` portion of the `X-Skrun-Signature` header.
+
 **Requirements**
 
 - `webhook_url` must be a valid URL
 - `webhook_url` must use HTTPS in production (HTTP allowed in dev mode)
+- `webhook_url` hostname must NOT resolve to a private/reserved address in production (blocks AWS IMDS, localhost services, link-local, IPv4-mapped IPv6); dev mode allows `http://localhost:NNNN/...` for local testing
 - Cannot be combined with `Accept: text/event-stream`
+- Server requires `WEBHOOK_SIGNING_KEY` env var (see above)
 
 ---
 
@@ -427,10 +471,16 @@ Download an agent bundle. Without `:version`, returns the latest version.
 |--------|----------|-------------|
 | `Authorization` | Yes | `Bearer <token>` |
 
-**Response**: binary `.agent` bundle with headers:
+**Multi-tenancy**: a caller without access to the agent (non-owner non-admin) receives a `404 NOT_FOUND` indistinguishable from "agent does not exist" — the response body and headers are identical to a genuine not-found. No bundle bytes leak, no `Content-Disposition` header on the 404. Admins (and dev-token in self-host) bypass this filter.
+
+**Response** `200`: binary `.agent` bundle with headers:
 - `Content-Type: application/octet-stream`
 - `Content-Disposition: attachment; filename="name-version.agent"`
 - `X-Agent-Version: 1.0.0`
+
+**Response** `401`: anonymous caller. Body `{ "error": { "code": "UNAUTHORIZED", ... } }`.
+
+**Response** `404`: agent does not exist OR caller is not the owner / admin (opaque).
 
 ---
 
@@ -440,7 +490,13 @@ Download an agent bundle. Without `:version`, returns the latest version.
 GET /api/agents?page=1&limit=20
 ```
 
-List all agents in the registry. Public, no auth required.
+List agents. **Authentication required.** Returns the caller's own agents (filtered by `owner_id`) when `user.role === 'user'`; returns all agents instance-wide when `user.role === 'admin'`. In self-host with dev-token mode, the caller is auto-granted admin and sees all agents — same UX as before the multi-tenant filter shipped.
+
+**Headers**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Authorization` | Yes | `Bearer <token>` |
 
 **Query params**
 
@@ -460,6 +516,10 @@ List all agents in the registry. Public, no auth required.
 }
 ```
 
+The `total` field reflects the **filtered** count (not the global agent count). A user who owns no agents receives `{ "agents": [], "total": 0 }` — no error.
+
+**Response** `401`: anonymous caller.
+
 ---
 
 ### Agent metadata
@@ -468,7 +528,13 @@ List all agents in the registry. Public, no auth required.
 GET /api/agents/:namespace/:name
 ```
 
-Get metadata for a specific agent. Public, no auth required.
+Get metadata for a specific agent. **Authentication required.** Non-owner non-admin callers receive `404 NOT_FOUND` indistinguishable from agent-not-found — existence is hidden from non-privileged readers (GitHub Private Repo / Stripe / Linear pattern).
+
+**Headers**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Authorization` | Yes | `Bearer <token>` |
 
 **Response** `200`
 
@@ -476,22 +542,42 @@ Get metadata for a specific agent. Public, no auth required.
 {
   "name": "code-review",
   "namespace": "dev",
-  "verified": false,
+  "latest_version_verified": false,
   "latest_version": "1.0.0",
   "created_at": "2026-04-11T...",
   "updated_at": "2026-04-11T..."
 }
 ```
 
+`latest_version_verified` mirrors the `verified` flag of the most recently pushed version. It's the signal that drives the dashboard listing badge. Older versions may have a different state — fetch `GET /versions` (below) to see the per-version flag.
+
+**Response** `401`: anonymous caller.
+
+**Response** `404`: agent does not exist OR caller is not the owner / admin (opaque body — identical in both cases).
+
 ---
 
-### Verify an agent
+### Verify a version (admin only)
 
 ```
-PATCH /api/agents/:namespace/:name/verify
+PATCH /api/agents/:namespace/:name/versions/:version/verify
 ```
 
-Set or unset the `verified` flag on an agent. Only verified agents can execute scripts from `scripts/`. Operator action — requires authentication.
+Set or unset the `verified` flag on a **specific version** of an agent. Only verified versions can be invoked via `POST /run` — unverified runs return `403 AGENT_NOT_VERIFIED`.
+
+**Restricted to admin callers** (`user.role === 'admin'`). The previous self-served behaviour — any namespace owner could verify their own agents — was closed in v0.8.0; the trust signal was not meaningful when the agent author was the one minting it.
+
+**Per-version, not per-agent**: pushing a new version creates a row at `verified=false` without touching prior versions. A caller pinning `version: "1.0.0"` keeps running even after a newer v1.1.0 push (until the v1.0.0 row is explicitly unverified). This protects pinned production callers from author iteration.
+
+Promotion to admin is a manual SQL update — there is no HTTP endpoint for role elevation by design.
+
+```bash
+# Promote a user to admin on self-host
+sqlite3 skrun.db "UPDATE users SET role='admin' WHERE username='you'"
+
+# Or on Postgres
+psql $DATABASE_URL -c "UPDATE users SET role='admin' WHERE username='you';"
+```
 
 **Headers**
 
@@ -506,11 +592,25 @@ Set or unset the `verified` flag on an agent. Only verified agents can execute s
 { "verified": true }
 ```
 
-**Response** `200`: returns the updated agent metadata (same format as GET metadata, with `verified` updated).
+**Response** `200`: returns the updated version row.
 
-**Errors**: `401` if no auth, `404` if agent not found, `400` if body is invalid.
+```json
+{
+  "version": "1.0.0",
+  "size": 12345,
+  "pushed_at": "2026-04-11T...",
+  "notes": null,
+  "verified": true
+}
+```
 
-**Note**: in dev mode (`dev-token`), verification is bypassed — all agents can execute scripts without being verified. This ensures zero friction for local development.
+**Errors**: `401` if no auth, `403` if caller is not admin, `404` if agent or version not found, `400` if body is invalid.
+
+**Note**: in dev mode (`dev-token`, used when OAuth is not configured), the caller is granted admin role unconditionally so `PATCH .../verify` works without any extra setup — this preserves zero-friction local development.
+
+**Structured log**: every successful flip emits a pino `info` line (`event: "agent_version_verify"`) with the actor identity, target version, and action — see [Admin role](self-hosting.md#admin-role) in the self-hosting guide.
+
+**Legacy endpoint removed**: the agent-level `PATCH /api/agents/:ns/:name/verify` (v0.7.x) is gone — calls now return `404`. Migrate to the per-version path above.
 
 ---
 
@@ -582,7 +682,13 @@ Note: past runs referencing the deleted version remain readable. `runs.agent_ver
 GET /api/agents/:namespace/:name/versions
 ```
 
-List all published versions of an agent with full metadata. Public, no auth required.
+List all published versions of an agent with full metadata. **Authentication required.** Same multi-tenancy gate as the metadata endpoint — non-owner non-admin callers receive `404 NOT_FOUND` with no `versions` array leaked in the body.
+
+**Headers**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Authorization` | Yes | `Bearer <token>` |
 
 **Response** `200`
 
@@ -594,6 +700,7 @@ List all published versions of an agent with full metadata. Public, no auth requ
       "size": 4523,
       "pushed_at": "2026-04-20T10:00:00Z",
       "notes": "Initial release — Claude primary with GPT-4 fallback",
+      "verified": true,
       "config_snapshot": {
         "model": {
           "provider": "anthropic",
@@ -673,7 +780,13 @@ Returns aggregated metrics for the dashboard home page.
 GET /api/agents/:namespace/:name/stats?days=N
 ```
 
-Returns aggregated metrics for a specific agent over the requested period.
+Returns aggregated metrics for a specific agent over the requested period. **Authentication required.** Same multi-tenancy gate as the metadata + versions endpoints — non-owner non-admin callers receive `404 NOT_FOUND` indistinguishable from agent-not-found, with no `runs` / `tokens` / `cost` fields leaked.
+
+**Headers**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Authorization` | Yes | `Bearer <token>` |
 
 **Query params**
 
@@ -838,7 +951,9 @@ All errors follow the same format:
 | Code | HTTP | Description |
 |------|------|-------------|
 | `UNAUTHORIZED` | 401 | Missing or invalid Authorization header |
-| `FORBIDDEN` | 403 | No permission (wrong namespace) |
+| `FORBIDDEN` | 403 | No permission (wrong namespace or non-admin on an admin-gated route) |
+| `AGENT_NOT_VERIFIED` | 403 | The resolved version (pinned or latest) has `verified=false`. `POST /run` returns this before any execution. Catch typed via `SkrunNotVerifiedError` in the SDK. |
+| `VERSION_NOT_FOUND` | 404 | Pinned version does not exist. Response includes `available: string[]` for recovery. |
 | `INVALID_REQUEST` | 400 | Invalid JSON body |
 | `MISSING_INPUT` | 400 | Required input field missing |
 | `INVALID_INPUT_TYPE` | 400 | Input field has wrong type |
@@ -858,11 +973,7 @@ All errors follow the same format:
 
 ### Warning codes
 
-Warnings appear in the `warnings` array of POST /run responses (not errors — the run still executes).
-
-| Code | Description |
-|------|-------------|
-| `agent_not_verified_scripts_disabled` | Agent has `scripts/` but is not verified — scripts were skipped. Agent ran with LLM + MCP only. |
+Warnings appear in the `warnings` array of POST /run responses (not errors — the run still executes). The field is reserved for advisory signals; v0.8.0 emits none by default (the `agent_not_verified_scripts_disabled` soft warning of v0.7.x is gone — unverified runs now return `403 AGENT_NOT_VERIFIED` upstream).
 
 ### Response warning headers
 
@@ -1070,7 +1181,10 @@ Authorization: Bearer <token>
 
 ```
 GET /api/files/:id
+Authorization: Bearer <token>
 ```
+
+**Authentication is required.** The caller must be the file owner: the uploader for `purpose: input` files, or the run owner for `purpose: output` files. Cross-tenant reads return `403 FORBIDDEN`.
 
 **Response** `200`
 
@@ -1086,17 +1200,30 @@ GET /api/files/:id
 
 For `purpose: output` files (produced by an agent run, see [Output files](#output-files)), the response shape is the same minus `expires_at` (output retention follows `FILES_RETENTION_S`, not `INPUT_FILES_RETENTION_S`).
 
-`404 FILE_NOT_FOUND` if the `file_id` is unknown or its TTL has expired.
+| Status | Code | When |
+|--------|------|------|
+| `200` | — | File found |
+| `401` | — | Missing / invalid `Authorization` header |
+| `403` | `FORBIDDEN` | Caller is not the file owner |
+| `404` | `FILE_NOT_FOUND` | Unknown `file_id` or TTL expired |
 
 ### GET /api/files/:id/content — download binary
 
 ```
 GET /api/files/:id/content
+Authorization: Bearer <token>
 ```
+
+**Authentication is required** with the same ownership semantics as `GET /api/files/:id` above.
 
 Returns the raw bytes with the recorded `Content-Type`. Works for both input and output files (unified namespace).
 
-`404 FILE_NOT_FOUND` if unknown or expired.
+| Status | Code | When |
+|--------|------|------|
+| `200` | — | Binary content |
+| `401` | — | Missing / invalid `Authorization` header |
+| `403` | `FORBIDDEN` | Caller is not the file owner |
+| `404` | `FILE_NOT_FOUND` | Unknown `file_id` or TTL expired |
 
 ### DELETE /api/files/:id — delete an input file
 
@@ -1169,6 +1296,8 @@ Agents produce files by writing to the `$SKRUN_OUTPUT_DIR` directory during exec
 **Download — two equivalent paths**:
 - `GET /api/files/:id/content` — unified namespace (recommended). Same path for input + output.
 - `GET /api/runs/:run_id/files/:filename` — run-scoped (existing route, backward-compatible).
+
+Both paths now **require authentication** and refuse cross-tenant reads with `403 FORBIDDEN`. The run-scoped path additionally returns `403` if the caller is not the run owner.
 
 **`DELETE /api/files/:id` on a `purpose: output` file** returns `403 DELETE_OUTPUT_FORBIDDEN` — output files are owned by the run, not by the caller.
 

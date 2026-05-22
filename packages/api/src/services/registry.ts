@@ -1,14 +1,22 @@
 import { parseAgentYaml } from "@skrun-dev/schema";
 import { bundleCache } from "../cache/bundle-cache.js";
 import type { DbAdapter } from "../db/adapter.js";
+import type { Agent } from "../db/schema.js";
 import type { AgentMetadata, AgentVersionInfo } from "../types.js";
 import { extractFiles } from "../utils/bundle.js";
+
+/**
+ * Status is encoded as the typed union of HTTP codes the service emits.
+ * Callers can return `c.json(..., err.status)` without an `as` cast —
+ * Hono's StatusCode parameter accepts this union directly.
+ */
+export type RegistryErrorStatus = 400 | 403 | 404 | 409 | 500;
 
 export class RegistryError extends Error {
   constructor(
     public code: string,
     message: string,
-    public status: number,
+    public status: RegistryErrorStatus,
   ) {
     super(message);
     this.name = "RegistryError";
@@ -83,13 +91,21 @@ export class RegistryService {
     namespace: string,
     name: string,
     version?: string,
-  ): Promise<{ buffer: Buffer; version: string }> {
-    const agent = await this.db.getAgent(namespace, name);
+    opts?: { preloadedAgent?: Agent },
+  ): Promise<{ buffer: Buffer; version: string; verified: boolean }> {
+    // Route layer (#80 multi-tenant gate) may pass `preloadedAgent` to skip
+    // the redundant `db.getAgent` call after it has already done one for
+    // the ownership check. Keeps `service.pull` testable in isolation while
+    // letting the route layer enforce ownership BEFORE any storage fetch
+    // (constant-time semantics — genuine-404 and ownership-404 share the
+    // same code path on the route side).
+    const agent = opts?.preloadedAgent ?? (await this.db.getAgent(namespace, name));
     if (!agent) {
       throw new RegistryError("NOT_FOUND", `Agent ${namespace}/${name} not found`, 404);
     }
 
     let resolvedVersion: string;
+    let resolvedVerified: boolean;
     if (version) {
       const v = await this.db.getVersionByNumber(agent.id, version);
       if (!v) {
@@ -100,12 +116,14 @@ export class RegistryService {
         );
       }
       resolvedVersion = v.version;
+      resolvedVerified = v.verified;
     } else {
       const latest = await this.db.getLatestVersion(agent.id);
       if (!latest) {
         throw new RegistryError("NO_VERSIONS", `No versions found for ${namespace}/${name}`, 404);
       }
       resolvedVersion = latest.version;
+      resolvedVerified = latest.verified;
     }
 
     const bundleKey = `${namespace}/${name}/${resolvedVersion}.agent`;
@@ -114,11 +132,19 @@ export class RegistryService {
       throw new RegistryError("BUNDLE_NOT_FOUND", "Bundle file not found in storage", 500);
     }
 
-    return { buffer, version: resolvedVersion };
+    return { buffer, version: resolvedVersion, verified: resolvedVerified };
   }
 
-  async list(page: number, limit: number): Promise<{ agents: AgentMetadata[]; total: number }> {
-    const result = await this.db.listAgents(page, limit);
+  async list(
+    page: number,
+    limit: number,
+    userId?: string,
+  ): Promise<{ agents: AgentMetadata[]; total: number }> {
+    // `userId` is provided by the route layer when the caller is a
+    // non-admin OAuth/API-key user (narrows results to own agents); it's
+    // left undefined for admin callers (or dev-token mode → admin auto-
+    // grant) so they see all agents instance-wide.
+    const result = await this.db.listAgents({ page, limit, userId });
     const agents: AgentMetadata[] = [];
     for (const a of result.agents) {
       const versions = await this.db.getVersions(a.id);
@@ -127,7 +153,7 @@ export class RegistryService {
         name: a.name,
         namespace: a.namespace,
         description: a.description,
-        verified: a.verified,
+        latest_version_verified: latest?.verified ?? false,
         latest_version: latest?.version ?? "",
         versions: versions.map((v) => v.version),
         created_at: a.created_at,
@@ -155,6 +181,7 @@ export class RegistryService {
       pushed_at: v.pushed_at,
       config_snapshot: v.config_snapshot,
       notes: v.notes,
+      verified: v.verified,
     }));
   }
 
@@ -211,12 +238,32 @@ export class RegistryService {
     await this.db.deleteVersion(agent.id, version);
   }
 
-  async setVerified(namespace: string, name: string, verified: boolean): Promise<AgentMetadata> {
-    const agent = await this.db.setVerified(namespace, name, verified);
+  async setVersionVerified(
+    namespace: string,
+    name: string,
+    version: string,
+    verified: boolean,
+  ): Promise<AgentVersionInfo> {
+    const agent = await this.db.getAgent(namespace, name);
     if (!agent) {
       throw new RegistryError("NOT_FOUND", `Agent ${namespace}/${name} not found`, 404);
     }
-    return this.buildMetadata(namespace, name);
+    const updated = await this.db.setVersionVerified(namespace, name, version, verified);
+    if (!updated) {
+      throw new RegistryError(
+        "VERSION_NOT_FOUND",
+        `Version ${version} not found for ${namespace}/${name}`,
+        404,
+      );
+    }
+    return {
+      version: updated.version,
+      size: updated.size,
+      pushed_at: updated.pushed_at,
+      config_snapshot: updated.config_snapshot,
+      notes: updated.notes,
+      verified: updated.verified,
+    };
   }
 
   private async buildMetadata(namespace: string, name: string): Promise<AgentMetadata> {
@@ -226,17 +273,23 @@ export class RegistryService {
     }
     const versions = await this.db.getVersions(agent.id);
     const latest = await this.db.getLatestVersion(agent.id);
+    // Previously hardcoded run_count/token_count to 0 — the dashboard and
+    // CLI both surface these. Compute from listRuns aggregated by agent_id
+    // (matches the per-agent semantic already exposed via listAgents and
+    // getAgentStats — `limit: 0` returns the full run history for this agent).
+    const runs = await this.db.listRuns({ agent_id: agent.id });
+    const tokenTotal = runs.reduce((sum, r) => sum + (r.usage_total_tokens ?? 0), 0);
     return {
       name: agent.name,
       namespace: agent.namespace,
       description: agent.description,
-      verified: agent.verified,
+      latest_version_verified: latest?.verified ?? false,
       latest_version: latest?.version ?? "",
       versions: versions.map((v) => v.version),
       created_at: agent.created_at,
       updated_at: agent.updated_at,
-      run_count: 0,
-      token_count: 0,
+      run_count: runs.length,
+      token_count: tokenTotal,
     };
   }
 }

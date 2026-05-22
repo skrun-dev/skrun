@@ -1,0 +1,47 @@
+name: audit-fixture-tool-error
+version: 1.0.0
+
+# E2E test fixture for audit/002.
+# DELIBERATELY broken: the `always_fails` tool exits non-zero so the runtime
+# emits a `tool_call_error` event. Used by tests/e2e/live/14-output-validation.ts
+# to verify the event shape end-to-end against a real LLM. Not a demo. Not
+# meant to be discovered by users.
+
+model:
+  provider: google
+  name: gemini-2.5-flash
+
+tool_choice: always_fails
+
+tools:
+  - name: always_fails
+    description: Test fixture tool. Always exits with a non-zero status — Skrun will surface the failure as a tool_call_error event.
+    input_schema:
+      type: object
+      properties: {}
+      additionalProperties: false
+
+inputs:
+  - name: dummy
+    type: string
+    required: false
+    default: ""
+    description: Unused. Present because the runtime expects at least one input field.
+
+outputs:
+  - name: result
+    type: string
+    description: Free-form message from the LLM after the tool failed.
+
+environment:
+  networking:
+    allowed_hosts: []
+  filesystem: read-only
+  secrets: []
+  timeout: 60s
+  sandbox: strict
+
+state:
+  type: none
+
+context_mode: skill

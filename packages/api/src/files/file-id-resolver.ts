@@ -1,5 +1,5 @@
-import { existsSync, statSync } from "node:fs";
-import { extname, join } from "node:path";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { extname, join, sep } from "node:path";
 import { getInputFile } from "../cache/input-cache.js";
 import { getOutputFileById } from "../cache/output-cache.js";
 
@@ -60,12 +60,19 @@ export function resolveFileId(fileId: string): ResolvedFile | null {
   if (outputEntry) {
     const path = join(outputEntry.dir, outputEntry.filename);
     if (!existsSync(path)) return null;
-    const stat = statSync(path);
+    // Defense-in-depth: reject symlinks AND any resolved path that escapes
+    // the registered output dir (covers symlink chains the collector might
+    // miss if the file was registered out-of-band).
+    const lstat = lstatSync(path);
+    if (lstat.isSymbolicLink()) return null;
+    const realPath = realpathSync(path);
+    const realDir = realpathSync(outputEntry.dir);
+    if (realPath !== realDir && !realPath.startsWith(realDir + sep)) return null;
     return {
       source: "output",
       path,
       metadata: {
-        size: stat.size,
+        size: lstat.size,
         media_type: inferMediaType(outputEntry.filename),
         purpose: "output",
       },

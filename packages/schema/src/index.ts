@@ -10,8 +10,9 @@ export {
 export type { ValidationIssue } from "./errors.js";
 // Errors
 export { SkrunError, ValidationError } from "./errors.js";
-export type { AgentYamlPrompt, GeneratedAgentYaml } from "./generators/skill-importer.js";
 // Generators
+export { outputsToZod } from "./generators/outputs-to-zod.js";
+export type { AgentYamlPrompt, GeneratedAgentYaml } from "./generators/skill-importer.js";
 export { generateAgentYaml } from "./generators/skill-importer.js";
 export { serializeAgentYaml } from "./generators/yaml-serializer.js";
 export type {

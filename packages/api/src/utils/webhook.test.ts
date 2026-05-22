@@ -91,4 +91,47 @@ describe("deliverWebhook", () => {
 
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
+
+  // VT-11 (SEC-008): refuse delivery with no signing key configured
+  it("VT-11: throws when neither signingKey arg nor WEBHOOK_SIGNING_KEY env is set", async () => {
+    const previousEnv = process.env.WEBHOOK_SIGNING_KEY;
+    delete process.env.WEBHOOK_SIGNING_KEY;
+
+    const mockFetch = vi.fn();
+    globalThis.fetch = mockFetch;
+
+    try {
+      await expect(deliverWebhook("https://example.com/hook", { test: true })).rejects.toThrow(
+        /WEBHOOK_SIGNING_KEY is not configured/,
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    } finally {
+      if (previousEnv !== undefined) process.env.WEBHOOK_SIGNING_KEY = previousEnv;
+    }
+  });
+
+  // VT-11b: env-based key works (no arg passed)
+  it("VT-11b: uses WEBHOOK_SIGNING_KEY env when no signingKey arg is passed", async () => {
+    const previousEnv = process.env.WEBHOOK_SIGNING_KEY;
+    process.env.WEBHOOK_SIGNING_KEY = "env-key";
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    globalThis.fetch = mockFetch;
+
+    try {
+      await deliverWebhook("https://example.com/hook", { run_id: "abc" });
+      expect(mockFetch).toHaveBeenCalledOnce();
+      const [, opts] = mockFetch.mock.calls[0];
+      const expected = createHmac("sha256", "env-key")
+        .update(JSON.stringify({ run_id: "abc" }))
+        .digest("hex");
+      expect(opts.headers["X-Skrun-Signature"]).toBe(`sha256=${expected}`);
+    } finally {
+      if (previousEnv !== undefined) {
+        process.env.WEBHOOK_SIGNING_KEY = previousEnv;
+      } else {
+        delete process.env.WEBHOOK_SIGNING_KEY;
+      }
+    }
+  });
 });

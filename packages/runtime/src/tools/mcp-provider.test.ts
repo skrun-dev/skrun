@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { McpConnectError } from "../errors.js";
 import { McpToolProvider } from "./mcp-provider.js";
 
 const MOCK_SERVER = resolve(import.meta.dirname, "../../tests/fixtures/mock-mcp-server.js");
@@ -38,7 +39,12 @@ describe("McpToolProvider — stdio transport", () => {
     await provider.disconnect();
   });
 
-  it("should handle command not found gracefully", async () => {
+  it("throws McpConnectError when command is not found (no silent tools=[])", async () => {
+    // Previously this swallowed the spawn error and returned tools=[].
+    // The LLM then had no tools and could hallucinate plausible answers
+    // that passed output-validation repair retry — silent garbage.
+    // Now the failure surfaces as a typed error the route can convert to
+    // 502 MCP_CONNECT_FAILED.
     const provider = new McpToolProvider({
       name: "test-missing",
       transport: "stdio",
@@ -47,8 +53,7 @@ describe("McpToolProvider — stdio transport", () => {
       auth: "none",
     });
 
-    const tools = await provider.listTools();
-    expect(tools).toEqual([]);
+    await expect(provider.listTools()).rejects.toThrow(McpConnectError);
 
     await provider.disconnect();
   });
@@ -119,7 +124,10 @@ describe("McpToolProvider — stdio transport", () => {
     await provider.disconnect();
   });
 
-  it("blocks remote MCP connection when host not in allowedHosts (VT-11)", async () => {
+  it("throws McpConnectError when host not in allowedHosts (VT-11)", async () => {
+    // allowed_hosts mismatch is a misconfiguration — fail the run loudly
+    // rather than silently dropping tools (which led to hallucinated output
+    // pre-fix, see post-#83 investigation).
     const provider = new McpToolProvider(
       {
         name: "blocked-remote",
@@ -131,9 +139,7 @@ describe("McpToolProvider — stdio transport", () => {
       ["other.com"], // allowedHosts does NOT include mcp.blocked.com
     );
 
-    // listTools triggers connect — should fail gracefully (tools=[])
-    const tools = await provider.listTools();
-    expect(tools).toEqual([]);
+    await expect(provider.listTools()).rejects.toThrow(McpConnectError);
 
     await provider.disconnect();
   });
@@ -154,6 +160,47 @@ describe("McpToolProvider — stdio transport", () => {
 
     const tools = await provider.listTools();
     expect(tools.length).toBeGreaterThan(0);
+
+    await provider.disconnect();
+  });
+});
+
+describe("McpToolProvider — connect timeout", () => {
+  const HANGING_SERVER = resolve(import.meta.dirname, "../../tests/fixtures/hanging-mcp-server.js");
+
+  it("aborts connect with McpConnectError after the configured timeout when the MCP server never answers", async () => {
+    // Subprocess spawns instantly but never speaks the MCP protocol — the
+    // client.connect() handshake hangs forever waiting for `initialize`.
+    // A small timeout (500ms) proves the bound fires; the throw is what
+    // surfaces the failure to the route (502 MCP_CONNECT_FAILED).
+    const provider = new McpToolProvider(
+      {
+        name: "test-hanging",
+        transport: "stdio",
+        command: "node",
+        args: [HANGING_SERVER],
+        auth: "none",
+      },
+      undefined,
+      [],
+      500, // connectTimeoutMs override
+    );
+
+    const t0 = Date.now();
+    let caught: McpConnectError | null = null;
+    try {
+      await provider.listTools();
+    } catch (err) {
+      caught = err instanceof McpConnectError ? err : null;
+    }
+    const elapsed = Date.now() - t0;
+
+    expect(caught).toBeInstanceOf(McpConnectError);
+    expect(caught?.details.isTimeout).toBe(true);
+    expect(caught?.details.timeoutMs).toBe(500);
+    expect(caught?.details.server).toBe("test-hanging");
+    // The bound should fire close to 500ms; allow generous slack for CI.
+    expect(elapsed).toBeLessThan(5_000);
 
     await provider.disconnect();
   });

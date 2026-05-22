@@ -41,11 +41,18 @@ Bundles are immutable once pushed. Each [version](#version) is a distinct bundle
 
 ## Namespace
 
-A **Namespace** is the owner prefix on every agent name — it identifies who published it. Every agent is named `namespace/slug` (e.g., `acme/seo-audit`). In local dev with `dev-token`, the namespace is always `dev`. In production (self-hosted with GitHub OAuth, or the hosted cloud), the namespace is your GitHub username.
+A **Namespace** identifies who published an agent in the registry. It is the **owner scope**, not part of the agent's artefact identity. The full registry-qualified reference an agent is `<namespace>/<slug>` (e.g., `acme/seo-audit`), but the slug alone (`seo-audit`) is what the author writes in `agent.yaml`.
 
-Permissions are scoped by namespace. Only the namespace owner can push, verify, or delete an agent in their namespace. Running an agent is public (marketplace model) — anyone with a valid auth can call any public agent.
+**Two halves of the identity:**
 
-**Where you see it**: every agent name (`namespace/slug`), CLI namespace errors, API 403 on cross-namespace push attempts, the Agents page in the dashboard.
+- **Slug** — the artefact identifier, owned by the author. Declared in `agent.yaml`'s `name` field (slug only, no slash). The author picks it; it travels with the bundle. Same convention as `npm`'s package `name`, Docker image's `name`, or a Cargo crate's `name`.
+- **Namespace** — the registry scope, assigned at push time from your auth context. Never written in `agent.yaml`. In local dev with `dev-token` it is always `dev`. In OAuth mode (cloud or self-host) it's your GitHub username.
+
+This split keeps the bundle portable: the same `.agent` file pushed under two namespaces produces two distinct registry entries (`alice/seo-audit` and `bob/seo-audit`) without re-editing the yaml.
+
+**Permissions are scoped by namespace.** Only the namespace owner can push to their namespace. **Registry reads** (list, metadata, versions, pull, stats) are filtered to the caller's own namespace by default — non-owners see the same `404 NOT_FOUND` response whether the agent doesn't exist OR they simply don't have access (opacity by design; see [Multi-tenancy in self-hosting](./self-hosting.md#multi-tenancy)). **Invocation** (`POST /run`) is intentionally cross-namespace — anyone with a valid auth can call any verified agent (marketplace model). **Admin role** bypasses the read filter and is required to flip verification or delete cross-namespace. Verification is admin-only (orthogonal to namespace ownership) — see Verification below.
+
+**Where you see it**: registry URLs (`/api/agents/<namespace>/<slug>/run`), CLI display strings (`Pushed acme/seo-audit@1.0.0`), CLI namespace errors, API 403 on cross-namespace push attempts, the Agents page in the dashboard.
 
 ---
 
@@ -71,6 +78,12 @@ Runs are persisted in the database — they don't disappear after the HTTP respo
 
 **Where you see it**: `POST /run` responses, dashboard Runs page + run-detail, `GET /api/runs`, `skrun logs <agent>` (planned).
 
+### Run artifacts (files)
+
+An agent can produce **file artifacts** alongside its JSON output — a rendered PDF, a generated audio file, a built `kb.zip`, etc. Two ways: (a) call the built-in `write_artifact` tool, or (b) write directly into the path exposed via the `SKRUN_OUTPUT_DIR` environment variable from a tool script. The runtime scans that directory at the end of the run and surfaces every file under `run_complete.files[]` and on the persisted run row.
+
+Each file in the response carries `{name, size, file_id, url}`. The `file_id` is the canonical reference into the unified files namespace and can be fetched via `GET /api/files/<id>/content` with normal auth. The dashboard renders the produced files as a **Files block** with download buttons under the agent's Output, both in the playground (live) and on the run-detail page (after persistence). Files are scoped to the run's owner — only the calling user (or an admin) can download them.
+
 ---
 
 ## Environment
@@ -95,11 +108,17 @@ State is enabled via `agent.yaml` `state: { type: kv, ttl: 30d }`. Set `type: no
 
 ## Verification
 
-**Verification** is a per-agent operator flag that controls whether the agent's local `scripts/` can execute. Unverified agents run with LLM + MCP only — their scripts are skipped with a warning. The verified flag lets an operator trust a third-party agent enough to run its scripts in their environment.
+**Verification** is a **per-version** admin-gated flag that controls whether a version of an agent can be invoked via `POST /run`. Unverified versions return `403 AGENT_NOT_VERIFIED` from the runtime — no LLM call, no MCP connection, no DB write happens for an unapproved version. The verified flag lets an operator vet what runs in their Skrun before any caller can use it.
 
-In local dev (`dev-token` mode), verification is bypassed — all scripts run by default. In production (OAuth or API keys), only the namespace owner can verify, and new pushes start unverified. The warning `agent_not_verified_scripts_disabled` appears in POST /run responses when scripts were skipped.
+Verification is per version, not per agent. Pushing a new version is a pure INSERT — it never touches the verified state of any existing version. A caller pinning `version: "1.0.0"` keeps running even if the author pushes a not-yet-verified v1.1.0 (the new version is what's blocked, not the old one). Without a version pin, `POST /run` resolves to the most recently pushed version; if that one is unverified, the call gets 403 — pin an older verified version to keep running.
 
-**Where you see it**: `PATCH /api/agents/<ns>/<name>/verify`, dashboard agent-detail verified pill, run response `warnings` array.
+Only an **admin** can flip the flag. Promotion to admin is a manual SQL update on the `users` table (no API for elevation by design); the local `dev-token` is mapped to admin automatically so single-user self-host flows just work. New pushes always start at `verified=false`. Every verify and unverify call writes a structured pino log entry (`event: "agent_version_verify"`) carrying the actor identity, target version, and action — the forensic trail for any future audit-log UI.
+
+**Where you see it**:
+- API: `PATCH /api/agents/<ns>/<name>/versions/<version>/verify`, `POST /run` returns 403 with `code: "AGENT_NOT_VERIFIED"` for unverified versions.
+- CLI: `skrun verify <ns>/<name>@<version>` and `skrun unverify <ns>/<name>@<version>` (admin only).
+- SDK: `client.verifyVersion(agent, version, verified)` and a typed `SkrunNotVerifiedError` consumers can catch.
+- Dashboard: per-row Status badges + Verify/Unverify buttons in the versions table on agent-detail; playground Run button disabled with an amber banner when the selected version is unverified.
 
 ---
 

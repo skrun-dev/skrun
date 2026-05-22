@@ -17,14 +17,14 @@ describe("E2E: Registry", () => {
     expect(pushRes.status).toBe(200);
     const pushBody = await pushRes.json();
     expect(pushBody.name).toBe("my-agent");
-    expect(pushBody.verified).toBe(false);
+    expect(pushBody.latest_version_verified).toBe(false);
 
     // Metadata
-    const metaRes = await ctx.app.request("/api/agents/dev/my-agent");
+    const metaRes = await ctx.app.request("/api/agents/dev/my-agent", { headers: devAuth });
     expect(metaRes.status).toBe(200);
     const meta = await metaRes.json();
     expect(meta.latest_version).toBe("1.0.0");
-    expect(meta.verified).toBe(false);
+    expect(meta.latest_version_verified).toBe(false);
 
     // Pull
     const pullRes = await ctx.app.request("/api/agents/dev/my-agent/pull", {
@@ -34,13 +34,15 @@ describe("E2E: Registry", () => {
     expect(pullRes.headers.get("X-Agent-Version")).toBe("1.0.0");
 
     // List
-    const listRes = await ctx.app.request("/api/agents");
+    const listRes = await ctx.app.request("/api/agents", { headers: devAuth });
     const list = await listRes.json();
     expect(list.total).toBe(1);
     expect(list.agents[0].name).toBe("my-agent");
 
     // Versions
-    const versionsRes = await ctx.app.request("/api/agents/dev/my-agent/versions");
+    const versionsRes = await ctx.app.request("/api/agents/dev/my-agent/versions", {
+      headers: devAuth,
+    });
     const versions = await versionsRes.json();
     expect(versions.versions).toHaveLength(1);
     expect(versions.versions[0].version).toBe("1.0.0");
@@ -82,7 +84,9 @@ describe("E2E: Registry", () => {
     const res = await ctx.app.request("/api/agents/dev/multi/pull", { headers: devAuth });
     expect(res.headers.get("X-Agent-Version")).toBe("2.0.0");
 
-    const versionsRes = await ctx.app.request("/api/agents/dev/multi/versions");
+    const versionsRes = await ctx.app.request("/api/agents/dev/multi/versions", {
+      headers: devAuth,
+    });
     const versions = await versionsRes.json();
     expect(versions.versions).toHaveLength(2);
     expect(versions.versions[0].version).toBe("1.0.0");

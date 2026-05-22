@@ -30,6 +30,18 @@ function createMockProvider(content = '{"result": "hello"}'): LLMProvider {
   };
 }
 
+/** Mock provider that returns a different content on each successive call. Useful for retry tests. */
+function createScriptedProvider(
+  contents: string[],
+  perCallTokens = { promptTokens: 100, completionTokens: 50 },
+): LLMProvider {
+  const fn = vi.fn();
+  for (const content of contents) {
+    fn.mockResolvedValueOnce({ content, usage: perCallTokens });
+  }
+  return { name: "mock", call: fn };
+}
+
 function createFailingProvider(): LLMProvider {
   return {
     name: "mock",
@@ -40,7 +52,7 @@ function createFailingProvider(): LLMProvider {
 function createRunRequest(overrides?: Partial<RunRequest>): RunRequest {
   return {
     agentConfig: {
-      name: "test/agent",
+      name: "test-agent",
       description: "Test agent",
       version: "1.0.0",
       model: { provider: "mock", name: "mock-model" },
@@ -298,6 +310,245 @@ describe("LocalAdapter.executeStream", () => {
     expect(types[0]).toBe("run_start");
     expect(types[types.length - 1]).toBe("run_complete");
     expect(types[types.length - 2]).toBe("llm_complete");
+  });
+
+  // Bug C (audit/002): when a tool returns isError, the runtime emits a
+  // visibility-only `tool_call_error` event BEFORE the existing `tool_result`.
+  // The tool_result still flows back to the LLM normally — permissive default
+  // contract (aligned with CMA/Bedrock/Vertex).
+  describe("Bug C: tool_call_error visibility event", () => {
+    it("SC-3 — emits tool_call_error before tool_result when isError is true (script tool)", async () => {
+      const toolCallResponse = {
+        content: "",
+        toolCalls: [{ name: "failing_tool", args: { key: "value" }, id: "tc-1" }],
+        usage: { promptTokens: 50, completionTokens: 20 },
+      };
+      const finalResponse = {
+        content: '{"result": "recovered"}',
+        usage: { promptTokens: 50, completionTokens: 30 },
+      };
+      const provider: LLMProvider = {
+        name: "mock",
+        call: vi.fn().mockResolvedValueOnce(toolCallResponse).mockResolvedValueOnce(finalResponse),
+      };
+      router.registerProvider("mock", provider);
+
+      tools.addProvider({
+        name: "test",
+        async listTools() {
+          return [{ name: "failing_tool", description: "Fails on purpose", parameters: {} }];
+        },
+        async callTool() {
+          return { content: "[BOOM] something went wrong", isError: true };
+        },
+        async disconnect() {},
+      });
+
+      const adapter = new LocalAdapter(router, tools, state);
+      const events = await collectEvents(adapter.executeStream(createRunRequest()));
+
+      const errorEvent = events.find((e) => e.type === "tool_call_error");
+      const resultEvent = events.find((e) => e.type === "tool_result");
+
+      expect(errorEvent).toBeDefined();
+      if (errorEvent?.type === "tool_call_error") {
+        expect(errorEvent.tool).toBe("failing_tool");
+        // Bracketed prefix `[BOOM]` is extracted as the structured `code`
+        // field; the remainder becomes the `message`.
+        expect(errorEvent.code).toBe("BOOM");
+        expect(errorEvent.message).toBe("something went wrong");
+      }
+
+      // Ordering: tool_call → tool_call_error → tool_result
+      const errorIdx = events.findIndex((e) => e.type === "tool_call_error");
+      const resultIdx = events.findIndex((e) => e.type === "tool_result");
+      expect(errorIdx).toBeGreaterThan(-1);
+      expect(resultIdx).toBeGreaterThan(errorIdx);
+
+      // The LLM still receives the tool_result content (permissive default).
+      // We verify by asserting the run reached `run_complete` (the LLM produced
+      // a final output after seeing the tool_result).
+      expect(resultEvent?.type).toBe("tool_result");
+      const runComplete = events.find((e) => e.type === "run_complete");
+      expect(runComplete).toBeDefined();
+    });
+
+    it("SC-3 (regression) — does NOT emit tool_call_error when isError is false", async () => {
+      const toolCallResponse = {
+        content: "",
+        toolCalls: [{ name: "ok_tool", args: {}, id: "tc-1" }],
+        usage: { promptTokens: 50, completionTokens: 20 },
+      };
+      const finalResponse = {
+        content: '{"result": "done"}',
+        usage: { promptTokens: 50, completionTokens: 30 },
+      };
+      const provider: LLMProvider = {
+        name: "mock",
+        call: vi.fn().mockResolvedValueOnce(toolCallResponse).mockResolvedValueOnce(finalResponse),
+      };
+      router.registerProvider("mock", provider);
+
+      tools.addProvider({
+        name: "test",
+        async listTools() {
+          return [{ name: "ok_tool", description: "Succeeds", parameters: {} }];
+        },
+        async callTool() {
+          return { content: "all good", isError: false };
+        },
+        async disconnect() {},
+      });
+
+      const adapter = new LocalAdapter(router, tools, state);
+      const events = await collectEvents(adapter.executeStream(createRunRequest()));
+
+      expect(events.find((e) => e.type === "tool_call_error")).toBeUndefined();
+      expect(events.find((e) => e.type === "tool_result")).toBeDefined();
+    });
+
+    it("SC-4 — emits tool_call_error for MCP tool failures (same emit path)", async () => {
+      // MCP tools flow through the same ToolRegistry.callTool() path as
+      // script tools — the test fixture is identical, just labelled "mcp" to
+      // confirm the contract holds regardless of provider type.
+      const toolCallResponse = {
+        content: "",
+        toolCalls: [{ name: "mcp_failing", args: { url: "https://broken" }, id: "tc-1" }],
+        usage: { promptTokens: 50, completionTokens: 20 },
+      };
+      const finalResponse = {
+        content: '{"result": "fallback"}',
+        usage: { promptTokens: 50, completionTokens: 30 },
+      };
+      const provider: LLMProvider = {
+        name: "mock",
+        call: vi.fn().mockResolvedValueOnce(toolCallResponse).mockResolvedValueOnce(finalResponse),
+      };
+      router.registerProvider("mock", provider);
+
+      tools.addProvider({
+        name: "mcp-fetch", // labelled as MCP, but behavior is identical
+        async listTools() {
+          return [{ name: "mcp_failing", description: "MCP tool that fails", parameters: {} }];
+        },
+        async callTool() {
+          return { content: "Connection refused", isError: true };
+        },
+        async disconnect() {},
+      });
+
+      const adapter = new LocalAdapter(router, tools, state);
+      const events = await collectEvents(adapter.executeStream(createRunRequest()));
+
+      const errorEvent = events.find((e) => e.type === "tool_call_error");
+      expect(errorEvent).toBeDefined();
+      if (errorEvent?.type === "tool_call_error") {
+        expect(errorEvent.tool).toBe("mcp_failing");
+        // No bracketed prefix → no `code` field, full content as message.
+        expect(errorEvent.code).toBeUndefined();
+        expect(errorEvent.message).toBe("Connection refused");
+      }
+    });
+  });
+
+  describe("Bug E: post-loop output validation", () => {
+    it("does not emit output_validation_warning when the final output matches the declared schema (SC-6)", async () => {
+      router.registerProvider("mock", createMockProvider('{"result": "hello"}'));
+      const adapter = new LocalAdapter(router, tools, state);
+      const events = await collectEvents(adapter.executeStream(createRunRequest()));
+
+      const warning = events.find((e) => e.type === "output_validation_warning");
+      expect(warning).toBeUndefined();
+      expect(events[events.length - 1]?.type).toBe("run_complete");
+    });
+
+    it("emits output_validation_warning + repair retry succeeds with summed usage (SC-7)", async () => {
+      // 1st call: missing required `result` key → triggers retry
+      // 2nd call (repair): valid output → run_complete
+      router.registerProvider(
+        "mock",
+        createScriptedProvider(['{"other": "value"}', '{"result": "fixed"}']),
+      );
+      const adapter = new LocalAdapter(router, tools, state);
+      const events = await collectEvents(adapter.executeStream(createRunRequest()));
+
+      const warning = events.find((e) => e.type === "output_validation_warning");
+      expect(warning).toBeDefined();
+      if (warning?.type === "output_validation_warning") {
+        expect(warning.errors.length).toBeGreaterThan(0);
+      }
+
+      const llmCompletes = events.filter((e) => e.type === "llm_complete");
+      expect(llmCompletes).toHaveLength(2);
+
+      const last = events[events.length - 1];
+      expect(last?.type).toBe("run_complete");
+      if (last?.type === "run_complete") {
+        expect(last.output).toEqual({ result: "fixed" });
+        // Summed: 2 calls × {prompt: 100, completion: 50}
+        expect(last.usage.prompt_tokens).toBe(200);
+        expect(last.usage.completion_tokens).toBe(100);
+        expect(last.usage.total_tokens).toBe(300);
+      }
+    });
+
+    it("repair retry still invalid → run_error OUTPUT_SCHEMA_INVALID (SC-8)", async () => {
+      // Both calls return invalid output → retry exhausted
+      router.registerProvider(
+        "mock",
+        createScriptedProvider(['{"other": "value"}', '{"still": "wrong"}']),
+      );
+      const adapter = new LocalAdapter(router, tools, state);
+      const events = await collectEvents(adapter.executeStream(createRunRequest()));
+
+      const warning = events.find((e) => e.type === "output_validation_warning");
+      expect(warning).toBeDefined();
+
+      const llmCompletes = events.filter((e) => e.type === "llm_complete");
+      expect(llmCompletes).toHaveLength(2);
+
+      const last = events[events.length - 1];
+      expect(last?.type).toBe("run_error");
+      if (last?.type === "run_error") {
+        expect(last.error.code).toBe("OUTPUT_SCHEMA_INVALID");
+        expect(last.error.message).toContain("repair retry");
+      }
+    });
+
+    it("repair retry returns non-JSON → run_error OUTPUT_SCHEMA_INVALID (SC-8b)", async () => {
+      // 1st call: invalid output, 2nd call: no JSON object at all
+      router.registerProvider(
+        "mock",
+        createScriptedProvider(['{"other": "value"}', "Sorry, I cannot comply."]),
+      );
+      const adapter = new LocalAdapter(router, tools, state);
+      const events = await collectEvents(adapter.executeStream(createRunRequest()));
+
+      const last = events[events.length - 1];
+      expect(last?.type).toBe("run_error");
+      if (last?.type === "run_error") {
+        expect(last.error.code).toBe("OUTPUT_SCHEMA_INVALID");
+        expect(last.error.message).toMatch(/not valid JSON|did not contain a JSON object/);
+      }
+    });
+
+    it("skips validation entirely when the agent declares no outputs", async () => {
+      router.registerProvider("mock", createMockProvider('{"result": "hello"}'));
+      const adapter = new LocalAdapter(router, tools, state);
+      const events = await collectEvents(
+        adapter.executeStream(
+          createRunRequest({
+            agentConfig: {
+              ...createRunRequest().agentConfig,
+              outputs: [],
+            },
+          }),
+        ),
+      );
+
+      const warning = events.find((e) => e.type === "output_validation_warning");
+      expect(warning).toBeUndefined();
+    });
   });
 });
 

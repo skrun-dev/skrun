@@ -4,7 +4,7 @@ import { resolveToolChoice } from "./tool-choice.js";
 
 function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
-    name: "dev/test-agent",
+    name: "test-agent",
     version: "0.1.0",
     model: { provider: "anthropic", name: "claude-3-7-sonnet" },
     tools: [],

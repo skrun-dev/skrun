@@ -42,3 +42,42 @@ export class ScriptDepsInstallError extends SkrunError {
     this.details = details;
   }
 }
+
+export interface McpConnectErrorDetails {
+  /** Name of the MCP server (from agent.yaml mcp_servers[].name). */
+  server: string;
+  /** Transport that failed: "stdio" | "sse" | "streamable-http". */
+  transport: string;
+  /** stdio command-line or remote URL, for diagnostic context. */
+  location: string;
+  /** True when the failure was a connect timeout (vs. a non-timeout error). */
+  isTimeout: boolean;
+  /** Connect timeout in milliseconds — present when `isTimeout` is true. */
+  timeoutMs?: number;
+}
+
+/**
+ * Raised when an MCP server declared by `agent.yaml.mcp_servers[]` cannot be
+ * connected to (timeout, transport error, allowed_hosts block, missing
+ * command, etc.). The runtime previously swallowed these failures and
+ * continued with `tools=[]`, which let the LLM hallucinate plausible-looking
+ * but ungrounded answers (especially under output-validation repair retry).
+ * Failing the run loudly forces operators to fix the underlying connection
+ * instead of shipping silent garbage.
+ *
+ * Code: `MCP_CONNECT_FAILED`
+ */
+export class McpConnectError extends SkrunError {
+  readonly details: McpConnectErrorDetails;
+
+  constructor(details: McpConnectErrorDetails, cause?: unknown) {
+    const suffix = details.isTimeout ? ` after ${details.timeoutMs ?? "?"}ms timeout` : "";
+    super(
+      "MCP_CONNECT_FAILED",
+      `MCP server "${details.server}" (${details.transport}) failed to connect${suffix}: ${details.location}`,
+      cause,
+    );
+    this.name = "McpConnectError";
+    this.details = details;
+  }
+}

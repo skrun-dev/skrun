@@ -16,7 +16,7 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { REGISTRY, ROOT, results, skrun, TOKEN } from "./_ctx.js";
+import { REGISTRY, ROOT, results, skrun, TOKEN, verifyLatestVersion } from "./_ctx.js";
 
 /**
  * Best-effort cleanup helper for a single version of `dev/<agentSlug>`. Calls
@@ -71,6 +71,7 @@ async function runForcedToolCallScenario(
     } catch {
       // already pushed at this version — skip
     }
+    await verifyLatestVersion("dev", agentSlug);
 
     const runs = 3;
     let producedCount = 0;
@@ -185,6 +186,7 @@ export async function run(): Promise<void> {
       } catch {
         // already pushed at this version
       }
+      await verifyLatestVersion("dev", "email-drafter");
 
       const runRes = await fetch(`${REGISTRY}/api/agents/dev/email-drafter/run`, {
         method: "POST",

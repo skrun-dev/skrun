@@ -3,6 +3,10 @@ import Database from "better-sqlite3";
 import type { DbAdapter } from "./adapter.js";
 import type { Agent, AgentVersion, ApiKey, Environment, Run, RunStatus, User } from "./schema.js";
 
+// FK semantics mirror packages/api/src/db/migrations/001_initial_schema.sql
+//   - Ownership chains: ON DELETE CASCADE (api_keys, agents, agent_versions, agent_state, environments)
+//   - Run history (runs.*): ON DELETE SET NULL — preserves analytics + billing data
+//     after the referenced agent/user/environment is deleted.
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -11,13 +15,14 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT NOT NULL DEFAULT '',
   avatar_url TEXT NOT NULL DEFAULT '',
   plan TEXT NOT NULL DEFAULT 'free',
+  role TEXT NOT NULL DEFAULT 'user',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (
   id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   key_hash TEXT UNIQUE NOT NULL,
   key_prefix TEXT NOT NULL,
   name TEXT NOT NULL,
@@ -32,8 +37,7 @@ CREATE TABLE IF NOT EXISTS agents (
   name TEXT NOT NULL,
   namespace TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
-  owner_id TEXT NOT NULL,
-  verified INTEGER NOT NULL DEFAULT 0,
+  owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(namespace, name)
@@ -41,13 +45,15 @@ CREATE TABLE IF NOT EXISTS agents (
 
 CREATE TABLE IF NOT EXISTS agent_versions (
   id TEXT PRIMARY KEY,
-  agent_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   version TEXT NOT NULL,
   size INTEGER NOT NULL,
   bundle_key TEXT NOT NULL,
   config_snapshot TEXT,
   notes TEXT,
-  pushed_at TEXT NOT NULL
+  pushed_at TEXT NOT NULL,
+  verified INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(agent_id, version)
 );
 
 CREATE TABLE IF NOT EXISTS agent_state (
@@ -59,7 +65,7 @@ CREATE TABLE IF NOT EXISTS agent_state (
 CREATE TABLE IF NOT EXISTS environments (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  owner_id TEXT NOT NULL,
+  owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   config TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -67,11 +73,11 @@ CREATE TABLE IF NOT EXISTS environments (
 
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
-  agent_id TEXT,
+  agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
   agent_version TEXT NOT NULL,
   model TEXT,
-  environment_id TEXT,
-  user_id TEXT,
+  environment_id TEXT REFERENCES environments(id) ON DELETE SET NULL,
+  user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
   status TEXT NOT NULL,
   input TEXT,
   output TEXT,
@@ -133,6 +139,297 @@ export class SqliteDb implements DbAdapter {
     if (!hasColumn("runs", "usage_cache_savings_usd")) {
       this.db.exec("ALTER TABLE runs ADD COLUMN usage_cache_savings_usd REAL NOT NULL DEFAULT 0");
     }
+
+    // Migration 007: users.role column + revoke pre-existing verified=true
+    // agents. Done BEFORE the FK rebuild (005) since 005's table-rebuild path
+    // would otherwise lose the role column if it ran first on a DB upgrading
+    // from pre-007 schema. The `verified` reset must run EVERY first-upgrade
+    // — gated on the column being newly added (one-shot).
+    if (!hasColumn("users", "role")) {
+      this.db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'");
+      // Pre-existing verified=true rows were minted under the old self-served
+      // PATCH /verify; they no longer reflect an admin gate, so reset them en
+      // masse. An admin (sole role allowed to verify post-007) can re-mint
+      // them after upgrading.
+      this.db.exec("UPDATE agents SET verified = 0 WHERE verified = 1");
+    }
+
+    // Migration 005: retrofit FOREIGN KEY constraints onto pre-existing SQLite
+    // DBs. The SCHEMA above declares the FKs for fresh installs; this
+    // migration handles existing self-host DBs created before the schema bump.
+    // Strategy: for each table missing its expected FK count, run an orphan
+    // pre-check first (fail loud with remediation hint), then rebuild the
+    // table using SQLite's "create-new + INSERT FROM old + drop + rename"
+    // pattern.
+    this.migrateForeignKeys();
+
+    // Migration 006: retrofit UNIQUE(agent_id, version) onto
+    // agent_versions for DBs that landed on the FK-only migration first.
+    // Fresh DBs (and DBs rebuilt via migrateForeignKeys) already have it
+    // baked in. This catches the narrow gap of "DB migrated to FKs but not
+    // yet to UNIQUE".
+    this.migrateAgentVersionsUnique();
+
+    // Migration 008: add per-version verified flag. Mirrors the .sql file for
+    // Postgres/Supabase.
+    if (!hasColumn("agent_versions", "verified")) {
+      this.db.exec("ALTER TABLE agent_versions ADD COLUMN verified INTEGER NOT NULL DEFAULT 0");
+    }
+
+    // Migration 009: drop legacy agents.verified. All consumers now read
+    // agent_versions.verified (or the computed latest_version_verified for
+    // agent-level surfaces). SQLite 3.35+ supports DROP COLUMN. Gated on
+    // hasColumn so fresh DBs (which never had the column post-7.7) skip.
+    if (hasColumn("agents", "verified")) {
+      this.db.exec("ALTER TABLE agents DROP COLUMN verified");
+    }
+  }
+
+  /** Number of FK rows the table is expected to have post-migration. */
+  private static readonly FK_EXPECTED: Record<string, number> = {
+    api_keys: 1, // user_id -> users
+    agents: 1, // owner_id -> users
+    agent_versions: 1, // agent_id -> agents
+    environments: 1, // owner_id -> users
+    runs: 3, // agent_id -> agents, environment_id -> environments, user_id -> users
+  };
+
+  private migrateForeignKeys(): void {
+    const tableHasExpectedFks = (table: string, expected: number): boolean => {
+      const rows = this.db.pragma(`foreign_key_list(${table})`) as Array<unknown>;
+      return rows.length >= expected;
+    };
+
+    const orphanCheck = (
+      table: string,
+      column: string,
+      refTable: string,
+      refColumn: string,
+    ): number => {
+      const row = this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM ${table} t WHERE t.${column} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ${refTable} r WHERE r.${refColumn} = t.${column})`,
+        )
+        .get() as { n: number };
+      return row.n;
+    };
+
+    const failOnOrphans = (
+      table: string,
+      column: string,
+      refTable: string,
+      orphans: number,
+    ): void => {
+      throw new Error(
+        `Cannot add FOREIGN KEY ${table}.${column} -> ${refTable}: ${orphans} orphan rows found. ` +
+          `Run \`DELETE FROM ${table} WHERE ${column} IS NOT NULL AND ${column} NOT IN (SELECT id FROM ${refTable});\` ` +
+          `(or repair the missing parent rows) before upgrading. See CHANGELOG v0.8.0.`,
+      );
+    };
+
+    // --- api_keys.user_id -> users.id ON DELETE CASCADE ---
+    if (!tableHasExpectedFks("api_keys", SqliteDb.FK_EXPECTED.api_keys)) {
+      const orphans = orphanCheck("api_keys", "user_id", "users", "id");
+      if (orphans > 0) failOnOrphans("api_keys", "user_id", "users", orphans);
+      this.rebuildWithFks(
+        "api_keys",
+        `CREATE TABLE api_keys (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          key_hash TEXT UNIQUE NOT NULL,
+          key_prefix TEXT NOT NULL,
+          name TEXT NOT NULL,
+          scopes TEXT NOT NULL DEFAULT '[]',
+          last_used_at TEXT,
+          expires_at TEXT,
+          created_at TEXT NOT NULL
+        )`,
+      );
+    }
+
+    // --- agents.owner_id -> users.id ON DELETE CASCADE ---
+    if (!tableHasExpectedFks("agents", SqliteDb.FK_EXPECTED.agents)) {
+      const orphans = orphanCheck("agents", "owner_id", "users", "id");
+      if (orphans > 0) failOnOrphans("agents", "owner_id", "users", orphans);
+      this.rebuildWithFks(
+        "agents",
+        `CREATE TABLE agents (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          namespace TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '',
+          owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          verified INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(namespace, name)
+        )`,
+      );
+    }
+
+    // --- agent_versions.agent_id -> agents.id ON DELETE CASCADE + UNIQUE(agent_id, version) ---
+    if (!tableHasExpectedFks("agent_versions", SqliteDb.FK_EXPECTED.agent_versions)) {
+      const orphans = orphanCheck("agent_versions", "agent_id", "agents", "id");
+      if (orphans > 0) failOnOrphans("agent_versions", "agent_id", "agents", orphans);
+      this.rebuildWithFks(
+        "agent_versions",
+        `CREATE TABLE agent_versions (
+          id TEXT PRIMARY KEY,
+          agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+          version TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          bundle_key TEXT NOT NULL,
+          config_snapshot TEXT,
+          notes TEXT,
+          pushed_at TEXT NOT NULL,
+          UNIQUE(agent_id, version)
+        )`,
+      );
+    }
+
+    // --- environments.owner_id -> users.id ON DELETE CASCADE ---
+    if (!tableHasExpectedFks("environments", SqliteDb.FK_EXPECTED.environments)) {
+      const orphans = orphanCheck("environments", "owner_id", "users", "id");
+      if (orphans > 0) failOnOrphans("environments", "owner_id", "users", orphans);
+      this.rebuildWithFks(
+        "environments",
+        `CREATE TABLE environments (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          config TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )`,
+      );
+    }
+
+    // --- runs.{agent_id, environment_id, user_id} -> ON DELETE SET NULL ---
+    // Preserves run history (billing/analytics) after parent deletion.
+    if (!tableHasExpectedFks("runs", SqliteDb.FK_EXPECTED.runs)) {
+      const orphansAgent = orphanCheck("runs", "agent_id", "agents", "id");
+      if (orphansAgent > 0) failOnOrphans("runs", "agent_id", "agents", orphansAgent);
+      const orphansUser = orphanCheck("runs", "user_id", "users", "id");
+      if (orphansUser > 0) failOnOrphans("runs", "user_id", "users", orphansUser);
+      const orphansEnv = orphanCheck("runs", "environment_id", "environments", "id");
+      if (orphansEnv > 0) failOnOrphans("runs", "environment_id", "environments", orphansEnv);
+      this.rebuildWithFks(
+        "runs",
+        `CREATE TABLE runs (
+          id TEXT PRIMARY KEY,
+          agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+          agent_version TEXT NOT NULL,
+          model TEXT,
+          environment_id TEXT REFERENCES environments(id) ON DELETE SET NULL,
+          user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+          status TEXT NOT NULL,
+          input TEXT,
+          output TEXT,
+          error TEXT,
+          usage_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+          usage_completion_tokens INTEGER NOT NULL DEFAULT 0,
+          usage_total_tokens INTEGER NOT NULL DEFAULT 0,
+          usage_estimated_cost REAL NOT NULL DEFAULT 0,
+          usage_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+          usage_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+          usage_cache_savings_usd REAL NOT NULL DEFAULT 0,
+          duration_ms INTEGER,
+          files TEXT,
+          created_at TEXT NOT NULL,
+          completed_at TEXT
+        )`,
+      );
+    }
+  }
+
+  private migrateAgentVersionsUnique(): void {
+    // Detect: does the table already have a UNIQUE constraint on (agent_id, version)?
+    // SQLite represents these as automatically-named indexes prefixed `sqlite_autoindex_`.
+    const indexes = this.db.pragma("index_list(agent_versions)") as Array<{
+      unique: number;
+      name: string;
+    }>;
+    for (const idx of indexes) {
+      if (idx.unique !== 1) continue;
+      const cols = this.db.pragma(`index_info(${idx.name})`) as Array<{ name: string }>;
+      const colNames = cols.map((c) => c.name).sort();
+      if (colNames.length === 2 && colNames[0] === "agent_id" && colNames[1] === "version") {
+        return; // Already present.
+      }
+    }
+
+    // Duplicate pre-check before rebuilding (per F-3 plan pattern). Extremely
+    // rare on self-host (the codebase already guards POST push against version
+    // collisions via service-layer 409 VERSION_EXISTS), but a row could exist
+    // from a pre-#77 race or manual SQL.
+    const dupes = this.db
+      .prepare(
+        "SELECT agent_id, version, COUNT(*) AS n FROM agent_versions GROUP BY agent_id, version HAVING COUNT(*) > 1 LIMIT 5",
+      )
+      .all() as Array<{ agent_id: string; version: string; n: number }>;
+    if (dupes.length > 0) {
+      const sample = dupes
+        .map((d) => `(agent_id=${d.agent_id}, version=${d.version}, count=${d.n})`)
+        .join(", ");
+      throw new Error(
+        `Cannot add UNIQUE(agent_id, version) on agent_versions: ${dupes.length}+ duplicate rows found. ` +
+          `Sample: ${sample}. ` +
+          `Dedupe before upgrading, e.g.: DELETE FROM agent_versions WHERE rowid NOT IN ` +
+          `(SELECT MIN(rowid) FROM agent_versions GROUP BY agent_id, version);`,
+      );
+    }
+
+    this.rebuildWithFks(
+      "agent_versions",
+      `CREATE TABLE agent_versions (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        version TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        bundle_key TEXT NOT NULL,
+        config_snapshot TEXT,
+        notes TEXT,
+        pushed_at TEXT NOT NULL,
+        UNIQUE(agent_id, version)
+      )`,
+    );
+  }
+
+  /**
+   * SQLite "rebuild table with FKs" — recommended pattern from
+   * https://www.sqlite.org/lang_altertable.html#otheralter.
+   * Wrapped in a transaction; foreign_keys pragma is toggled off so the
+   * INSERT FROM old doesn't error on the very FKs we're adding.
+   */
+  private rebuildWithFks(table: string, createSql: string): void {
+    const backup = `${table}_pre_fk_backup`;
+    this.db.pragma("foreign_keys = OFF");
+    try {
+      this.db.exec("BEGIN");
+      this.db.exec(`ALTER TABLE ${table} RENAME TO ${backup}`);
+      this.db.exec(createSql);
+      // Copy rows (column lists match by name since we kept identical columns).
+      const cols = (this.db.pragma(`table_info(${backup})`) as Array<{ name: string }>)
+        .map((c) => c.name)
+        .join(", ");
+      this.db.exec(`INSERT INTO ${table} (${cols}) SELECT ${cols} FROM ${backup}`);
+      this.db.exec(`DROP TABLE ${backup}`);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    } finally {
+      this.db.pragma("foreign_keys = ON");
+    }
+
+    // foreign_key_check should be empty after a clean rebuild.
+    const violations = this.db.pragma("foreign_key_check") as Array<unknown>;
+    if (violations.length > 0) {
+      throw new Error(
+        `FK migration on ${table} left ${violations.length} violation(s) — refusing to continue. ` +
+          `Inspect the rolled-back DB and fix referential integrity manually.`,
+      );
+    }
   }
 
   close(): void {
@@ -151,7 +448,7 @@ export class SqliteDb implements DbAdapter {
   }
 
   private toAgent(row: Record<string, unknown>): Agent {
-    return { ...row, verified: row.verified === 1 } as Agent;
+    return row as unknown as Agent;
   }
 
   private toApiKey(row: Record<string, unknown>): ApiKey {
@@ -183,6 +480,7 @@ export class SqliteDb implements DbAdapter {
         | Record<string, unknown>
         | undefined,
       notes: (row.notes as string | null) ?? null,
+      verified: row.verified === 1,
     } as AgentVersion;
   }
 
@@ -198,10 +496,10 @@ export class SqliteDb implements DbAdapter {
     const now = new Date().toISOString();
     this.db
       .prepare(
-        "INSERT INTO agents (id, name, namespace, description, owner_id, verified, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+        "INSERT INTO agents (id, name, namespace, description, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       )
       .run(id, data.name, data.namespace, data.description, data.owner_id, now, now);
-    return { id, ...data, verified: false, created_at: now, updated_at: now };
+    return { id, ...data, created_at: now, updated_at: now };
   }
 
   async getAgent(namespace: string, name: string): Promise<Agent | null> {
@@ -211,19 +509,24 @@ export class SqliteDb implements DbAdapter {
     return row ? this.toAgent(row) : null;
   }
 
-  async listAgents(
-    page: number,
-    limit: number,
-  ): Promise<{
+  async listAgents(opts: { page: number; limit: number; userId?: string }): Promise<{
     agents: (Agent & { run_count: number; token_count: number; cost_total: number })[];
     total: number;
   }> {
-    const total = (this.db.prepare("SELECT COUNT(*) as cnt FROM agents").get() as { cnt: number })
-      .cnt;
+    const { page, limit, userId } = opts;
+    // Filtered count — required so dashboard pagination is accurate (total
+    // must match the number of rows visible to this caller, not the global
+    // agent count). idx_agents_owner from migration 001 makes this O(log n).
+    const total = userId
+      ? (
+          this.db.prepare("SELECT COUNT(*) as cnt FROM agents WHERE owner_id = ?").get(userId) as {
+            cnt: number;
+          }
+        ).cnt
+      : (this.db.prepare("SELECT COUNT(*) as cnt FROM agents").get() as { cnt: number }).cnt;
+
     const offset = (page - 1) * limit;
-    const rows = this.db
-      .prepare(
-        `SELECT a.*,
+    const baseSelect = `SELECT a.*,
          COALESCE(r.run_count, 0) as run_count,
          COALESCE(r.token_count, 0) as token_count,
          COALESCE(r.cost_total, 0) as cost_total
@@ -234,10 +537,16 @@ export class SqliteDb implements DbAdapter {
              SUM(usage_total_tokens) as token_count,
              SUM(usage_estimated_cost) as cost_total
            FROM runs GROUP BY agent_id
-         ) r ON r.agent_id = a.id
-         LIMIT ? OFFSET ?`,
-      )
-      .all(limit, offset) as Record<string, unknown>[];
+         ) r ON r.agent_id = a.id`;
+    const rows = userId
+      ? (this.db
+          .prepare(`${baseSelect} WHERE a.owner_id = ? LIMIT ? OFFSET ?`)
+          .all(userId, limit, offset) as Record<string, unknown>[])
+      : (this.db.prepare(`${baseSelect} LIMIT ? OFFSET ?`).all(limit, offset) as Record<
+          string,
+          unknown
+        >[]);
+
     const agents = rows.map((row) => ({
       ...this.toAgent(row),
       run_count: (row.run_count as number) ?? 0,
@@ -247,13 +556,19 @@ export class SqliteDb implements DbAdapter {
     return { agents, total };
   }
 
-  async setVerified(namespace: string, name: string, verified: boolean): Promise<Agent | null> {
-    const now = new Date().toISOString();
+  async setVersionVerified(
+    namespace: string,
+    name: string,
+    version: string,
+    verified: boolean,
+  ): Promise<AgentVersion | null> {
+    const agent = await this.getAgent(namespace, name);
+    if (!agent) return null;
     const result = this.db
-      .prepare("UPDATE agents SET verified = ?, updated_at = ? WHERE namespace = ? AND name = ?")
-      .run(verified ? 1 : 0, now, namespace, name);
+      .prepare("UPDATE agent_versions SET verified = ? WHERE agent_id = ? AND version = ?")
+      .run(verified ? 1 : 0, agent.id, version);
     if (result.changes === 0) return null;
-    return this.getAgent(namespace, name);
+    return this.getVersionByNumber(agent.id, version);
   }
 
   async deleteAgent(namespace: string, name: string): Promise<boolean> {
@@ -282,7 +597,7 @@ export class SqliteDb implements DbAdapter {
     const notes = data.notes ?? null;
     this.db
       .prepare(
-        "INSERT INTO agent_versions (id, agent_id, version, size, bundle_key, config_snapshot, notes, pushed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO agent_versions (id, agent_id, version, size, bundle_key, config_snapshot, notes, pushed_at, verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
       )
       .run(id, agentId, data.version, data.size, data.bundle_key, snapshot, notes, now);
     this.db.prepare("UPDATE agents SET updated_at = ? WHERE id = ?").run(now, agentId);
@@ -295,6 +610,7 @@ export class SqliteDb implements DbAdapter {
       config_snapshot: data.config_snapshot,
       notes,
       pushed_at: now,
+      verified: false,
     };
   }
 
@@ -378,12 +694,13 @@ export class SqliteDb implements DbAdapter {
       email: data.email ?? "",
       avatar_url: data.avatar_url ?? "",
       plan: "free",
+      role: "user",
       created_at: now,
       updated_at: now,
     };
     this.db
       .prepare(
-        "INSERT INTO users (id, github_id, username, email, avatar_url, plan, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO users (id, github_id, username, email, avatar_url, plan, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         user.id,
@@ -392,6 +709,7 @@ export class SqliteDb implements DbAdapter {
         user.email,
         user.avatar_url,
         user.plan,
+        user.role,
         now,
         now,
       );

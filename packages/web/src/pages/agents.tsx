@@ -45,8 +45,8 @@ export function AgentsPage() {
         (a) => a.namespace.includes(namespaceFilter) || a.name.includes(namespaceFilter),
       );
     }
-    if (verifiedFilter === "verified") result = result.filter((a) => a.verified);
-    if (verifiedFilter === "unverified") result = result.filter((a) => !a.verified);
+    if (verifiedFilter === "verified") result = result.filter((a) => a.latest_version_verified);
+    if (verifiedFilter === "unverified") result = result.filter((a) => !a.latest_version_verified);
     result.sort((a, b) => {
       let cmp = 0;
       if (sortKey === "name")
@@ -201,8 +201,11 @@ export function AgentsPage() {
                       >
                         {agent.namespace}/<span className="font-semibold">{agent.name}</span>
                       </Link>
-                      {agent.verified && (
-                        <span className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-full bg-sky-500/15 text-sky-600 dark:text-sky-400">
+                      {agent.latest_version_verified && (
+                        <span
+                          className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-full bg-sky-500/15 text-sky-600 dark:text-sky-400"
+                          title="Latest version is verified by an admin"
+                        >
                           <IconCheck className="w-2.5 h-2.5" />
                         </span>
                       )}
@@ -230,12 +233,17 @@ export function AgentsPage() {
                   {formatUsd(agent.cost_total)}
                 </span>
 
-                {/* Status */}
-                <span>
-                  {agent.verified ? (
-                    <Pill tone="sky">verified</Pill>
+                {/* Status — reflects latest version's verified flag.
+                    Older versions may differ; see agent-detail versions table. */}
+                <span title="Status of the latest version. Older versions may have different trust state — see agent details.">
+                  {agent.latest_version_verified ? (
+                    <Pill tone="sky" dot>
+                      verified
+                    </Pill>
                   ) : (
-                    <Pill tone="neutral">unverified</Pill>
+                    <Pill tone="amber" dot>
+                      unverified
+                    </Pill>
                   )}
                 </span>
 

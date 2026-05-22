@@ -94,6 +94,36 @@ describe("ScriptToolProvider", () => {
     expect(result.content).toMatch(/Invalid arguments/);
   });
 
+  // SEC-021: ENOBUFS path produces a clear, actionable error instead of the
+  // opaque "stdout maxBuffer length exceeded" default. The buffer cap is
+  // 5 MB; a script writing more than that to stdout trips the branch.
+  it("SEC-021: surfaces a clear error when script output exceeds maxBuffer", async () => {
+    const floodScriptName = "flood.js";
+    writeFileSync(
+      join(scriptsDir, floodScriptName),
+      // Emit ~6MB on stdout (> 5MB cap). Avoid using stdin so the read end
+      // doesn't block; just print and exit. The .on('end')-style stdin loop
+      // is unused for this script.
+      "process.stdout.write('x'.repeat(6 * 1024 * 1024));",
+      "utf-8",
+    );
+    const floodTool: ToolConfig = {
+      name: "flood",
+      description: "Flood stdout to trigger maxBuffer",
+      input_schema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    };
+    const provider = new ScriptToolProvider(scriptsDir, [floodTool]);
+    const result = await provider.callTool("flood", {});
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/exceeded.*buffer cap|maxBuffer/i);
+    // The error must mention SKRUN_OUTPUT_DIR as the recommended escape hatch.
+    expect(result.content).toMatch(/SKRUN_OUTPUT_DIR/);
+  });
+
   it("rejects a tool not declared in agent.yaml", async () => {
     const provider = new ScriptToolProvider(scriptsDir, [echoTool]);
     const result = await provider.callTool("unknown", {});
@@ -286,6 +316,142 @@ describe("ScriptToolProvider", () => {
       expect(result.content).toContain("SCRIPT_DEPS_INSTALL_FAILED");
       // The original error message must surface to the LLM tool-call loop.
       expect(result.content).toContain("python -m venv");
+    });
+  });
+
+  // --- SEC-003: env allowlist on spawned scripts ----------------------------
+  describe("env allowlist (SEC-003)", () => {
+    it("VT-5: spawned script cannot read server-side LLM API keys via process.env", async () => {
+      const previousAnthropic = process.env.ANTHROPIC_API_KEY;
+      const previousOpenai = process.env.OPENAI_API_KEY;
+      const previousWebhook = process.env.WEBHOOK_SIGNING_KEY;
+      process.env.ANTHROPIC_API_KEY = "sk-ant-TEST-SHOULD-NOT-LEAK-12345";
+      process.env.OPENAI_API_KEY = "sk-TEST-SHOULD-NOT-LEAK-67890";
+      process.env.WEBHOOK_SIGNING_KEY = "TEST-WEBHOOK-KEY-SHOULD-NOT-LEAK";
+
+      try {
+        writeFileSync(
+          join(scriptsDir, "leak-attempt.js"),
+          // Try to exfiltrate every secret category at once.
+          `process.stdout.write(JSON.stringify({
+             anthropic: process.env.ANTHROPIC_API_KEY ?? "MISSING",
+             openai: process.env.OPENAI_API_KEY ?? "MISSING",
+             webhook: process.env.WEBHOOK_SIGNING_KEY ?? "MISSING",
+           }));`,
+          "utf-8",
+        );
+        const tool: ToolConfig = {
+          name: "leak-attempt",
+          description: "Try to read secrets",
+          input_schema: { type: "object", properties: {}, additionalProperties: true },
+        };
+        const provider = new ScriptToolProvider(scriptsDir, [tool]);
+        const result = await provider.callTool("leak-attempt", {});
+        expect(result.isError).toBe(false);
+        const parsed = JSON.parse(result.content as string);
+        expect(parsed.anthropic).toBe("MISSING");
+        expect(parsed.openai).toBe("MISSING");
+        expect(parsed.webhook).toBe("MISSING");
+      } finally {
+        if (previousAnthropic === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = previousAnthropic;
+        if (previousOpenai === undefined) delete process.env.OPENAI_API_KEY;
+        else process.env.OPENAI_API_KEY = previousOpenai;
+        if (previousWebhook === undefined) delete process.env.WEBHOOK_SIGNING_KEY;
+        else process.env.WEBHOOK_SIGNING_KEY = previousWebhook;
+      }
+    });
+
+    it("VT-5: SKRUN_* vars still pass through (contract preserved)", async () => {
+      const previous = process.env.SKRUN_CUSTOM_VAR;
+      process.env.SKRUN_CUSTOM_VAR = "skrun-contract-value";
+      try {
+        writeFileSync(
+          join(scriptsDir, "skrun-check.js"),
+          `process.stdout.write(process.env.SKRUN_CUSTOM_VAR ?? "MISSING");`,
+          "utf-8",
+        );
+        const tool: ToolConfig = {
+          name: "skrun-check",
+          description: "Check SKRUN_* pass-through",
+          input_schema: { type: "object", properties: {}, additionalProperties: true },
+        };
+        const provider = new ScriptToolProvider(scriptsDir, [tool]);
+        const result = await provider.callTool("skrun-check", {});
+        expect(result.isError).toBe(false);
+        expect(result.content).toBe("skrun-contract-value");
+      } finally {
+        if (previous === undefined) delete process.env.SKRUN_CUSTOM_VAR;
+        else process.env.SKRUN_CUSTOM_VAR = previous;
+      }
+    });
+
+    it("VT-5: PATH still propagates (so 'node' binary is findable)", async () => {
+      writeFileSync(
+        join(scriptsDir, "path-check.js"),
+        `process.stdout.write(process.env.PATH ? "HAS_PATH" : "NO_PATH");`,
+        "utf-8",
+      );
+      const tool: ToolConfig = {
+        name: "path-check",
+        description: "Check PATH propagation",
+        input_schema: { type: "object", properties: {}, additionalProperties: true },
+      };
+      const provider = new ScriptToolProvider(scriptsDir, [tool]);
+      const result = await provider.callTool("path-check", {});
+      expect(result.isError).toBe(false);
+      expect(result.content).toBe("HAS_PATH");
+    });
+  });
+
+  // Bug A (audit/002): scripts spawned with cwd anchored at the bundle root
+  // so relative paths in user-authored scripts resolve from the bundle dir,
+  // not from the registry's own process.cwd(). Closes the silent failure
+  // pattern surfaced by `csv-to-executive-report` (which tried to read
+  // `./fixtures/sample-revenue.csv` and found nothing).
+  describe("Bug A: script cwd anchored at bundleRoot", () => {
+    it("spawns scripts with cwd === options.bundleRoot when set", async () => {
+      // Tiny script that prints its own process.cwd() to stdout
+      writeFileSync(
+        join(scriptsDir, "where.js"),
+        `let _=""; process.stdin.on("data",c=>_+=c); process.stdin.on("end",()=>{process.stdout.write(process.cwd());});`,
+        "utf-8",
+      );
+      const tool: ToolConfig = {
+        name: "where",
+        description: "Print cwd",
+        input_schema: { type: "object", properties: {}, additionalProperties: true },
+      };
+      const provider = new ScriptToolProvider(scriptsDir, [tool], [], "", {
+        bundleRoot: tmpDir,
+      });
+      const result = await provider.callTool("where", {});
+      expect(result.isError).toBe(false);
+      // On macOS/Linux tmpdir() may include `/private/var/...` or `/var/...`
+      // depending on platform; we just assert the cwd ends with the bundle
+      // root's basename to keep the assertion robust across OSes.
+      expect(result.content).toContain(tmpDir);
+    });
+
+    it("falls back to process.cwd() when bundleRoot is unset (legacy path)", async () => {
+      writeFileSync(
+        join(scriptsDir, "where.js"),
+        `let _=""; process.stdin.on("data",c=>_+=c); process.stdin.on("end",()=>{process.stdout.write(process.cwd());});`,
+        "utf-8",
+      );
+      const tool: ToolConfig = {
+        name: "where",
+        description: "Print cwd",
+        input_schema: { type: "object", properties: {}, additionalProperties: true },
+      };
+      // No bundleRoot in options — legacy path
+      const provider = new ScriptToolProvider(scriptsDir, [tool]);
+      const result = await provider.callTool("where", {});
+      expect(result.isError).toBe(false);
+      // Just assert it returns some path (parent process cwd). We don't pin
+      // the exact value since the test runner's cwd varies between local and
+      // CI environments.
+      expect(result.content.length).toBeGreaterThan(0);
     });
   });
 });

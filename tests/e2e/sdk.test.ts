@@ -88,15 +88,19 @@ describe("E2E: SDK", () => {
     expect(result.agents.some((a) => a.name === "sdk-test")).toBe(true);
   });
 
-  it("verify() sets verified flag", async () => {
-    const result = await client.verify("dev/sdk-test", true);
+  it("verifyVersion() sets per-version verified flag (admin only — dev-token is admin)", async () => {
+    const result = await client.verifyVersion("dev/sdk-test", "1.0.0", true);
     expect(result.verified).toBe(true);
+    expect(result.version).toBe("1.0.0");
 
     const meta = await client.getAgent("dev/sdk-test");
-    expect(meta.verified).toBe(true);
+    expect(meta.latest_version_verified).toBe(true);
   });
 
-  it("run() on fake bundle returns BUNDLE_CORRUPT", async () => {
+  it("run() on fake bundle returns BUNDLE_CORRUPT (post-verify)", async () => {
+    // Pre-verify so the runtime gate passes — fake bundle still fails at
+    // extraction, which is the assertion we care about.
+    await client.verifyVersion("dev/sdk-test", "1.0.0", true);
     try {
       await client.run("dev/sdk-test", {});
       expect.unreachable("should throw");
@@ -122,7 +126,8 @@ describe("E2E: SDK", () => {
     await expect(client.run("no-slash", {})).rejects.toThrow("Agent must be 'namespace/name'");
   });
 
-  it("agent object format works", async () => {
+  it("agent object format works (post-verify so runtime gate passes)", async () => {
+    await client.verifyVersion("dev/sdk-test", "1.0.0", true);
     try {
       await client.run({ namespace: "dev", name: "sdk-test" }, {});
     } catch (e) {
@@ -132,9 +137,10 @@ describe("E2E: SDK", () => {
   });
 
   it("run() with environment option passes it in request body (VT-11)", async () => {
-    // Environment override is passed through to the API. Since the bundle is fake,
-    // we expect BUNDLE_CORRUPT (same as run() without env) — proving the env option
-    // doesn't break the request flow and reaches the server.
+    // Environment override is passed through to the API. Pre-verify the
+    // version so we reach the bundle-extraction phase (where the fake
+    // bundle fails with BUNDLE_CORRUPT — proves env was accepted).
+    await client.verifyVersion("dev/sdk-test", "1.0.0", true);
     try {
       await client.run(
         "dev/sdk-test",
@@ -147,7 +153,8 @@ describe("E2E: SDK", () => {
     } catch (e) {
       expect(e).toBeInstanceOf(SkrunApiError);
       // If environment was rejected, we'd get 400 INVALID_ENVIRONMENT.
-      // Getting BUNDLE_CORRUPT means environment was accepted and we progressed further.
+      // Getting BUNDLE_CORRUPT means environment was accepted + the verified
+      // gate was passed (proving verifyVersion took effect).
       expect((e as SkrunApiError).code).toBe("BUNDLE_CORRUPT");
     }
   });

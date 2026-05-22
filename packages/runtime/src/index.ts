@@ -16,9 +16,9 @@ export { computeDepsHash, DepsCache } from "./cache/deps-cache.js";
 export type { TTLCacheOptions } from "./cache/ttl-cache.js";
 // Cache
 export { TTLCache } from "./cache/ttl-cache.js";
-export type { ScriptDepsInstallErrorDetails } from "./errors.js";
+export type { McpConnectErrorDetails, ScriptDepsInstallErrorDetails } from "./errors.js";
 // Runtime-level typed errors
-export { ScriptDepsInstallError } from "./errors.js";
+export { McpConnectError, ScriptDepsInstallError } from "./errors.js";
 export type { CollectOptions } from "./files/output-collector.js";
 // Files
 export { collectOutputFiles } from "./files/output-collector.js";
@@ -72,12 +72,14 @@ export type { ToolDefinition, ToolProvider, ToolResult } from "./tools/types.js"
 export type {
   FileInfo,
   LlmCompleteEvent,
+  OutputValidationWarningEvent,
   RunCompleteEvent,
   RunErrorEvent,
   RunEvent,
   RunRequest,
   RunResult,
   RunStartEvent,
+  ToolCallErrorEvent,
   ToolCallEvent,
   ToolResultEvent,
 } from "./types.js";

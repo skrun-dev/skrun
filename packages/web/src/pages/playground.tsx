@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { EmptyState } from "../components/shared/empty-state";
+import { FilesBlock, type RunFile } from "../components/shared/files-block";
 import { IconChevRight, IconCopy, IconLock, IconPlay } from "../components/shared/icons";
 import { JsonViewer } from "../components/shared/json-viewer";
 import { Btn, Card, PageHeader, Pill } from "../components/shared/ui";
@@ -70,13 +71,13 @@ export function PlaygroundPage() {
   const [status, setStatus] = useState<PlaygroundStatus>("idle");
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [runFiles, setRunFiles] = useState<RunFile[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
   const [inputMode, setInputMode] = useState<"json" | "form">("json");
   const [fileAttachments, setFileAttachments] = useState<Record<string, AttachedFile[]>>({});
   const [uploading, setUploading] = useState<Record<string, boolean>>({});
   const [uploadError, setUploadError] = useState<string | null>(null);
-  const jsonAttachRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -100,6 +101,7 @@ export function PlaygroundPage() {
     setStatus("running");
     setEvents([]);
     setResult(null);
+    setRunFiles(null);
     setError(null);
     setRunId(null);
 
@@ -172,6 +174,9 @@ export function PlaygroundPage() {
               }
               if (data.type === "run_complete") {
                 setResult(data.output ?? data);
+                if (Array.isArray(data.files)) {
+                  setRunFiles(data.files as RunFile[]);
+                }
                 finalStatus = "completed";
               }
               if (data.type === "run_error") {
@@ -247,41 +252,6 @@ export function PlaygroundPage() {
     [input],
   );
 
-  const handleJsonAttach = useCallback(async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
-    setUploadError(null);
-    setUploading((p) => ({ ...p, __json__: true }));
-    try {
-      const uploaded = await Promise.all(Array.from(files).map(uploadFileToApi));
-      const refs = uploaded.map((u) => ({
-        type: "file",
-        source: "id",
-        file_id: u.file_id,
-      }));
-      const snippet =
-        refs.length === 1 ? JSON.stringify(refs[0], null, 2) : JSON.stringify(refs, null, 2);
-      const ta = textareaRef.current;
-      if (ta) {
-        const start = ta.selectionStart;
-        const end = ta.selectionEnd;
-        const before = ta.value.slice(0, start);
-        const after = ta.value.slice(end);
-        const next = before + snippet + after;
-        setInput(next);
-        requestAnimationFrame(() => {
-          ta.focus();
-          ta.setSelectionRange(start + snippet.length, start + snippet.length);
-        });
-      } else {
-        setInput((cur) => `${cur}\n${snippet}`);
-      }
-    } catch (err) {
-      setUploadError(err instanceof Error ? err.message : "Upload failed");
-    } finally {
-      setUploading((p) => ({ ...p, __json__: false }));
-    }
-  }, []);
-
   if (agentLoading) {
     return (
       <div className="space-y-4">
@@ -306,6 +276,19 @@ export function PlaygroundPage() {
   }
 
   const latestVersion = versions && versions.length > 0 ? versions[versions.length - 1] : null;
+
+  // The version actually resolved for the current run (mirrors how the API
+  // resolves the request body's `version` field). When the user picks "latest"
+  // (empty selectedVersion), it's the most recently pushed.
+  const resolvedVersionInfo = (() => {
+    if (!versions || versions.length === 0) return null;
+    if (!selectedVersion) return latestVersion;
+    return versions.find((v) => v.version === selectedVersion) ?? null;
+  })();
+  // Default to "verified" while versions still loading (undefined). The API
+  // enforces the real gate; this prevents a flash of disabled UI on cold load.
+  const selectedVersionVerified = resolvedVersionInfo ? resolvedVersionInfo.verified : true;
+  const resolvedVersionLabel = resolvedVersionInfo?.version ?? selectedVersion ?? "latest";
   const agentInputs = (latestVersion?.config_snapshot as Record<string, unknown> | undefined)
     ?.inputs as AgentInput[] | undefined;
   const modelConfig = (latestVersion?.config_snapshot as Record<string, unknown> | undefined)
@@ -368,6 +351,25 @@ export function PlaygroundPage() {
       <div className="grid grid-cols-5 gap-5">
         {/* Left: form */}
         <div className="col-span-2 space-y-4">
+          {/* Unverified-version banner — informational; the real gate is the
+              POST /run 403 enforced server-side. */}
+          {!selectedVersionVerified && (
+            <div
+              role="status"
+              className="rounded-md border border-amber-200 dark:border-amber-900/60 bg-amber-50 dark:bg-amber-950/30 px-3 py-2 text-[12px] text-amber-800 dark:text-amber-300"
+            >
+              <span className="font-medium">Version {resolvedVersionLabel} is not verified.</span>{" "}
+              Run is disabled until an admin approves it.{" "}
+              <Link
+                to={`/agents/${namespace}/${name}`}
+                className="underline underline-offset-2 hover:no-underline"
+              >
+                View versions table
+              </Link>
+              .
+            </div>
+          )}
+
           {/* Input card */}
           <Card
             title="Input"
@@ -510,34 +512,19 @@ export function PlaygroundPage() {
                   onChange={(e) => setInput(e.target.value)}
                   rows={10}
                   disabled={status === "running"}
-                  className="w-full px-4 py-3 pb-10 text-[11.5px] font-mono leading-[1.55] text-gray-700 dark:text-gray-300 bg-gray-50/40 dark:bg-gray-950/60 border-0 outline-hidden resize-none disabled:opacity-50"
+                  className="w-full px-4 py-3 text-[11.5px] font-mono leading-[1.55] text-gray-700 dark:text-gray-300 bg-gray-50/40 dark:bg-gray-950/60 border-0 outline-hidden resize-none disabled:opacity-50"
                   spellCheck={false}
                 />
-                <div className="absolute bottom-2 right-3 flex items-center gap-2">
-                  {uploading.__json__ && (
-                    <span className="text-[10.5px] text-amber-600 dark:text-amber-400">
-                      Uploading…
-                    </span>
-                  )}
-                  <input
-                    ref={jsonAttachRef}
-                    type="file"
-                    multiple
-                    className="hidden"
-                    onChange={(e) => {
-                      handleJsonAttach(e.target.files);
-                      e.target.value = "";
-                    }}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => jsonAttachRef.current?.click()}
-                    disabled={status === "running" || uploading.__json__}
-                    className="px-2 py-0.5 rounded-md text-[10.5px] font-medium bg-sky-50 dark:bg-sky-900/30 text-sky-700 dark:text-sky-300 hover:bg-sky-100 dark:hover:bg-sky-900/50 disabled:opacity-50"
+                {agentInputs?.some((inp) => inp.type === "file") && (
+                  <div
+                    className="px-4 py-2 border-t border-gray-100 dark:border-gray-900 bg-gray-50/40 dark:bg-gray-950/60 text-[11px] text-gray-500 dark:text-gray-400"
+                    role="note"
                   >
-                    Attach file
-                  </button>
-                </div>
+                    This agent takes file inputs. Switch to{" "}
+                    <strong className="font-medium text-gray-700 dark:text-gray-300">Form</strong>{" "}
+                    mode (toggle above) to attach files.
+                  </div>
+                )}
               </div>
             )}
             {uploadError && (
@@ -640,6 +627,7 @@ export function PlaygroundPage() {
                       setInput("{}");
                       setEvents([]);
                       setResult(null);
+                      setRunFiles(null);
                       setError(null);
                       setRunId(null);
                       setStatus("idle");
@@ -647,9 +635,26 @@ export function PlaygroundPage() {
                   >
                     Clear
                   </Btn>
-                  <Btn variant="primary" icon={<IconPlay />} onClick={runAgent}>
+                  <Btn
+                    variant="primary"
+                    icon={<IconPlay />}
+                    onClick={runAgent}
+                    disabled={!selectedVersionVerified}
+                    aria-disabled={!selectedVersionVerified}
+                    aria-describedby={!selectedVersionVerified ? "run-disabled-reason" : undefined}
+                    title={
+                      !selectedVersionVerified
+                        ? `Version ${resolvedVersionLabel} must be verified by an admin before it can run`
+                        : undefined
+                    }
+                  >
                     Run agent
                   </Btn>
+                  {!selectedVersionVerified && (
+                    <span id="run-disabled-reason" className="sr-only">
+                      Version {resolvedVersionLabel} must be verified by an admin before it can run.
+                    </span>
+                  )}
                 </>
               )}
             </div>
@@ -688,15 +693,34 @@ export function PlaygroundPage() {
               <div className="px-4 py-3 space-y-1.5 font-mono text-[11.5px] leading-relaxed bg-linear-to-b from-white to-gray-50/40 dark:from-gray-950/40 dark:to-gray-950/70 max-h-[300px] overflow-y-auto">
                 {events.map((e, i) => {
                   const color = getEventColor(e.type);
+                  const isToolError = e.type === "tool_call_error";
                   return (
-                    <div key={`ev-${i}`} className="flex gap-2.5 items-baseline">
-                      <span className="text-[10px] text-gray-400 tabular-nums w-10 shrink-0">
-                        +{String(i * 100).padStart(4, "0")}
-                      </span>
-                      <span className={`${color} font-semibold w-[88px] shrink-0`}>{e.type}</span>
-                      <span className="text-gray-700 dark:text-gray-300 flex-1 truncate">
-                        {formatEventText(e)}
-                      </span>
+                    <div
+                      key={`ev-${i}`}
+                      className={
+                        isToolError ? "border-l-2 border-red-500/70 pl-2 -ml-2 py-0.5" : undefined
+                      }
+                    >
+                      <div className="flex gap-2.5 items-baseline">
+                        <span className="text-[10px] text-gray-400 tabular-nums w-10 shrink-0">
+                          +{String(i * 100).padStart(4, "0")}
+                        </span>
+                        <span className={`${color} font-semibold w-[88px] shrink-0`}>{e.type}</span>
+                        <span
+                          className={`flex-1 truncate ${isToolError ? "text-red-700 dark:text-red-400" : "text-gray-700 dark:text-gray-300"}`}
+                        >
+                          {formatEventText(e)}
+                        </span>
+                      </div>
+                      {isToolError && (
+                        <div className="flex gap-2.5">
+                          <span className="w-10 shrink-0" />
+                          <span className="w-[88px] shrink-0" />
+                          <span className="text-[10.5px] text-red-600/70 dark:text-red-400/70 italic">
+                            (LLM still received this; run continues)
+                          </span>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -727,6 +751,9 @@ export function PlaygroundPage() {
             </Card>
           )}
 
+          {/* Files produced by the run (if any) */}
+          <FilesBlock files={runFiles} />
+
           {/* Run link */}
           {runId && status !== "running" && (
             <Link
@@ -750,16 +777,23 @@ export function PlaygroundPage() {
 }
 
 function getEventColor(type: string): string {
+  // `tool_call_error` matches BOTH "tool" and "error" — error takes precedence
+  // so the failed tool call renders in red, not sky-blue.
+  if (type.includes("error") || type.includes("fail")) return "text-red-600 dark:text-red-400";
   if (type.includes("complete") || type.includes("result"))
     return "text-emerald-600 dark:text-emerald-400";
   if (type.includes("tool")) return "text-sky-600 dark:text-sky-400";
   if (type.includes("llm") || type.includes("chunk")) return "text-violet-600 dark:text-violet-400";
-  if (type.includes("error")) return "text-red-600 dark:text-red-400";
   return "text-gray-500";
 }
 
 function formatEventText(e: RunEvent): string {
   const d = e.data;
+  if (d.type === "tool_call_error") {
+    const tool = d.tool ? String(d.tool) : "?";
+    const msg = d.message ? String(d.message) : "(no message)";
+    return `Tool error: ${tool} — ${msg}`;
+  }
   if (d.message) return String(d.message);
   if (d.type === "run_start") return `agent=${d.agent ?? ""}`;
   if (d.tool_name) return `${d.tool_name}(${d.args ? "..." : ""})`;

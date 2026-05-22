@@ -7,6 +7,7 @@ import {
   runAgent,
   runAgentSSE,
   runAgentWebhook,
+  verifyVersion,
 } from "./setup.js";
 
 describe("E2E: SSE Streaming", () => {
@@ -16,6 +17,9 @@ describe("E2E: SSE Streaming", () => {
     const ctx = createTestApp();
     app = ctx.app;
     await pushAgent(app);
+    // Pre-verify the version so tests reach the SSE / bundle-extraction
+    // path; the runtime gate is exercised in tests/e2e/verification.test.ts.
+    await verifyVersion(app);
   });
 
   it("sync mode still works without Accept header (backward compat — UAT-2)", async () => {
@@ -80,6 +84,7 @@ describe("E2E: Webhook", () => {
     const ctx = createTestApp();
     app = ctx.app;
     await pushAgent(app);
+    await verifyVersion(app);
   });
 
   it("invalid webhook URL returns 400 (EC-2)", async () => {

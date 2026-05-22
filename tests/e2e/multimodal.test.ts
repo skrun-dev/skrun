@@ -25,9 +25,12 @@ const FIXTURES = join(HERE, "..", "fixtures");
 
 describe("E2E: multimodal — Files API round-trip", () => {
   let app: ReturnType<typeof setup>["app"];
+  let db: ReturnType<typeof setup>["db"];
 
   beforeEach(() => {
-    app = setup().app;
+    const ctx = setup();
+    app = ctx.app;
+    db = ctx.db;
     inputCache.clear();
     _clearOutputCacheForTests();
     delete process.env.INPUT_FILES_MAX_SIZE_MB;
@@ -65,15 +68,17 @@ describe("E2E: multimodal — Files API round-trip", () => {
     expect(meta.media_type).toBe("image/jpeg");
     expect(meta.purpose).toBe("input");
 
-    // 2. GET /api/files/:id (metadata)
-    const metaRes = await app.request(`/api/files/${meta.file_id}`);
+    // 2. GET /api/files/:id (metadata) — auth required since audit/001
+    const metaRes = await app.request(`/api/files/${meta.file_id}`, { headers: devAuth });
     expect(metaRes.status).toBe(200);
     const metaBody = (await metaRes.json()) as { size: number; media_type: string };
     expect(metaBody.size).toBe(bytes.length);
     expect(metaBody.media_type).toBe("image/jpeg");
 
     // 3. GET /api/files/:id/content (binary)
-    const contentRes = await app.request(`/api/files/${meta.file_id}/content`);
+    const contentRes = await app.request(`/api/files/${meta.file_id}/content`, {
+      headers: devAuth,
+    });
     expect(contentRes.status).toBe(200);
     expect(contentRes.headers.get("Content-Type")).toBe("image/jpeg");
     const contentBytes = Buffer.from(await contentRes.arrayBuffer());
@@ -87,7 +92,7 @@ describe("E2E: multimodal — Files API round-trip", () => {
     expect(del.status).toBe(204);
 
     // 5. GET → 404
-    const after = await app.request(`/api/files/${meta.file_id}`);
+    const after = await app.request(`/api/files/${meta.file_id}`, { headers: devAuth });
     expect(after.status).toBe(404);
   });
 
@@ -134,6 +139,14 @@ describe("E2E: multimodal — Files API round-trip", () => {
   });
 
   it("output file retrievable via unified /api/files/:id/content (Task 6.5)", async () => {
+    // Lazily seed the dev-token user so the run.user_id ownership check
+    // (audit/001 SEC-002) finds a matching identity for the dev-auth caller.
+    await app.request("/api/me", { headers: devAuth });
+    const { createHash } = await import("node:crypto");
+    const devId = createHash("sha256").update("dev-token").digest("hex").slice(0, 16);
+    const devUser = await db.getUserByGithubId(`dev-${devId}`);
+    if (!devUser) throw new Error("dev user not seeded by middleware");
+
     // Simulate a completed run with an output dir. Use a temp dir (not the fixtures
     // dir) because output-cache's onEvict will rmSync the dir on cleanup.
     const tmpOutputDir = join(
@@ -144,16 +157,24 @@ describe("E2E: multimodal — Files API round-trip", () => {
     copyFileSync(join(FIXTURES, "sample-image.jpg"), join(tmpOutputDir, "sample-image.jpg"));
 
     const fileId = "fil_e2e_output_test_padding_to_32";
+    // Seed the run record so the file route's user_id ownership check passes.
+    await db.createRun({
+      id: "run_e2e_test",
+      agent_id: null,
+      agent_version: "1.0.0",
+      status: "completed",
+      user_id: devUser.id,
+    });
     registerOutput("run_e2e_test", tmpOutputDir, [
       { name: "sample-image.jpg", size: 30331, file_id: fileId },
     ]);
 
-    const meta = await app.request(`/api/files/${fileId}`);
+    const meta = await app.request(`/api/files/${fileId}`, { headers: devAuth });
     expect(meta.status).toBe(200);
     const metaBody = (await meta.json()) as { purpose: string };
     expect(metaBody.purpose).toBe("output");
 
-    const content = await app.request(`/api/files/${fileId}/content`);
+    const content = await app.request(`/api/files/${fileId}/content`, { headers: devAuth });
     expect(content.status).toBe(200);
     expect(content.headers.get("Content-Type")).toBe("image/jpeg");
 
@@ -185,7 +206,9 @@ describe("E2E: multimodal — Files API round-trip", () => {
   });
 
   it("returns 404 for unknown file_id", async () => {
-    const res = await app.request("/api/files/fil_does_not_exist_at_all_31_chars");
+    const res = await app.request("/api/files/fil_does_not_exist_at_all_31_chars", {
+      headers: devAuth,
+    });
     expect(res.status).toBe(404);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("FILE_NOT_FOUND");

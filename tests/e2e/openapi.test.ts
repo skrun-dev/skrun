@@ -20,7 +20,8 @@ describe("E2E: OpenAPI", () => {
     expect(paths).toContain("/api/agents/{namespace}/{name}/run");
     expect(paths).toContain("/api/agents/{namespace}/{name}/push");
     expect(paths).toContain("/api/agents");
-    expect(paths).toContain("/api/agents/{namespace}/{name}/verify");
+    // Per-version verify (legacy /verify removed in 7.7)
+    expect(paths).not.toContain("/api/agents/{namespace}/{name}/verify");
   });
 
   it("GET /docs returns HTML page", async () => {

@@ -152,14 +152,25 @@ describe("Files Routes — POST /api/files (input upload)", () => {
 
 describe("Files Routes — GET /api/files/:id (metadata + content)", () => {
   let app: ReturnType<typeof createTestApp>["app"];
+  let db: ReturnType<typeof createTestApp>["db"];
   const outputDirsToCleanup: string[] = [];
 
   beforeEach(() => {
     const ctx = createTestApp();
     app = ctx.app;
+    db = ctx.db;
     inputCache.clear();
     _clearOutputCacheForTests();
   });
+
+  // Discover the dev-token caller's user_id by making one authed call. Lets
+  // tests seed db rows owned by that synthetic user so the SEC-004 ownership
+  // checks resolve.
+  async function devUserId(): Promise<string> {
+    const res = await app.request("/api/me", { headers: authHeader });
+    const body = (await res.json()) as { id: string };
+    return body.id;
+  }
 
   afterEach(() => {
     inputCache.clear();
@@ -190,7 +201,7 @@ describe("Files Routes — GET /api/files/:id (metadata + content)", () => {
 
   it("VT-7: GET /api/files/:id returns metadata for an uploaded file", async () => {
     const { file_id, size } = await uploadFixture("image/jpeg");
-    const res = await app.request(`/api/files/${file_id}`);
+    const res = await app.request(`/api/files/${file_id}`, { headers: authHeader });
 
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -208,7 +219,7 @@ describe("Files Routes — GET /api/files/:id (metadata + content)", () => {
   });
 
   it("GET /api/files/:id returns 404 for unknown file_id", async () => {
-    const res = await app.request("/api/files/fil_does_not_exist");
+    const res = await app.request("/api/files/fil_does_not_exist", { headers: authHeader });
     expect(res.status).toBe(404);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("FILE_NOT_FOUND");
@@ -216,7 +227,7 @@ describe("Files Routes — GET /api/files/:id (metadata + content)", () => {
 
   it("GET /api/files/:id/content returns binary with correct Content-Type", async () => {
     const { file_id, size } = await uploadFixture("application/pdf");
-    const res = await app.request(`/api/files/${file_id}/content`);
+    const res = await app.request(`/api/files/${file_id}/content`, { headers: authHeader });
 
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("application/pdf");
@@ -226,14 +237,14 @@ describe("Files Routes — GET /api/files/:id (metadata + content)", () => {
   });
 
   it("GET /api/files/:id/content returns 404 for unknown file_id", async () => {
-    const res = await app.request("/api/files/fil_unknown/content");
+    const res = await app.request("/api/files/fil_unknown/content", { headers: authHeader });
     expect(res.status).toBe(404);
   });
 
   it("VT-9: DELETE /api/files/:id removes an input file (subsequent GET returns 404)", async () => {
     const { file_id } = await uploadFixture("image/jpeg");
 
-    const before = await app.request(`/api/files/${file_id}`);
+    const before = await app.request(`/api/files/${file_id}`, { headers: authHeader });
     expect(before.status).toBe(200);
 
     const del = await app.request(`/api/files/${file_id}`, {
@@ -242,7 +253,7 @@ describe("Files Routes — GET /api/files/:id (metadata + content)", () => {
     });
     expect(del.status).toBe(204);
 
-    const after = await app.request(`/api/files/${file_id}`);
+    const after = await app.request(`/api/files/${file_id}`, { headers: authHeader });
     expect(after.status).toBe(404);
   });
 
@@ -272,18 +283,27 @@ describe("Files Routes — GET /api/files/:id (metadata + content)", () => {
     writeFileSync(join(dir, filename), fileBytes);
     outputDirsToCleanup.push(dir);
 
+    const userId = await devUserId();
+    await db.createRun({
+      id: "run_test_1",
+      agent_id: null,
+      agent_version: "test/test@1.0.0",
+      user_id: userId,
+      status: "completed",
+    });
+
     const fileId = "fil_output_test_id_padding_to_32_chars";
     registerOutput("run_test_1", dir, [
       { name: filename, size: fileBytes.length, file_id: fileId },
     ]);
 
-    const meta = await app.request(`/api/files/${fileId}`);
+    const meta = await app.request(`/api/files/${fileId}`, { headers: authHeader });
     expect(meta.status).toBe(200);
     const metaBody = (await meta.json()) as { purpose: string; size: number };
     expect(metaBody.purpose).toBe("output");
     expect(metaBody.size).toBe(fileBytes.length);
 
-    const content = await app.request(`/api/files/${fileId}/content`);
+    const content = await app.request(`/api/files/${fileId}/content`, { headers: authHeader });
     expect(content.status).toBe(200);
     expect(content.headers.get("Content-Type")).toBe("application/pdf");
     const buf = await content.arrayBuffer();
@@ -312,6 +332,85 @@ describe("Files Routes — GET /api/files/:id (metadata + content)", () => {
     expect(body.error.code).toBe("DELETE_OUTPUT_FORBIDDEN");
   });
 
+  // VT-3 (SEC-004): file routes require authentication.
+  it("VT-3: GET /api/files/:id returns 401 without Authorization header", async () => {
+    const { file_id } = await uploadFixture("image/jpeg");
+    const res = await app.request(`/api/files/${file_id}`);
+    expect(res.status).toBe(401);
+  });
+
+  it("VT-3: GET /api/files/:id/content returns 401 without Authorization header", async () => {
+    const { file_id } = await uploadFixture("image/jpeg");
+    const res = await app.request(`/api/files/${file_id}/content`);
+    expect(res.status).toBe(401);
+  });
+
+  it("VT-3: GET /api/runs/:run_id/files/:filename returns 401 without auth", async () => {
+    const res = await app.request("/api/runs/run-x/files/whatever.txt");
+    expect(res.status).toBe(401);
+  });
+
+  // VT-4 (SEC-004): a caller authenticated as a different user gets 403 when
+  // probing a file they don't own.
+  it("VT-4: GET /api/files/:id returns 403 when caller is not the input owner", async () => {
+    const { file_id } = await uploadFixture("image/jpeg");
+    // Different token → different dev user id (deterministic SHA-256 of token).
+    const res = await app.request(`/api/files/${file_id}`, {
+      headers: { Authorization: "Bearer other-user" },
+    });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("FORBIDDEN");
+  });
+
+  it("VT-4: GET /api/files/:id/content returns 403 for non-owner output file", async () => {
+    const dir = join(
+      tmpdir(),
+      `skrun-output-vt4-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "report.pdf"), Buffer.from("output"));
+    outputDirsToCleanup.push(dir);
+
+    // Run owned by "user-A" (a synthetic user id, not the dev caller)
+    await db.createUser({ github_id: "gh-user-A", username: "user-A" });
+    const owner = await db.getUserByGithubId("gh-user-A");
+    if (!owner) throw new Error("seed user-A missing");
+    await db.createRun({
+      id: "run_vt4",
+      agent_id: null,
+      agent_version: "x/y@1.0.0",
+      user_id: owner.id,
+      status: "completed",
+    });
+
+    const fileId = "fil_vt4_output_padding_to_32chars";
+    registerOutput("run_vt4", dir, [{ name: "report.pdf", size: 6, file_id: fileId }]);
+
+    // dev-token caller (a different user) attempts to read.
+    const res = await app.request(`/api/files/${fileId}/content`, { headers: authHeader });
+    expect(res.status).toBe(403);
+  });
+
+  it("VT-4: GET /api/runs/:run_id/files/:filename returns 403 when caller is not the run owner", async () => {
+    await db.createUser({ github_id: "gh-other-2", username: "other-2" });
+    const owner = await db.getUserByGithubId("gh-other-2");
+    if (!owner) throw new Error("seed other-2 missing");
+    await db.createRun({
+      id: "run_vt4_runfile",
+      agent_id: null,
+      agent_version: "x/y@1.0.0",
+      user_id: owner.id,
+      status: "completed",
+    });
+
+    // dev-token caller tries to read.
+    const res = await app.request("/api/runs/run_vt4_runfile/files/anything.txt", {
+      headers: authHeader,
+    });
+    expect(res.status).toBe(403);
+  });
+
   it("VT-8: GET /api/files/:id returns 404 after the file has been evicted from cache", async () => {
     // Simplified from spec's 410: without a tombstone index, we can't differentiate
     // "never existed" from "expired". Both surface as 404. The contract preserved is
@@ -320,13 +419,13 @@ describe("Files Routes — GET /api/files/:id (metadata + content)", () => {
     const { file_id } = await uploadFixture("image/jpeg");
 
     // Verify present
-    const before = await app.request(`/api/files/${file_id}`);
+    const before = await app.request(`/api/files/${file_id}`, { headers: authHeader });
     expect(before.status).toBe(200);
 
     // Manually evict
     inputCache.delete(file_id);
 
-    const after = await app.request(`/api/files/${file_id}`);
+    const after = await app.request(`/api/files/${file_id}`, { headers: authHeader });
     expect(after.status).toBe(404);
   });
 });

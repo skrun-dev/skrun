@@ -62,6 +62,32 @@ async function decompressGzip(buffer: Buffer): Promise<Buffer> {
   });
 }
 
+/**
+ * Format the error printed to stderr when `skrun pull` fails. On a 404
+ * response, prints a 3-cause hint — intentionally NOT
+ * confirming or denying the agent's existence. The server returns 404
+ * indistinguishably for both genuine-not-found and ownership-not-allowed
+ * cases (multi-tenant filter), so the CLI must respect the same opacity.
+ *
+ * Exported separately to make the message contract testable without
+ * driving the full Commander action.
+ */
+export function formatPullErrorMessage(err: unknown, agentRef: string): string {
+  if (err instanceof Error) {
+    const e = err as Error & { status?: number; code?: string };
+    if (e.status === 404 || e.code === "NOT_FOUND") {
+      return [
+        `Agent '${agentRef}' not found. Possible causes:`,
+        "  1. Typo in the agent name",
+        "  2. You're not logged in with the namespace-owning account — run `skrun whoami` to check",
+        "  3. The agent doesn't exist",
+      ].join("\n");
+    }
+    return e.message;
+  }
+  return String(err);
+}
+
 export function registerPullCommand(program: Command): void {
   program
     .command("pull <agent>")
@@ -89,7 +115,7 @@ export function registerPullCommand(program: Command): void {
       try {
         bundle = await client.pull(namespace, name, version);
       } catch (err) {
-        format.error(err instanceof Error ? err.message : String(err));
+        format.error(formatPullErrorMessage(err, `${namespace}/${name}`));
         process.exit(1);
       }
 

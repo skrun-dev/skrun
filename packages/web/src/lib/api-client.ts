@@ -60,7 +60,13 @@ export interface Agent {
   namespace: string;
   description: string;
   owner_id: string;
-  verified: boolean;
+  /**
+   * Verified state of the latest version (by push time). Drives the listing
+   * badge. Computed by the registry service from `agent_versions.verified`
+   * of the most recently pushed version. False when the agent has no
+   * versions.
+   */
+  latest_version_verified: boolean;
   created_at: string;
   updated_at: string;
   run_count: number;
@@ -78,6 +84,11 @@ export interface AgentVersion {
   pushed_at: string;
   config_snapshot?: Record<string, unknown>;
   notes: string | null;
+  /**
+   * Per-version verified state. Drives the per-row badge + Verify/Unverify
+   * action button in the versions table on agent-detail.
+   */
+  verified: boolean;
 }
 
 export interface Run {
@@ -104,6 +115,13 @@ export interface Run {
   usage_cache_savings_usd: number;
   model: string | null;
   duration_ms: number | null;
+  /**
+   * Files produced by the run, persisted at completion. Each entry mirrors
+   * the SSE `run_complete.files[]` payload: `{name, size, url?, file_id?}`.
+   * Consumed by the `FilesBlock` UI component to render download links.
+   * Null for runs with no output files or for failed runs.
+   */
+  files: Array<{ name: string; size: number; url?: string; file_id?: string }> | null;
   created_at: string;
   completed_at: string | null;
 }
@@ -207,6 +225,24 @@ async function apiFetchRaw(path: string, options?: RequestInit): Promise<Respons
 }
 
 // --- Query Hooks ---
+
+export interface MeResponse {
+  id: string;
+  username: string;
+  namespace: string;
+  email?: string | null;
+  avatar_url?: string | null;
+  plan: string;
+  role: "admin" | "user";
+}
+
+export function useMe() {
+  return useQuery<MeResponse>({
+    queryKey: ["me"],
+    queryFn: () => apiFetch("/me"),
+    staleTime: 5 * 60_000, // identity is stable across a session
+  });
+}
 
 export function useStats() {
   return useQuery<Stats>({
@@ -322,25 +358,37 @@ export function useDeleteAgent() {
   });
 }
 
-export function useVerifyAgent() {
+/**
+ * Per-version verify mutation. Calls the new
+ * `PATCH /api/agents/:ns/:name/versions/:version/verify` endpoint (admin only
+ * — non-admin callers receive 403 from the server). Invalidates the three
+ * query keys that source the dashboard surfaces affected by a verify flip:
+ * single-agent metadata, the versions table, and the listing badge stat.
+ */
+export function useVerifyVersion() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({
       namespace,
       name,
+      version,
       verified,
     }: {
       namespace: string;
       name: string;
+      version: string;
       verified: boolean;
     }) =>
-      apiFetch(`/agents/${namespace}/${name}/verify`, {
+      apiFetch(`/agents/${namespace}/${name}/versions/${version}/verify`, {
         method: "PATCH",
         body: JSON.stringify({ verified }),
       }),
-    onSuccess: () => {
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["agent", variables.namespace, variables.name] });
+      queryClient.invalidateQueries({
+        queryKey: ["agent-versions", variables.namespace, variables.name],
+      });
       queryClient.invalidateQueries({ queryKey: ["agents"] });
-      queryClient.invalidateQueries({ queryKey: ["agent"] });
     },
   });
 }

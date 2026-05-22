@@ -50,7 +50,7 @@ describe("EXCLUDE_PATTERNS", () => {
 describe("collectFiles — manifest packaging (SC-6)", () => {
   it("includes package.json + package-lock.json", async () => {
     writeIn("SKILL.md", "# x");
-    writeIn("agent.yaml", "name: dev/x");
+    writeIn("agent.yaml", "name: x-fixture");
     writeIn("package.json", '{"name":"x"}');
     writeIn("package-lock.json", '{"lockfileVersion":3}');
     const files = await collectFiles(bundle);
@@ -60,7 +60,7 @@ describe("collectFiles — manifest packaging (SC-6)", () => {
 
   it("includes requirements.txt", async () => {
     writeIn("SKILL.md", "# x");
-    writeIn("agent.yaml", "name: dev/x");
+    writeIn("agent.yaml", "name: x-fixture");
     writeIn("requirements.txt", "pandas==2.2.3\n");
     const files = await collectFiles(bundle);
     expect(files).toContain("requirements.txt");
@@ -68,7 +68,7 @@ describe("collectFiles — manifest packaging (SC-6)", () => {
 
   it("includes pyproject.toml + uv.lock", async () => {
     writeIn("SKILL.md", "# x");
-    writeIn("agent.yaml", "name: dev/x");
+    writeIn("agent.yaml", "name: x-fixture");
     writeIn("pyproject.toml", '[project]\nname = "x"\n');
     writeIn("uv.lock", "version = 1\n");
     const files = await collectFiles(bundle);
@@ -78,7 +78,7 @@ describe("collectFiles — manifest packaging (SC-6)", () => {
 
   it("includes pnpm-lock.yaml and yarn.lock when present", async () => {
     writeIn("SKILL.md", "# x");
-    writeIn("agent.yaml", "name: dev/x");
+    writeIn("agent.yaml", "name: x-fixture");
     writeIn("package.json", '{"name":"x"}');
     writeIn("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
     writeIn("yarn.lock", "# yarn lockfile v1\n");
@@ -91,7 +91,7 @@ describe("collectFiles — manifest packaging (SC-6)", () => {
 describe("collectFiles — deps directories excluded (SC-5)", () => {
   it("excludes node_modules/", async () => {
     writeIn("SKILL.md", "# x");
-    writeIn("agent.yaml", "name: dev/x");
+    writeIn("agent.yaml", "name: x-fixture");
     writeIn("package.json", '{"name":"x"}');
     writeIn("node_modules/jszip/package.json", '{"name":"jszip"}');
     writeIn("node_modules/jszip/index.js", "module.exports = {};");
@@ -102,7 +102,7 @@ describe("collectFiles — deps directories excluded (SC-5)", () => {
 
   it("excludes venv/ (Unix-style Python venv)", async () => {
     writeIn("SKILL.md", "# x");
-    writeIn("agent.yaml", "name: dev/x");
+    writeIn("agent.yaml", "name: x-fixture");
     writeIn("requirements.txt", "pandas\n");
     writeIn("venv/bin/python", "#!/usr/bin/env python3");
     writeIn("venv/lib/python3.11/site-packages/pandas/__init__.py", "");
@@ -113,7 +113,7 @@ describe("collectFiles — deps directories excluded (SC-5)", () => {
 
   it("excludes .venv/ (alternative Python venv naming)", async () => {
     writeIn("SKILL.md", "# x");
-    writeIn("agent.yaml", "name: dev/x");
+    writeIn("agent.yaml", "name: x-fixture");
     writeIn("pyproject.toml", "[project]\nname = 'x'\n");
     writeIn(".venv/bin/python", "");
     writeIn(".venv/Lib/site-packages/numpy/__init__.py", "");
@@ -124,7 +124,7 @@ describe("collectFiles — deps directories excluded (SC-5)", () => {
 
   it("excludes __pycache__/ and .pytest_cache/", async () => {
     writeIn("SKILL.md", "# x");
-    writeIn("agent.yaml", "name: dev/x");
+    writeIn("agent.yaml", "name: x-fixture");
     writeIn("scripts/util.py", "import os\n");
     writeIn("scripts/__pycache__/util.cpython-311.pyc", "compiled-bytecode");
     writeIn(".pytest_cache/v/cache/lastfailed", "{}");
@@ -137,7 +137,7 @@ describe("collectFiles — deps directories excluded (SC-5)", () => {
 
   it("preserves scripts/ contents while excluding caches inside it", async () => {
     writeIn("SKILL.md", "# x");
-    writeIn("agent.yaml", "name: dev/x");
+    writeIn("agent.yaml", "name: x-fixture");
     writeIn("requirements.txt", "pandas\n");
     writeIn("scripts/process.py", "import pandas as pd\n");
     writeIn("scripts/helpers.py", "def x(): pass\n");

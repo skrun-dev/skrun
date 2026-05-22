@@ -1,4 +1,4 @@
-name: dev/adr-writer
+name: adr-writer
 version: 0.2.0
 
 model:

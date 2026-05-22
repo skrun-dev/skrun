@@ -17,6 +17,11 @@ export interface InputFileMetadata {
   media_type: string;
   purpose: "input";
   expires_at: Date;
+  /**
+   * id of the user who uploaded the file via POST /api/files. Read by the
+   * GET /files/:id and /content routes to refuse cross-tenant reads.
+   */
+  owner_id: string;
 }
 
 /** Tracks file_id → InputFileMetadata for serving + TTL cleanup of input uploads. */

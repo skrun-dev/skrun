@@ -20,8 +20,9 @@ import {
   useAgentVersions,
   useDeleteAgent,
   useRecentRuns,
-  useVerifyAgent,
+  useVerifyVersion,
 } from "../lib/api-client";
+import { useAuth } from "../lib/auth";
 import { computeDeltaPercent as deltaPct, formatUsd } from "../lib/format";
 
 /**
@@ -54,9 +55,19 @@ export function AgentDetailPage() {
   const { data: versions } = useAgentVersions(namespace, name);
   const { data: agentStats } = useAgentStats(namespace, name, statsDays);
   const { data: allRuns } = useRecentRuns(undefined, 50);
-  const verifyAgent = useVerifyAgent();
+  const verifyVersion = useVerifyVersion();
   const deleteAgent = useDeleteAgent();
   const [deleteOpen, setDeleteOpen] = useState(false);
+  // PATCH /verify is admin-only (server-enforced). The dashboard hides the
+  // button entirely for non-admin viewers — server would return 403 anyway,
+  // but no point teasing a control they can't use. `role` is optional on
+  // AuthUser; treat missing as 'user' (least-privilege).
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
+  // Delete button: namespace owner OR admin (admin override for moderation
+  // of squatter/abusive agents in other namespaces). Server enforces the
+  // same rule — the UI just hides the action when the caller can't use it.
+  const canDelete = user?.namespace === namespace || isAdmin;
 
   const agentPrefix = `${namespace}/${name}`;
   const runs = useMemo(() => {
@@ -118,15 +129,6 @@ export function AgentDetailPage() {
           </span>
         }
         description={agent.description || "No description"}
-        meta={
-          agent.verified ? (
-            <Pill tone="sky" dot>
-              verified
-            </Pill>
-          ) : (
-            <Pill tone="neutral">unverified</Pill>
-          )
-        }
       >
         <Btn
           variant="ghost"
@@ -361,10 +363,33 @@ export function AgentDetailPage() {
                           {v.version}
                         </span>
                         {i === 0 && <Pill tone="emerald">current</Pill>}
+                        <Pill tone={v.verified ? "sky" : "amber"} dot>
+                          <span className="sr-only">
+                            {v.verified ? "Verified by admin" : "Awaiting admin verification"}
+                          </span>
+                          <span aria-hidden="true">{v.verified ? "verified" : "unverified"}</span>
+                        </Pill>
                         <span className="flex-1" />
                         <span className="text-[10.5px] text-gray-400 dark:text-gray-600">
                           {formatDate(v.pushed_at)}
                         </span>
+                        {isAdmin && (
+                          <Btn
+                            variant="ghost"
+                            size="sm"
+                            disabled={verifyVersion.isPending}
+                            onClick={() =>
+                              verifyVersion.mutate({
+                                namespace: namespace,
+                                name: name,
+                                version: v.version,
+                                verified: !v.verified,
+                              })
+                            }
+                          >
+                            {v.verified ? "Unverify" : "Verify"}
+                          </Btn>
+                        )}
                       </div>
                       {v.notes && (
                         <div
@@ -440,23 +465,10 @@ export function AgentDetailPage() {
             </dl>
           </Card>
 
-          {/* Danger zone */}
-          <Card title="Danger zone">
-            <div className="space-y-2">
-              <Btn
-                variant="secondary"
-                size="sm"
-                className="w-full justify-center"
-                onClick={() =>
-                  verifyAgent.mutate({
-                    namespace: namespace,
-                    name: name,
-                    verified: !agent.verified,
-                  })
-                }
-              >
-                {agent.verified ? "Unverify" : "Verify"}
-              </Btn>
+          {/* Danger zone — verify/unverify is per-version now (see versions
+              table above); Danger zone is delete-only. */}
+          {canDelete && (
+            <Card title="Danger zone">
               <Btn
                 variant="danger"
                 size="sm"
@@ -465,8 +477,8 @@ export function AgentDetailPage() {
               >
                 Delete agent
               </Btn>
-            </div>
-          </Card>
+            </Card>
+          )}
         </div>
       </div>
 

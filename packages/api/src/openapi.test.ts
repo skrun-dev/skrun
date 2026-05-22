@@ -8,7 +8,7 @@ describe("OpenAPI Schema", () => {
     expect(schema.openapi).toBe("3.1.0");
   });
 
-  it("has all 10 endpoint paths", () => {
+  it("has all expected endpoint paths", () => {
     const paths = Object.keys(schema.paths);
     expect(paths).toContain("/health");
     expect(paths).toContain("/api/agents/{namespace}/{name}/run");
@@ -19,7 +19,10 @@ describe("OpenAPI Schema", () => {
     expect(paths).toContain("/api/agents/{namespace}/{name}");
     expect(paths).toContain("/api/agents/{namespace}/{name}/versions");
     expect(paths).toContain("/api/agents/{namespace}/{name}/versions/{version}");
-    expect(paths).toContain("/api/agents/{namespace}/{name}/verify");
+    // Per-version verify route replaces the legacy agent-level
+    // `/agents/:ns/:name/verify`. Listed once below; the legacy path is
+    // absent from the schema.
+    expect(paths).not.toContain("/api/agents/{namespace}/{name}/verify");
   });
 
   // --- deleteAgentVersion (#77) ---
@@ -166,5 +169,65 @@ describe("OpenAPI Schema", () => {
     expect(agentStatsProps.prev_cache_savings?.type).toBe("number");
     expect(agentStatsProps.daily_cache_savings?.type).toBe("array");
     expect(agentStatsProps.daily_cache_savings?.items?.type).toBe("number");
+  });
+
+  // VT-18 (#80): the 5 registry GET endpoints inherit the global bearerAuth
+  // security (no `security: []` override), declare 401 + 404 responses, and
+  // explicitly do NOT declare a 403 (opacity is intentional — non-owner reads
+  // get the 404 path, not a 403). OpenAPI version stays at 0.8.0 — #83 already
+  // moved 0.7.0 → 0.8.0 and #80 bundles into the still-unreleased v0.8.0.
+  it("VT-18 (#80): 5 GET endpoints — security + 401/404 + NO 403 + version 0.8.0", () => {
+    // The 5 per-agent GET endpoints — all gated by `assertAgentVisibleOrThrow`,
+    // all return 404 opaque on non-owner. The list endpoint at /api/agents
+    // is checked separately below since it has no 404 (filters return [] for
+    // new users with no agents, not a 404).
+    const perAgentTargets = [
+      { path: "/api/agents/{namespace}/{name}", op: "getAgent" },
+      { path: "/api/agents/{namespace}/{name}/versions", op: "getAgentVersions" },
+      { path: "/api/agents/{namespace}/{name}/pull", op: "pullAgent" },
+      { path: "/api/agents/{namespace}/{name}/pull/{version}", op: "pullAgentVersion" },
+      { path: "/api/agents/{namespace}/{name}/stats", op: "getAgentStats" },
+    ];
+
+    // OpenAPI version stays at 0.8.0 (Q-7)
+    expect(schema.info.version).toBe("0.8.0");
+
+    // Global security IS bearerAuth (so endpoints without an override inherit it)
+    expect(schema.security).toEqual([{ bearerAuth: [] }]);
+
+    // List endpoint: auth required (no `security: []` override) + 401, but
+    // no 404 (empty filtered list returns 200 with `agents: [], total: 0`).
+    const listRoute = schema.paths["/api/agents"].get;
+    expect(listRoute.operationId).toBe("listAgents");
+    expect(listRoute.security).toBeUndefined();
+    expect(listRoute.responses["401"]).toBeDefined();
+    expect(listRoute.responses["403"]).toBeUndefined();
+    expect(listRoute.responses["404"]).toBeUndefined();
+
+    for (const { path, op } of perAgentTargets) {
+      const route = schema.paths[path].get;
+      expect(route.operationId).toBe(op);
+
+      // No security override — inherits global bearerAuth
+      // (presence of `security: []` here would mean "no auth required" per OpenAPI 3.1)
+      expect(route.security).toBeUndefined();
+
+      // 401 response declared
+      expect(route.responses["401"]).toBeDefined();
+      expect(route.responses["401"].content["application/json"].schema.$ref).toBe(
+        "#/components/schemas/ErrorResponse",
+      );
+
+      // 404 response declared with description NOT mentioning permissions/visibility
+      expect(route.responses["404"]).toBeDefined();
+      const fourOhFourDescription: string = route.responses["404"].description;
+      expect(fourOhFourDescription).toMatch(/not found/i);
+      expect(fourOhFourDescription).not.toMatch(/permission|forbidden|access denied|private/i);
+
+      // CRITICAL: NO 403 response on these per-agent GET routes — opacity is
+      // by design. Read/write split: writes (DELETE, PATCH /verify) use 403
+      // explicit; reads (these 5) use 404 opaque.
+      expect(route.responses["403"]).toBeUndefined();
+    }
   });
 });

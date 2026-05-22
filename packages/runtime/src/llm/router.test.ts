@@ -119,7 +119,7 @@ describe("LLMRouter", () => {
       undefined,
       // agentContext IS provided — proves cacheKey is computed but Mistral
       // adapter's skipCaching path correctly suppresses it.
-      { name: "acme/foo", version: "1.0.0", environmentId: "prod" },
+      { name: "foo", version: "1.0.0", environmentId: "prod" },
     );
 
     // Provider received cacheKey (proves router threading works).
@@ -160,7 +160,7 @@ describe("LLMRouter", () => {
       undefined,
       undefined,
       undefined,
-      { name: "acme/foo", version: "1.0.0", environmentId: "prod" },
+      { name: "foo", version: "1.0.0", environmentId: "prod" },
     );
 
     expect(result.usage.cacheReadTokens).toBe(8000);

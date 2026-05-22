@@ -257,7 +257,7 @@ describe("SkillFrontmatterSchema", () => {
 
 describe("AgentConfigSchema", () => {
   const validConfig = {
-    name: "acme/seo-audit",
+    name: "seo-audit",
     version: "1.0.0",
     model: { provider: "anthropic", name: "claude-sonnet-4-20250514" },
     inputs: [{ name: "website_url", type: "string" }],
@@ -266,7 +266,7 @@ describe("AgentConfigSchema", () => {
 
   it("should validate a minimal valid config", () => {
     const result = AgentConfigSchema.parse(validConfig);
-    expect(result.name).toBe("acme/seo-audit");
+    expect(result.name).toBe("seo-audit");
     expect(result.tools).toEqual([]);
     expect(result.environment.filesystem).toBe("read-only");
     expect(result.environment.timeout).toBe("300s");
@@ -342,8 +342,14 @@ describe("AgentConfigSchema", () => {
     expect(result.context_mode).toBe("persistent");
   });
 
-  it("should reject invalid name format", () => {
-    expect(() => AgentConfigSchema.parse({ ...validConfig, name: "no-namespace" })).toThrow();
+  it("should reject legacy namespace/slug name format (post-#84)", () => {
+    // Pre-#84 this asserted that names lacking a `/` were rejected. Post-#84
+    // (clean break to slug-only) the assertion flips: names WITH a `/` are now
+    // the rejected legacy form, and bare slugs like "no-namespace" are valid.
+    expect(() => AgentConfigSchema.parse({ ...validConfig, name: "acme/foo" })).toThrow();
+    expect(AgentConfigSchema.parse({ ...validConfig, name: "no-namespace" }).name).toBe(
+      "no-namespace",
+    );
   });
 
   it("should reject invalid version format", () => {

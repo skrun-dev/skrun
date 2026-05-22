@@ -30,7 +30,6 @@ export class MemoryDb implements DbAdapter {
     const agent: Agent = {
       id: randomUUID(),
       ...data,
-      verified: false,
       created_at: now,
       updated_at: now,
     };
@@ -43,14 +42,13 @@ export class MemoryDb implements DbAdapter {
     return this.agents.get(this.agentKey(namespace, name)) ?? null;
   }
 
-  async listAgents(
-    page: number,
-    limit: number,
-  ): Promise<{
+  async listAgents(opts: { page: number; limit: number; userId?: string }): Promise<{
     agents: (Agent & { run_count: number; token_count: number; cost_total: number })[];
     total: number;
   }> {
+    const { page, limit, userId } = opts;
     const all = [...this.agents.values()];
+    const filtered = userId ? all.filter((a) => a.owner_id === userId) : all;
     const start = (page - 1) * limit;
 
     // Compute per-agent run_count, token_count, cost_total
@@ -64,7 +62,7 @@ export class MemoryDb implements DbAdapter {
       agentCounts.set(run.agent_id, counts);
     }
 
-    const agents = all.slice(start, start + limit).map((agent) => {
+    const agents = filtered.slice(start, start + limit).map((agent) => {
       const counts = agentCounts.get(agent.id) ?? { runs: 0, tokens: 0, cost: 0 };
       return {
         ...agent,
@@ -74,15 +72,23 @@ export class MemoryDb implements DbAdapter {
       };
     });
 
-    return { agents, total: all.length };
+    return { agents, total: filtered.length };
   }
 
-  async setVerified(namespace: string, name: string, verified: boolean): Promise<Agent | null> {
+  async setVersionVerified(
+    namespace: string,
+    name: string,
+    version: string,
+    verified: boolean,
+  ): Promise<AgentVersion | null> {
     const agent = await this.getAgent(namespace, name);
     if (!agent) return null;
-    agent.verified = verified;
-    agent.updated_at = new Date().toISOString();
-    return agent;
+    const versions = this.versions.get(agent.id);
+    if (!versions) return null;
+    const target = versions.find((v) => v.version === version);
+    if (!target) return null;
+    target.verified = verified;
+    return target;
   }
 
   async deleteAgent(namespace: string, name: string): Promise<boolean> {
@@ -115,6 +121,7 @@ export class MemoryDb implements DbAdapter {
       config_snapshot: data.config_snapshot,
       notes: data.notes ?? null,
       pushed_at: new Date().toISOString(),
+      verified: false,
     };
     const versions = this.versions.get(agentId) ?? [];
     versions.push(version);
@@ -192,6 +199,7 @@ export class MemoryDb implements DbAdapter {
       email: data.email ?? "",
       avatar_url: data.avatar_url ?? "",
       plan: "free",
+      role: "user",
       created_at: now,
       updated_at: now,
     };

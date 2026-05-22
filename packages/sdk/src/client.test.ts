@@ -366,14 +366,86 @@ describe("SkrunClient", () => {
     expect(url).toContain("limit=10");
   });
 
+  // VT-22 (#80): list / getAgent / getVersions must send the Authorization
+  // header. Pre-#80 the endpoints were public so these methods worked
+  // without it; once the multi-tenant filter lands, an anonymous fetch
+  // would silently 401. Asserting the header is sent locks the contract.
+  it("VT-22 (#80): list() sends Authorization header", async () => {
+    globalThis.fetch = mockFetchJson({ agents: [], total: 0, page: 1, limit: 20 });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+    await client.list();
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("VT-22b (#80): getAgent() sends Authorization header", async () => {
+    globalThis.fetch = mockFetchJson({
+      name: "x",
+      namespace: "y",
+      latest_version_verified: false,
+      latest_version: "1.0.0",
+    });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+    await client.getAgent("y/x");
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("VT-22c (#80): getVersions() sends Authorization header", async () => {
+    globalThis.fetch = mockFetchJson({ versions: ["1.0.0", "2.0.0"] });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+    await client.getVersions("y/x");
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  // VT-22d (#80): list() returns { agents: [], total: 0 } cleanly for a
+  // user who owns no agents (new OAuth sign-up scenario). Must NOT throw.
+  it("VT-22d (#80): list() returns clean empty result for a user with 0 owned agents", async () => {
+    globalThis.fetch = mockFetchJson({ agents: [], total: 0, page: 1, limit: 20 });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+    const result = await client.list();
+    expect(result.agents).toEqual([]);
+    expect(result.total).toBe(0);
+  });
+
+  // VT-22e (#80): 404 propagates as SkrunApiError with code === 'NOT_FOUND'.
+  // The fromResponse dispatch table (shipped earlier) already handles this
+  // generically — no typed SkrunNotFoundError subclass needed (Q-9).
+  it("VT-22e (#80): getAgent() propagates 404 as SkrunApiError(code='NOT_FOUND')", async () => {
+    globalThis.fetch = mockFetchError(
+      { code: "NOT_FOUND", message: "Agent other/foo not found" },
+      404,
+    );
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+    // Single call — a Response body can only be read once, so we can't both
+    // .rejects.toBeInstanceOf(...) AND inspect the thrown error from a
+    // second call against the same mock.
+    let thrown: unknown;
+    try {
+      await client.getAgent("other/foo");
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(SkrunApiError);
+    const err = thrown as SkrunApiError;
+    expect(err.code).toBe("NOT_FOUND");
+    expect(err.status).toBe(404);
+  });
+
   it("getAgent() returns metadata", async () => {
-    const meta = { name: "agent", namespace: "dev", verified: true, latest_version: "1.0.0" };
+    const meta = {
+      name: "agent",
+      namespace: "dev",
+      latest_version_verified: true,
+      latest_version: "1.0.0",
+    };
     globalThis.fetch = mockFetchJson(meta);
     const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
 
     const result = await client.getAgent("dev/agent");
 
-    expect(result.verified).toBe(true);
+    expect(result.latest_version_verified).toBe(true);
     const [url] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(url).toBe(`${BASE_URL}/api/agents/dev/agent`);
   });
@@ -387,14 +459,14 @@ describe("SkrunClient", () => {
     expect(versions).toEqual(["1.0.0", "1.1.0"]);
   });
 
-  it("verify() sends PATCH with verified flag", async () => {
-    globalThis.fetch = mockFetchJson({ name: "agent", verified: true });
+  it("verifyVersion() sends PATCH to per-version endpoint with verified flag", async () => {
+    globalThis.fetch = mockFetchJson({ version: "1.0.0", verified: true });
     const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
 
-    await client.verify("dev/agent", true);
+    await client.verifyVersion("dev/agent", "1.0.0", true);
 
     const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(url).toContain("/verify");
+    expect(url).toContain("/agents/dev/agent/versions/1.0.0/verify");
     expect(init.method).toBe("PATCH");
     expect(JSON.parse(init.body)).toEqual({ verified: true });
   });

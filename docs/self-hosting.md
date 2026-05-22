@@ -112,7 +112,7 @@ Skrun auto-detects the auth mode based on environment variables.
 
 ### Mode 1: Dev-token (local dev, never production)
 
-If no OAuth env vars are set, the registry accepts a simple `dev-token`. All agents live in the `dev` namespace. This is zero-friction for local dev but has no user isolation — never expose publicly.
+If no OAuth env vars are set, the registry accepts a simple `dev-token`. All agents live in the `dev` namespace — this prefix is **assigned by the registry at push time**, not declared in `agent.yaml`. The bundle's yaml only carries the slug (e.g., `name: email-drafter`); the registry stamps `dev` onto it on `skrun push`. Zero-friction for local dev but has no user isolation — never expose publicly.
 
 ```bash
 # .env
@@ -137,7 +137,7 @@ For real users with isolated namespaces:
    GITHUB_CLIENT_SECRET=your_client_secret
    ```
 
-3. Restart the registry. Users visit `/login`, click "Sign in with GitHub", and their username becomes their namespace (e.g., `alice`).
+3. Restart the registry. Users visit `/login`, click "Sign in with GitHub", and their username becomes their namespace (e.g., `alice`). The same `agent.yaml` (slug-only `name`) pushed under different OAuth users lands under different namespaces — no per-environment yaml edits needed.
 
 ### Mode 3: API keys (programmatic)
 
@@ -156,6 +156,75 @@ skrun login --token sk_live_abc...
 ```
 
 Keys use the prefix `sk_live_` + 32 hex chars. They're stored as SHA-256 hashes — the server never sees the raw key after creation. Revoke via the dashboard or `DELETE /api/keys/:id`.
+
+### Admin role
+
+Every `users` row carries a `role` column (`admin` or `user`, defaults to `user`). Admin-gated routes:
+
+- `PATCH /api/agents/:ns/:name/versions/:version/verify` — flip a version's verified flag (the runtime gate consumes this).
+- `DELETE /api/agents/:ns/:name` and `DELETE /api/agents/:ns/:name/versions/:version` — namespace owner OR admin (admin can delete any agent/version across namespaces, for moderation).
+
+Promotion to admin is a **manual SQL update** — there is no HTTP endpoint for role elevation by design. Pick the operator(s) you trust to mint the verified trust signal and promote them once:
+
+```bash
+# SQLite (default)
+sqlite3 skrun.db "UPDATE users SET role='admin' WHERE username='you'"
+
+# Postgres
+psql $DATABASE_URL -c "UPDATE users SET role='admin' WHERE username='you';"
+```
+
+In `dev-token` mode (OAuth not configured), the caller is granted admin role automatically — local-dev workflows need no extra setup.
+
+### Multi-tenancy
+
+When a Skrun registry has more than one user (OAuth deployments), each user only sees the agents they own when listing, fetching metadata, downloading bundles, or reading per-agent stats. Cross-tenant **invocation** (`POST /run`) remains open — that's the marketplace pattern (any caller can run any verified agent). Only **reads** are filtered.
+
+#### How the filter behaves per auth mode
+
+| Mode | `user.id` source | `user.role` | List behavior | Per-agent reads |
+|------|------------------|-------------|---------------|-----------------|
+| **dev-token** (OAuth not configured, single-tenant self-host) | derived from token, persistent across restarts | `"admin"` (auto-granted) | instance-wide (no filter) | full access (admin bypass) |
+| **OAuth GitHub session** | `users.id` from DB | `users.role` (default `"user"`) | filtered to own `owner_id` (or instance-wide if admin) | non-owner gets `404 NOT_FOUND` (opaque) |
+| **`sk_live_*` API key** | `apiKeys.user_id` → `users.id` | inherits the owning user's role | same as the owning user | same as the owning user |
+
+The `dev-token` row is what makes the self-host experience seamless: in single-user dev/test, you're the operator AND the only user, so the auto-admin role means the filter doesn't narrow anything. You see all agents in the dashboard and CLI as before.
+
+The OAuth row is what activates the actual filter: a non-admin user pushing to `alice/foo` won't see `bob/bar` in their dashboard list, can't `skrun pull bob/bar`, and `GET /api/agents/bob/bar` returns `404 NOT_FOUND` with a body identical to a genuine "agent not found" response.
+
+#### Why the opaque 404 (not a 403)
+
+Read endpoints return `404 NOT_FOUND` rather than `403 FORBIDDEN` on a cross-tenant access attempt. The two response bodies are byte-identical to a "the agent really doesn't exist" 404 — a caller cannot distinguish whether the namespace contains an agent of that name. This is the GitHub Private Repo / Stripe API / Linear pattern: the namespace itself (your GitHub username) is public, but the slugs you push under it may carry strategic signal — exposing existence via a 403 would let a competitor probe your namespace for telltale agent names.
+
+Write endpoints (`DELETE /api/agents/...`, `PATCH /api/agents/.../verify`) keep `403 FORBIDDEN` — when a user is performing an action, they need to know why it failed so they can switch accounts or contact an admin.
+
+#### Promoting an operator to admin (multi-tenant ops)
+
+Admins bypass the read filter — useful when you need to inspect or moderate agents across all namespaces from a single account. Promote via the same SQL pattern as the verification gate:
+
+```bash
+sqlite3 skrun.db "UPDATE users SET role='admin' WHERE username='ops-account'"
+```
+
+The promoted user's session/API key then sees all agents instance-wide.
+
+#### Verification lifecycle
+
+Verification is **per version** of an agent. Every push creates a new version with `verified=false`; an admin then runs `skrun verify <ns>/<name>@<version>` (or hits the PATCH endpoint) to make that version runnable. The runtime gate on `POST /run` returns `403 AGENT_NOT_VERIFIED` for any version whose flag is `false`. Pinned callers on prior verified versions are unaffected by newer pushes — pushing a v1.1.0 leaves v1.0.0's verified state intact.
+
+Every successful verify or unverify writes a structured log line (level `info`):
+
+```json
+{
+  "event": "agent_version_verify",
+  "actor": { "user_id": "<uuid>", "namespace": "<ns>", "role": "admin" },
+  "target": { "namespace": "<ns>", "name": "<name>", "version": "<X.Y.Z>" },
+  "action": "verify" | "unverify",
+  "timestamp": "<ISO-8601>"
+}
+```
+
+Pino writes to stdout — pipe your registry's stdout to your log aggregator (CloudWatch, Loki, Datadog, etc.) and filter on `event:"agent_version_verify"` to see the trust trail. This is the forensic record for "who verified what when" until the audit-log UI ships.
 
 ---
 
@@ -247,7 +316,10 @@ server {
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `PORT` | `4000` | Registry HTTP port |
-| `CORS_ORIGIN` | `*` | CORS allowed origin (restrict in production) |
+| `NODE_ENV` | — | Set to `production` to enable strict mode (forces `CORS_ORIGIN`, requires HTTPS webhooks, refuses private-IP `webhook_url`) |
+| `CORS_ORIGIN` | `*` in dev, **required in prod** | CORS allowed origin. When `NODE_ENV=production`, the API fails fast at startup if unset (no implicit `*`). Set e.g. `https://app.example.com`. |
+| `WEBHOOK_SIGNING_KEY` | — (**required for webhook delivery**) | HMAC-SHA256 key used to sign `POST /run` webhook callbacks (`X-Skrun-Signature: sha256=...`). Without it, webhook delivery refuses to fire. Generate with `openssl rand -hex 32`. |
+| `BUNDLE_MAX_DECOMPRESSED_MB` | `50` | Cap on decompressed `.agent` bundle size (gzip-bomb defense). Raise only for legitimately larger artefacts. |
 | `DATABASE_URL` | — | Supabase project URL. If set, uses SupabaseDb. Otherwise SQLite. |
 | `SUPABASE_KEY` | — | Supabase service role key (required with `DATABASE_URL`) |
 | `GITHUB_CLIENT_ID` | — | GitHub OAuth App client ID. If set, enables OAuth auth mode. |
@@ -261,10 +333,13 @@ server {
 | `BUNDLE_CACHE_MAX` | `50` | Max cached bundle extractions |
 | `MCP_CACHE_TTL` | `600` | MCP connection cache TTL (seconds) |
 | `MCP_CACHE_MAX` | `20` | Max cached MCP connections |
+| `MCP_CONNECT_TIMEOUT_MS` | `120000` | Per-connect timeout for MCP servers (stdio spawn / SSE / streamable-HTTP), plumbed to the MCP SDK via `client.connect(transport, { timeout })`. On expiry the runtime logs `event=mcp_connect_timeout`, tears down the half-open transport, and the run **fails** with `502 MCP_CONNECT_FAILED`. Stdio cold-starts via `npx -y @some/mcp` can take 60-120s on first run after a fresh registry process (`@playwright/mcp` measured at ~70s on a warm chromium cache). Bump to `180000`+ if your runner needs to download chromium / large MCP binaries from cold. |
 | `FILES_MAX_SIZE_MB` | `10` | Max file size for Files API (MB) |
 | `FILES_MAX_COUNT` | `20` | Max files per run |
 | `FILES_RETENTION_S` | `3600` | How long agent-produced files stay available (seconds) |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY` / `MISTRAL_API_KEY` / `GROQ_API_KEY` / `XAI_API_KEY` | — | Server-side LLM keys (optional — callers can provide their own) |
+
+> **Upgrading from a previous version?** See [`CHANGELOG.md`](../CHANGELOG.md) for breaking changes and one-shot migration steps.
 
 ---
 
@@ -313,6 +388,7 @@ The codebase is platform-agnostic, but a few details differ on Windows:
 
 - **`.env` sourcing**: PowerShell doesn't auto-source `.env`. Use `pnpm dev:registry` which loads `.env` via Node's `--env-file` flag.
 - **Path separators**: the code uses `node:path` everywhere, so `\` vs `/` shouldn't bite you. Don't hard-code Unix paths in `agent.yaml` `secrets` or `scripts/` references.
+- **Node script-dep install**: agents that ship a `package.json` (with or without a lockfile) install their dependencies automatically on first call. Skrun spawns `npm` / `pnpm` / `yarn` through the OS shell on Win32 so the `.cmd` shims resolve cleanly — no manual setup needed. Python (`requirements.txt`, `pyproject.toml`) works the same way.
 - **SQLite on network drives**: avoid. SQLite's file locking is finicky on SMB/NFS. Use a local disk or switch to Supabase.
 - **Reverse proxy**: IIS works but Caddy/nginx on WSL2 is simpler. Or use the built-in tools if you're already on IIS.
 - **Headless Chrome / MCP servers**: work fine on Windows via `npx @playwright/mcp`. Playwright auto-downloads a Chromium build.

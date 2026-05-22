@@ -18,7 +18,15 @@
  *   - Print a summary
  */
 
-import { ROOT, results, skrun, startRegistry, stopRegistry, TOKEN } from "./e2e/live/_ctx.js";
+import {
+  ROOT,
+  registryLogPath,
+  results,
+  skrun,
+  startRegistry,
+  stopRegistry,
+  TOKEN,
+} from "./e2e/live/_ctx.js";
 import { run as runDemos } from "./e2e/live/01-demos.js";
 import { run as runCallerKeys } from "./e2e/live/02-caller-keys.js";
 import { run as runVerification } from "./e2e/live/03-verification.js";
@@ -32,6 +40,10 @@ import { run as runVersionNotes } from "./e2e/live/10-version-notes.js";
 import { run as runMultimodal } from "./e2e/live/11-multimodal.js";
 import { run as runToolChoice } from "./e2e/live/12-tool-choice.js";
 import { run as runPromptCaching } from "./e2e/live/13-prompt-caching.js";
+import { run as runOutputValidation } from "./e2e/live/14-output-validation.js";
+import { run as runVerifyRequired } from "./e2e/live/15-verify-required.js";
+import { run as runSimplifyName } from "./e2e/live/16-simplify-agent-name.js";
+import { run as runMultiTenantReads } from "./e2e/live/17-multi-tenant-reads.js";
 
 // --- Start registry ---
 console.log("Starting registry...");
@@ -80,6 +92,18 @@ await runToolChoice();
 // --- Phase 13: prompt-caching (#68) ---
 await runPromptCaching();
 
+// --- Phase 14: audit/002 output validation + tool_call_error + run.files ---
+await runOutputValidation();
+
+// --- Phase 15: per-version verify-required-before-run (#83) ---
+await runVerifyRequired();
+
+// --- Phase 16: simplify-agent-name (#84) ---
+await runSimplifyName();
+
+// --- Phase 17: multi-tenant reads — registry GET ownership gate ---
+await runMultiTenantReads();
+
 // --- Summary ---
 console.log(`\n${"=".repeat(70)}`);
 console.log("E2E TEST RESULTS");
@@ -99,6 +123,13 @@ for (const r of results) {
 console.log(`\n${"-".repeat(70)}`);
 console.log(`${passed} passed, ${failed} failed, ${results.length} total`);
 console.log("-".repeat(70));
+
+// On failure, point the human at the registry log file — that's where the
+// real server-side error message lives for 0ms / $0 failures.
+if (failed > 0 && registryLogPath) {
+  console.log(`\nRegistry log (for failure diagnostics):\n  ${registryLogPath}`);
+  console.log(`  Grep for the failed agent name or 'event_failed' / 'error' to find the stack.\n`);
+}
 
 // --- Cleanup ---
 stopRegistry();

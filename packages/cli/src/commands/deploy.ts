@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { validateAgent, validateAgentCapabilities } from "@skrun-dev/schema";
 import type { Command } from "commander";
-import { getRegistryUrl, getToken } from "../utils/auth.js";
+import { getCurrentNamespace, getRegistryUrl, getToken } from "../utils/auth.js";
 import * as format from "../utils/format.js";
 import { RegistryClient } from "../utils/registry-client.js";
 import { getValidatedConfig } from "../utils/validated-config.js";
@@ -46,9 +46,15 @@ export function registerDeployCommand(program: Command): void {
       }
 
       const config = getValidatedConfig(result);
-      const [namespace, name] = config.name.split("/");
+      const slug = config.name;
       const version = config.version;
-      const slug = name ?? config.name;
+      let namespace: string;
+      try {
+        namespace = await getCurrentNamespace();
+      } catch (err) {
+        format.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
 
       // Capability check — refuse before build/push if model can't handle declared media
       const capCheck = validateAgentCapabilities(config);

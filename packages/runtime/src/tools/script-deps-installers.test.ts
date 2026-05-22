@@ -534,6 +534,27 @@ describe("installNode — package-manager dispatch", () => {
   });
 });
 
+describe("Bug B (audit/002): real execFileRunner on Windows", () => {
+  it("spawns npm via shell on Windows (real spawn, not mocked)", async () => {
+    // This is an integration test that uses the REAL execFileRunner against
+    // the real `npm` binary. It verifies that Node 24's CVE-2024-27980 fix
+    // (which blocks direct .cmd spawn with EINVAL) is handled correctly by
+    // execFileRunner's `shell: true` on Windows.
+    //
+    // Skipped on non-Windows (npm exists as a real binary there, no CMD).
+    if (process.platform !== "win32") {
+      // eslint-disable-next-line no-console
+      return; // No-op on Linux/macOS — bare `npm` works directly.
+    }
+    // Import dynamically to avoid the eager import in non-Windows runners
+    // accidentally pulling Windows-only code paths.
+    const { execFileRunner } = await import("./script-deps-installers.js");
+    const result = await execFileRunner("npm", ["--version"], {});
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/); // semver
+  });
+});
+
 describe("installNode — env hardening (registry allowlist)", () => {
   it("pins npm_config_registry to registry.npmjs.org for pnpm/npm", async () => {
     const { runner, calls } = mockRunner(ok);

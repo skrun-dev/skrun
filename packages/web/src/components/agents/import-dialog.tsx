@@ -1,11 +1,34 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   type ScannedAgent,
   useImportAgent,
+  useMe,
   usePushScannedAgent,
   useScanAgents,
 } from "../../lib/api-client";
 import { Btn, Pill } from "../shared/ui";
+
+/**
+ * Parse a `.agent` bundle filename produced by `skrun build`.
+ *
+ * Convention: `skrun build` emits `<slug>-<version>.agent` where `<slug>` is
+ * the agent.yaml `name` (slug-only) and `<version>` is the semver string. The
+ * last `-` splits slug from version; slugs themselves may contain hyphens
+ * (`email-drafter`).
+ *
+ * Returns `null` if the filename doesn't match the expected shape; the caller
+ * surfaces an error and prompts the user for the values manually.
+ */
+function parseBundleFilename(filename: string): { name: string; version: string } | null {
+  const base = filename.replace(/\.agent$/, "");
+  const lastDash = base.lastIndexOf("-");
+  if (lastDash <= 0 || lastDash === base.length - 1) return null;
+  const name = base.slice(0, lastDash);
+  const version = base.slice(lastDash + 1);
+  // Loose semver-ish guard — final shape is validated server-side.
+  if (!/^\d/.test(version)) return null;
+  return { name, version };
+}
 
 interface ImportDialogProps {
   open: boolean;
@@ -79,62 +102,85 @@ export function ImportDialog({ open, onClose }: ImportDialogProps) {
 function UploadTab({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [file, setFile] = useState<File | null>(null);
+  const [namespace, setNamespace] = useState("");
+  const [name, setName] = useState("");
+  const [version, setVersion] = useState("");
   const importAgent = useImportAgent();
+  const me = useMe();
+  // Namespace mirrors the caller's auth context — the push endpoint refuses
+  // cross-namespace pushes for non-admin callers (403) AND a cross-namespace
+  // admin import would create an agent with `owner_id = admin.id` that the
+  // supposed target user can't see, read, or pull (filtered out by the
+  // multi-tenant gate). The field is therefore display-only.
+  useEffect(() => {
+    if (me.data?.namespace) {
+      setNamespace(me.data.namespace);
+    }
+  }, [me.data?.namespace]);
 
-  const handleFile = useCallback(
-    async (file: File) => {
-      setError(null);
-
-      if (!file.name.endsWith(".agent")) {
-        setError("Invalid bundle format. Use `skrun build` to create a valid .agent file.");
-        return;
-      }
-
-      const baseName = file.name.replace(".agent", "");
-      const parts = baseName.split("-");
-      if (parts.length < 3) {
-        setError("Filename must follow format: namespace-name-version.agent");
-        return;
-      }
-
-      const namespace = parts[0];
-      const version = parts[parts.length - 1];
-      const name = parts.slice(1, -1).join("-");
-      if (!namespace || !version) {
-        setError("Filename must follow format: namespace-name-version.agent");
-        return;
-      }
-
-      try {
-        const buffer = await file.arrayBuffer();
-        await importAgent.mutateAsync({ namespace, name, version, bundle: buffer });
-        onClose();
-      } catch (err) {
-        if (err instanceof Error) {
-          setError(err.message);
-        }
-      }
-    },
-    [importAgent, onClose],
-  );
+  const handleFile = useCallback((picked: File) => {
+    setError(null);
+    if (!picked.name.endsWith(".agent")) {
+      setError("Invalid bundle format. Use `skrun build` to create a valid .agent file.");
+      return;
+    }
+    setFile(picked);
+    // Heuristic pre-fill from filename (`<slug>-<version>.agent`). User can
+    // edit before submit — authoritative slug comes from the bundle's internal
+    // agent.yaml, which the server validates.
+    const parsed = parseBundleFilename(picked.name);
+    if (parsed) {
+      setName(parsed.name);
+      setVersion(parsed.version);
+    }
+  }, []);
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
       setIsDragging(false);
-      const file = e.dataTransfer.files[0];
-      if (file) handleFile(file);
+      const picked = e.dataTransfer.files[0];
+      if (picked) handleFile(picked);
     },
     [handleFile],
   );
 
   const handleFileInput = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (file) handleFile(file);
+      const picked = e.target.files?.[0];
+      if (picked) handleFile(picked);
     },
     [handleFile],
   );
+
+  const handleSubmit = useCallback(async () => {
+    setError(null);
+    if (!file) {
+      setError("Choose a .agent bundle first.");
+      return;
+    }
+    if (!namespace.trim() || !name.trim() || !version.trim()) {
+      setError("Namespace, name, and version are all required.");
+      return;
+    }
+    try {
+      const buffer = await file.arrayBuffer();
+      await importAgent.mutateAsync({
+        namespace: namespace.trim(),
+        name: name.trim(),
+        version: version.trim(),
+        bundle: buffer,
+      });
+      onClose();
+    } catch (err) {
+      if (err instanceof Error) {
+        setError(err.message);
+      }
+    }
+  }, [file, namespace, name, version, importAgent, onClose]);
+
+  const canSubmit = Boolean(file && namespace.trim() && name.trim() && version.trim());
 
   return (
     <div>
@@ -146,30 +192,99 @@ function UploadTab({ onClose }: { onClose: () => void }) {
         }}
         onDragLeave={() => setIsDragging(false)}
         onDrop={handleDrop}
-        className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
+        className={`border-2 border-dashed rounded-lg p-6 text-center transition-colors ${
           isDragging
             ? "border-sky-400 bg-sky-50/50 dark:bg-sky-950/20"
             : "border-gray-200 dark:border-gray-800"
         }`}
       >
-        <p className="text-[12.5px] text-gray-500 dark:text-gray-400 mb-3">
-          Drag & drop a{" "}
-          <code className="text-[11px] font-mono bg-gray-100 dark:bg-gray-800 px-1 rounded-sm">
-            .agent
-          </code>{" "}
-          bundle here
-        </p>
+        {file ? (
+          <p className="text-[12.5px] text-gray-700 dark:text-gray-300 mb-3 font-mono truncate">
+            {file.name}
+          </p>
+        ) : (
+          <p className="text-[12.5px] text-gray-500 dark:text-gray-400 mb-3">
+            Drag & drop a{" "}
+            <code className="text-[11px] font-mono bg-gray-100 dark:bg-gray-800 px-1 rounded-sm">
+              .agent
+            </code>{" "}
+            bundle here
+          </p>
+        )}
         <label>
           <Btn variant="primary" className="cursor-pointer">
-            Choose file
+            {file ? "Choose another file" : "Choose file"}
           </Btn>
           <input type="file" accept=".agent" onChange={handleFileInput} className="hidden" />
         </label>
       </div>
 
-      {importAgent.isPending && (
-        <p className="mt-3 text-[12px] text-sky-600 dark:text-sky-400">Uploading...</p>
-      )}
+      {/* Form fields — pre-filled from filename heuristic + auth context. */}
+      <div className="mt-4 space-y-3">
+        <div>
+          <label
+            htmlFor="import-namespace"
+            className="block text-[11.5px] font-medium text-gray-700 dark:text-gray-300 mb-1"
+          >
+            Namespace
+          </label>
+          <input
+            id="import-namespace"
+            type="text"
+            value={namespace}
+            readOnly
+            placeholder="dev"
+            className="w-full px-2.5 h-8 text-[12.5px] rounded-sm border border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900 text-gray-600 dark:text-gray-400 focus:outline-none cursor-not-allowed"
+          />
+          <p className="mt-1 text-[10.5px] text-gray-500 dark:text-gray-500">
+            Mirrors your account namespace.
+          </p>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label
+              htmlFor="import-name"
+              className="block text-[11.5px] font-medium text-gray-700 dark:text-gray-300 mb-1"
+            >
+              Name (slug)
+            </label>
+            <input
+              id="import-name"
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="email-drafter"
+              className="w-full px-2.5 h-8 text-[12.5px] rounded-sm border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100 focus:outline-none focus:border-sky-400 font-mono"
+            />
+          </div>
+          <div>
+            <label
+              htmlFor="import-version"
+              className="block text-[11.5px] font-medium text-gray-700 dark:text-gray-300 mb-1"
+            >
+              Version
+            </label>
+            <input
+              id="import-version"
+              type="text"
+              value={version}
+              onChange={(e) => setVersion(e.target.value)}
+              placeholder="1.0.0"
+              className="w-full px-2.5 h-8 text-[12.5px] rounded-sm border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100 focus:outline-none focus:border-sky-400 font-mono"
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-4 flex justify-end">
+        <Btn
+          variant="primary"
+          disabled={!canSubmit || importAgent.isPending}
+          onClick={handleSubmit}
+        >
+          {importAgent.isPending ? "Uploading..." : "Import"}
+        </Btn>
+      </div>
 
       {error && (
         <div className="mt-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md p-2.5">

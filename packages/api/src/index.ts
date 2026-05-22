@@ -2,6 +2,7 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { apiReference } from "@scalar/hono-api-reference";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { secureHeaders } from "hono/secure-headers";
 import type { DbAdapter } from "./db/adapter.js";
 import { createAuthMiddleware } from "./middleware/auth.js";
 import { rateLimiter } from "./middleware/rate-limit.js";
@@ -20,8 +21,63 @@ export function createApp(storage: StorageAdapter, db: DbAdapter) {
   const service = new RegistryService(storage, db);
   const authMiddleware = createAuthMiddleware(db);
 
-  // CORS — configurable origins (default: all for dev, restrict via CORS_ORIGIN in production)
-  app.use("*", cors({ origin: process.env.CORS_ORIGIN ?? "*" }));
+  // Security headers — applied BEFORE CORS so they are present on every
+  // response including CORS preflight.
+  //   - X-Frame-Options: DENY (clickjacking defense; tighter than Hono default SAMEORIGIN)
+  //   - HSTS: 2 years + preload (Cloudflare / browser-preload-list grade)
+  //   - Cross-Origin-Resource-Policy: cross-origin so the dashboard can load
+  //     /api/files/:id/content from a different host (cloud deployment).
+  //   - CSP is scoped to `/dashboard/*` below (the only HTML surface that
+  //     accepts user interaction). API JSON responses + `/docs` (Scalar,
+  //     external CDN-loaded JS) are intentionally left without CSP.
+  app.use(
+    "*",
+    secureHeaders({
+      xFrameOptions: "DENY",
+      strictTransportSecurity: "max-age=63072000; includeSubDomains; preload",
+      crossOriginResourcePolicy: "cross-origin",
+    }),
+  );
+
+  // CSP scoped to `/dashboard/*` — defense-in-depth against XSS in the
+  // bundled React SPA. Allows the SPA's own bundle (script-src 'self') and
+  // its CSS (style-src 'self'), plus 'unsafe-inline' for the rare React
+  // inline-style prop (DOM-level style attribute — minor XSS risk via
+  // injected style is acceptable trade-off vs the script-src protection).
+  // Same-origin only for fetch / images / fonts / form actions.
+  app.use(
+    "/dashboard/*",
+    secureHeaders({
+      contentSecurityPolicy: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:"],
+        fontSrc: ["'self'"],
+        connectSrc: ["'self'"],
+        frameAncestors: ["'none'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'"],
+        objectSrc: ["'none'"],
+      },
+    }),
+  );
+
+  // CORS — production-safe by default.
+  //   - production: CORS_ORIGIN is REQUIRED (fail loud at startup if unset),
+  //     no '*' wildcard allowed (per the CORS spec, '*' cannot be paired with
+  //     credentials anyway).
+  //   - dev / test: falls back to '*' so local pnpm dev:registry + dashboard
+  //     stay frictionless.
+  const corsOriginEnv = process.env.CORS_ORIGIN;
+  if (process.env.NODE_ENV === "production" && !corsOriginEnv) {
+    throw new Error(
+      "CORS_ORIGIN env var is required when NODE_ENV=production. " +
+        "Set it to a comma-separated list of allowed origins (e.g. https://app.example.com). " +
+        "See .env.example.",
+    );
+  }
+  app.use("*", cors({ origin: corsOriginEnv ?? "*" }));
 
   // Rate limiting — 60 requests per minute per IP on mutating endpoints
   app.use("/api/agents/*/push", rateLimiter({ windowMs: 60_000, max: 10 }));
@@ -49,9 +105,9 @@ export function createApp(storage: StorageAdapter, db: DbAdapter) {
   app.route("", createAuthRoutes(db, authMiddleware));
   app.route("/api", createScanRoutes(db, authMiddleware, service));
   app.route("/api", createStatsRoutes(db, authMiddleware));
-  app.route("/api", createRegistryRoutes(service, authMiddleware));
+  app.route("/api", createRegistryRoutes(service, authMiddleware, db));
   app.route("/api", createRunRoutes(service, db, authMiddleware));
-  app.route("/api", createFilesRoutes(authMiddleware));
+  app.route("/api", createFilesRoutes(db, authMiddleware));
 
   // Dashboard static files (served from packages/web/dist/)
   app.use(

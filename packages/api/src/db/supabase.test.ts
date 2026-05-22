@@ -125,6 +125,36 @@ describe("SupabaseDb", () => {
     await expect(db.deleteVersion("agent-id-X", "1.0.0")).rejects.toThrow("constraint violation");
   });
 
+  // UAT-18: getLatestVersion has `id DESC` tiebreaker after `pushed_at DESC`.
+  // Postgres doesn't break ties otherwise; two rows with identical pushed_at
+  // would return non-deterministic latest, which is security-relevant since
+  // the per-version verified gate consumes this resolution.
+  it("UAT-18: getLatestVersion orders by pushed_at DESC + id DESC (tiebreaker)", async () => {
+    const chain = mockChain({ data: { id: "v-2", version: "1.0.1", verified: true } });
+    mockFrom.mockReturnValue(chain);
+
+    await db.getLatestVersion("agent-id-X");
+
+    expect(mockFrom).toHaveBeenCalledWith("agent_versions");
+    expect(chain.order).toHaveBeenCalledWith("pushed_at", { ascending: false });
+    expect(chain.order).toHaveBeenCalledWith("id", { ascending: false });
+  });
+
+  // Per-version verify happy path on Supabase (mirrors UAT-7 in sqlite/memory).
+  it("setVersionVerified updates the row by (agent_id, version)", async () => {
+    const agentChain = mockChain({ data: { id: "a-1" } });
+    const versionChain = mockChain({ data: { version: "1.0.0", verified: true } });
+    // First mockFrom call → getAgent("ns", "x"), second → agent_versions update
+    mockFrom.mockReturnValueOnce(agentChain).mockReturnValueOnce(versionChain);
+
+    const result = await db.setVersionVerified("ns", "x", "1.0.0", true);
+
+    expect(result?.verified).toBe(true);
+    expect(versionChain.update).toHaveBeenCalledWith({ verified: true });
+    expect(versionChain.eq).toHaveBeenCalledWith("agent_id", "a-1");
+    expect(versionChain.eq).toHaveBeenCalledWith("version", "1.0.0");
+  });
+
   // ── Cache cost-savings ([005-cache-cost-savings-dashboard]) ──────────
 
   describe("cache cost-savings", () => {

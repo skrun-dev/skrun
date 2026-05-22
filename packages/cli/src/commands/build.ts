@@ -140,8 +140,7 @@ async function runBuild(outputDir?: string): Promise<void> {
   }
 
   const config = getValidatedConfig(result);
-  const slug = config.name.split("/")[1] ?? config.name;
-  const filename = `${slug}-${config.version}.agent`;
+  const filename = `${config.name}-${config.version}.agent`;
   const outDir = outputDir ? resolve(outputDir) : dir;
   const outPath = join(outDir, filename);
 

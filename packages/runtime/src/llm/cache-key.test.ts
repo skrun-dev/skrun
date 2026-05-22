@@ -32,13 +32,14 @@ describe("hashCacheKey", () => {
     expect(a).not.toBe(b);
   });
 
-  // VT-5d (peer-review C1) — special characters in agent name (slashes) and
-  // version (dots, dashes, plus) produce alphanumeric-only hex output. No
-  // `/`, `@`, `+`, `.`, `-` in the hashed key — safe for HTTP headers
-  // (x-grok-conv-id) and JSON body fields (prompt_cache_key) across all
-  // providers.
-  it("VT-5d: agent name with slash + version with dots/dashes/plus → alphanumeric-only output", () => {
-    const key = hashCacheKey("dev/my-agent", "1.0.0-beta+build.42", "prod-us");
+  // VT-5d (peer-review C1) — special characters in version (dots, dashes,
+  // plus) and env id produce alphanumeric-only hex output. No `/`, `@`, `+`,
+  // `.`, `-` in the hashed key — safe for HTTP headers (x-grok-conv-id) and
+  // JSON body fields (prompt_cache_key) across all providers. Post-#84 agent
+  // names are slug-only (regex `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`), but
+  // versions still legitimately contain dots/dashes/plus.
+  it("VT-5d: slug agent name + version with dots/dashes/plus → alphanumeric-only output", () => {
+    const key = hashCacheKey("my-agent", "1.0.0-beta+build.42", "prod-us");
     expect(key).toMatch(/^[0-9a-f]{64}$/);
     expect(key).not.toContain("/");
     expect(key).not.toContain("@");

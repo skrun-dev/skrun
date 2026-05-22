@@ -28,7 +28,7 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { REGISTRY, ROOT, results, skrun, TOKEN } from "./_ctx.js";
+import { REGISTRY, ROOT, results, skrun, TOKEN, verifyLatestVersion } from "./_ctx.js";
 
 /**
  * Make a stable filler block of approximately N paragraphs of `seed`-tagged
@@ -149,6 +149,7 @@ async function runScenario(cfg: ScenarioConfig): Promise<void> {
     } catch {
       // already pushed at this version
     }
+    await verifyLatestVersion("dev", "email-drafter");
 
     const input = {
       context: "Quick thank-you note for a colleague who helped debug a tricky bug.",
@@ -239,6 +240,7 @@ async function runScenario(cfg: ScenarioConfig): Promise<void> {
     } catch {
       // already pushed
     }
+    await verifyLatestVersion("dev", "email-drafter");
 
     const r3 = await callAgent(input);
     totalCost += ((r3.cost as Record<string, number>)?.estimated as number) ?? 0;

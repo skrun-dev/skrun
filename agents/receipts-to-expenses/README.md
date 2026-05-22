@@ -33,6 +33,7 @@ From the repo root:
 # 1. Push the agent to your local registry
 cd agents/receipts-to-expenses
 skrun build && skrun push
+skrun verify dev/receipts-to-expenses@0.4.0   # admin step; dev-token = auto-admin
 
 # 2. Upload each receipt image and capture the file_id
 RECEIPT_1=$(curl -s -X POST http://localhost:4000/api/files \
@@ -98,6 +99,17 @@ curl http://localhost:4000/api/files/${result.files[1].file_id}/content \
 open expenses.xlsx  # Excel / Numbers / LibreOffice Calc
 open monthly.pdf
 ```
+
+## Try it in the playground
+
+The fastest way to see this agent run end-to-end is the dashboard playground:
+
+1. Open `http://localhost:4000/dashboard/agents/dev/receipts-to-expenses`.
+2. Click **Run in playground**.
+3. Switch to **Form** mode at the top of the Input panel.
+4. On the `receipts` field, click **Attach** and select all three bundled images from `agents/receipts-to-expenses/fixtures/sample-receipts/` (`01-restaurant.jpg`, `02-uber.jpg`, `03-saas.jpg`).
+5. Fill `month` (e.g. `2026-04`). Leave `bank_statement_csv` empty (the reconciliation step is optional).
+6. Click **Run agent**. When the run completes, the Files block lists `expenses.xlsx` and `monthly.pdf` with Download buttons.
 
 ## Artifacts
 

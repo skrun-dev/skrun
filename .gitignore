@@ -149,5 +149,9 @@ skrun.db-*
 .claude/
 .playwright-mcp/
 
+# One-off local dev helpers — wipe scripts, sweep scripts. Never committed.
+scripts/wipe-*.mjs
+scripts/_TMP_*
+
 # Per-worktree local journal (multi-session dev workflow)
 specs/_meta/JOURNAL-worktree.md

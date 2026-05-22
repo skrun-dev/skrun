@@ -16,7 +16,7 @@ description: A test agent for #57 script-deps validation
 Body.
 `;
 
-const MINIMAL_AGENT_YAML = `name: dev/test-agent
+const MINIMAL_AGENT_YAML = `name: test-agent
 version: 0.1.0
 model:
   provider: anthropic
@@ -51,7 +51,7 @@ describe("validateAgent", () => {
     expect(result.errors).toHaveLength(0);
     expect(result.parsed).not.toBeNull();
     expect(result.parsed?.skill.frontmatter.name).toBe("pdf-processing");
-    expect(result.parsed?.agentConfig.config.name).toBe("acme/seo-audit");
+    expect(result.parsed?.agentConfig.config.name).toBe("seo-audit");
   });
 
   it("should return error for missing SKILL.md", async () => {
@@ -75,8 +75,10 @@ describe("validateAgent", () => {
     expect(result.errors.some((e) => e.code === "CONTEXT_MODE_NO_AGENTS_MD")).toBe(true);
   });
 
-  it("should return name mismatch warning", async () => {
-    // valid-agent-dir has SKILL.md name "pdf-processing" but agent.yaml slug "seo-audit"
+  // VT-12 — NAME_MISMATCH warning fires when SKILL.md and agent.yaml names
+  // differ. valid-agent-dir has SKILL.md name "pdf-processing" but agent.yaml
+  // name "seo-audit", so the warning is expected.
+  it("VT-12: NAME_MISMATCH warning fires on real name divergence", async () => {
     const result = await validateAgent(resolve(FIXTURES, "valid-agent-dir"));
     expect(result.warnings.some((w) => w.code === "NAME_MISMATCH")).toBe(true);
     expect(result.valid).toBe(true); // warnings don't block
@@ -87,6 +89,51 @@ describe("validateAgent", () => {
     expect(result.valid).toBe(true);
     expect(result.warnings.length).toBeGreaterThan(0);
     expect(result.errors).toHaveLength(0);
+  });
+});
+
+// VT-13 — NAME_MISMATCH must NOT fire when SKILL.md.name === agent.yaml.name
+// (both slug-only post-#84; the comparison is exact equality).
+describe("validateAgent — NAME_MISMATCH (post-#84)", () => {
+  let bundle: string;
+
+  beforeEach(() => {
+    bundle = createBundle();
+  });
+
+  afterEach(() => {
+    rmSync(bundle, { recursive: true, force: true });
+  });
+
+  it("VT-13: does NOT fire NAME_MISMATCH when SKILL.md and agent.yaml names match", async () => {
+    // createBundle() uses test-agent in both files — exact match.
+    const result = await validateAgent(bundle);
+    expect(result.valid).toBe(true);
+    expect(result.warnings.some((w) => w.code === "NAME_MISMATCH")).toBe(false);
+  });
+
+  it("fires NAME_MISMATCH when only one of the two names is changed", async () => {
+    // Override agent.yaml with a different slug than SKILL.md says.
+    writeIn(
+      bundle,
+      "agent.yaml",
+      `name: different-slug
+version: 0.1.0
+model:
+  provider: anthropic
+  name: claude-3-7-sonnet
+inputs:
+  - name: q
+    type: string
+    required: true
+outputs:
+  - name: answer
+    type: string
+`,
+    );
+    const result = await validateAgent(bundle);
+    expect(result.warnings.some((w) => w.code === "NAME_MISMATCH")).toBe(true);
+    expect(result.valid).toBe(true);
   });
 });
 

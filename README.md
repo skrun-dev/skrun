@@ -119,11 +119,13 @@ What skill would you turn into an API tomorrow? What's missing in your current a
 ```bash
 npm install -g @skrun-dev/cli
 
-skrun init --from-skill ./my-skill    # or: skrun init my-agent
-skrun deploy -m "initial release"     # build + push + get your API URL
+skrun init --from-skill ./my-skill        # or: skrun init my-agent
+skrun deploy -m "initial release"         # build + push + get your API URL
+skrun verify dev/my-skill@1.0.0           # admin step — auto-admin in local dev
+skrun run dev/my-skill -i '{"query":"analyze this"}'
 ```
 
-That's it. Your agent is now callable via `POST /run`:
+That's it. Your agent is verified, callable via the CLI, and reachable as a `POST /run` HTTP endpoint:
 
 ```bash
 curl -X POST http://localhost:4000/api/agents/dev/my-skill/run \
@@ -132,7 +134,7 @@ curl -X POST http://localhost:4000/api/agents/dev/my-skill/run \
   -d '{"input": {"query": "analyze this"}}'
 ```
 
-> `dev-token` is for local development. In production, authenticate via [GitHub OAuth or API keys](docs/api.md#authentication) — your GitHub username becomes your namespace.
+> `dev-token` is for local development. In production, authenticate via [GitHub OAuth or API keys](docs/api.md#authentication) — your GitHub username becomes your namespace, and a separate admin role gates `skrun verify`.
 
 → **[10-minute tutorial](docs/getting-started.md)** · **[Concepts](docs/concepts.md)** · **[API reference](docs/api.md)**
 
@@ -275,8 +277,13 @@ pnpm dev:registry              # keep this terminal open
 skrun login --token dev-token
 cd agents/changelog-generator
 skrun build && skrun push -m "v1 — first push"
+skrun verify dev/changelog-generator@1.0.0   # admin step; dev-token = auto-admin
 
 # 3. Call it (uses the bundled fixture — no real git repo needed)
+skrun run dev/changelog-generator \
+  -i '{"repo_path": "./fixtures/sample-repo.git-log.txt", "project_name": "demo"}'
+
+# Or via raw HTTP:
 curl -X POST http://localhost:4000/api/agents/dev/changelog-generator/run \
   -H "Authorization: Bearer dev-token" \
   -H "Content-Type: application/json" \
@@ -304,6 +311,9 @@ curl http://localhost:4000/api/runs/<run_id>/files/CHANGELOG.md \
 | `skrun test` | Run agent tests (real LLM) |
 | `skrun build` | Package `.agent` bundle |
 | `skrun push -m "note"` | Push with a version note |
+| `skrun verify <ns>/<name>@<v>` | Mint admin-verified trust on a version (admin only) |
+| `skrun unverify <ns>/<name>@<v>` | Revoke verification (admin only) |
+| `skrun run <ns>/<name>[@<v>]` | Invoke an agent — `-i` inline, `-f` file, `--stdin` pipe |
 | `skrun deploy -m "note"` | Build + push + live URL |
 | `skrun pull <agent>` | Download agent bundle |
 | `skrun login` / `logout` | Authentication (OAuth or token) |

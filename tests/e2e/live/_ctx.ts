@@ -7,10 +7,18 @@
  */
 
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 export const ROOT = resolve(import.meta.dirname, "..", "..", "..");
+
+/**
+ * Registry stderr/stdout log file path. Set by startRegistry(); printed in
+ * the final summary when any test fails so a human (or Claude) can grep it
+ * for the actual server-side error message of the failure.
+ */
+export let registryLogPath: string | null = null;
 export const CLI = join(ROOT, "packages/cli/bin/skrun.js");
 export const REGISTRY = "http://localhost:4000";
 export const TOKEN = "dev-token";
@@ -63,7 +71,18 @@ export async function startRegistry(): Promise<void> {
   await new Promise((r) => setTimeout(r, 1000)); // Wait for port release
 
   const devTs = join(ROOT, "packages/api/src/dev.ts");
-  registryProcess = spawn(process.execPath, ["--import", "tsx", devTs], {
+  // Capture the registry's stdout+stderr to a temp file. The legacy
+  // `stdio: "pipe"` silenced both streams (never read), so a failed run
+  // surfaced as "Expected completed, got failed | 0ms | $0" with no
+  // server-side context. Now the log lives at registryLogPath, printed
+  // in the final summary when any test fails so a human can grep it.
+  registryLogPath = join(tmpdir(), `skrun-e2e-registry-${Date.now()}.log`);
+  const logFd = openSync(registryLogPath, "w");
+  // --use-system-ca: required on Windows when LLM provider certs (or an
+  // intermediate) are present in the system CA store but not in Node's
+  // compiled CA bundle. Without this flag, `fetch()` to Google/Anthropic/etc.
+  // fails with `unable to verify the first certificate`. Surfaced 2026-05-15.
+  registryProcess = spawn(process.execPath, ["--use-system-ca", "--import", "tsx", devTs], {
     cwd: ROOT,
     env: {
       ...process.env,
@@ -76,7 +95,7 @@ export async function startRegistry(): Promise<void> {
       // still point at the legacy `examples/`).
       SKRUN_AGENTS_DIR: "./agents",
     },
-    stdio: "pipe",
+    stdio: ["ignore", logFd, logFd],
   });
 
   // Poll health endpoint
@@ -112,16 +131,19 @@ export function skrun(args: string[], cwd: string): string {
 
 export function patchAgent(
   dir: string,
-  namespace: string,
+  _namespace: string,
   provider: string,
   model: string,
 ): string {
   const yamlPath = join(dir, "agent.yaml");
   const original = readFileSync(yamlPath, "utf-8");
 
+  // The yaml namespace patching is no longer needed post-#84: `agent.yaml.name`
+  // is slug-only, and the registry assigns namespace at push from auth context.
+  // The `_namespace` parameter is preserved for caller-side signature
+  // compatibility (callers may want namespace context for downstream HTTP
+  // assertions) but is intentionally unused here.
   let patched = original;
-  // Patch namespace
-  patched = patched.replace(/name: dev\//, `name: ${namespace}/`);
   // Patch provider + model (all demo agents default to google/gemini-2.5-flash)
   patched = patched.replace(/provider: \w+/g, `provider: ${provider}`);
   patched = patched.replace(/name: gemini-[\w.-]+/g, `name: ${model}`);
@@ -159,6 +181,29 @@ export async function postRun(
   return (await res.json()) as Record<string, unknown>;
 }
 
+/**
+ * Verify the latest version of an agent so POST /run reaches past the
+ * per-version verified gate (#83). dev-token is admin so this call always
+ * passes the admin check. Idempotent — safe to call on already-verified
+ * versions. Used by `testAgent` after every push.
+ */
+export async function verifyLatestVersion(namespace: string, name: string): Promise<void> {
+  const metaRes = await fetch(`${REGISTRY}/api/agents/${namespace}/${name}`, {
+    headers: { Authorization: `Bearer ${TOKEN}` },
+  });
+  if (!metaRes.ok) return;
+  const meta = (await metaRes.json()) as { latest_version?: string };
+  if (!meta.latest_version) return;
+  await fetch(
+    `${REGISTRY}/api/agents/${namespace}/${name}/versions/${meta.latest_version}/verify`,
+    {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    },
+  );
+}
+
 export async function testAgent(
   name: string,
   feature: string,
@@ -177,6 +222,12 @@ export async function testAgent(
       // 409 Version already exists — agent already in registry, continue
     }
 
+    // Verify the just-pushed (or pre-existing) version so POST /run reaches
+    // past the per-version verified gate (#83). dev-token is admin, so this
+    // is the live-test analog of an operator approving the version after a
+    // push. Without this, all phase-01+ tests would 403 on the run.
+    await verifyLatestVersion("dev", name);
+
     // Run
     const res = await postRun("dev", name, input);
     const output = res.output as Record<string, unknown>;
@@ -192,15 +243,19 @@ export async function testAgent(
       }
     }
 
+    // Include the server-side `res.error` when the validator fails — it's the
+    // most useful diagnostic for 0ms / $0 failures (run failed before the LLM
+    // call). Otherwise the detail stays the same happy-path string.
+    const errorDetail = error
+      ? `${error}${res.error ? ` | run.error=${typeof res.error === "string" ? res.error : JSON.stringify(res.error)}` : ""}`
+      : `status=${res.status}, version=${res.agent_version as string}, output keys=[${Object.keys(output ?? {}).join(", ")}]`;
     results.push({
       agent: name,
       feature,
       passed: !error,
       duration: (res.duration_ms as number) ?? 0,
       cost: ((res.cost as Record<string, number>)?.estimated as number) ?? 0,
-      detail:
-        error ??
-        `status=${res.status}, version=${res.agent_version as string}, output keys=[${Object.keys(output ?? {}).join(", ")}]`,
+      detail: errorDetail,
     });
   } catch (err) {
     results.push({

@@ -271,22 +271,27 @@ describe("Auth Routes", () => {
     expect(res.status).toBe(403);
   });
 
-  // VT-9: Run is public (anyone can run any agent)
-  it("VT-9: run on another user's agent succeeds", async () => {
-    // Push as dev
+  // VT-9: Run on a verified version is public (no namespace gate at run-time)
+  it("VT-9: run on another user's verified agent succeeds (no namespace gate at run-time)", async () => {
+    // Push as dev (creates row with verified=false)
     await app.request("/api/agents/dev/my-agent/push?version=1.0.0", {
       method: "POST",
       headers: { Authorization: "Bearer dev-token", "Content-Type": "application/octet-stream" },
       body: Buffer.from("fake-bundle"),
     });
 
-    // Run with a different token — still works (auth succeeds, no namespace check)
+    // Admin (dev-token = admin) verifies v1.0.0 so the hard 403 gate passes.
+    await db.setVersionVerified("dev", "my-agent", "1.0.0", true);
+
+    // Run with a different token — still works (auth succeeds, no namespace
+    // check at run-time, version is verified).
     const res = await app.request("/api/agents/dev/my-agent/run", {
       method: "POST",
       headers: { Authorization: "Bearer other-token", "Content-Type": "application/json" },
       body: JSON.stringify({ input: {} }),
     });
-    // 500 expected (bundle is fake, can't extract agent.yaml) but NOT 403
+    // Past auth + verified gate now — downstream failure (e.g. fake bundle
+    // extraction) is acceptable, but the response must NOT be 403.
     expect(res.status).not.toBe(403);
   });
 
@@ -321,6 +326,21 @@ describe("Auth Routes", () => {
     expect(body.email).toBe("alice@test.com");
     expect(body.avatar_url).toBe("https://avatar/alice");
     expect(body.plan).toBe("free");
+    // SEC-005 F-2 fix: role exposed for dashboard conditional rendering.
+    expect(body.role).toBe("user");
+  });
+
+  // SEC-005 (4.3): /api/me surfaces role='admin' for dev-token caller (Q-11)
+  it("GET /api/me returns role='admin' for dev-token caller", async () => {
+    delete process.env.GITHUB_CLIENT_ID;
+    delete process.env.GITHUB_CLIENT_SECRET;
+
+    const res = await app.request("/api/me", {
+      headers: { Authorization: "Bearer dev-token" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.role).toBe("admin");
   });
 
   // VT-12: Login page renders with GitHub button

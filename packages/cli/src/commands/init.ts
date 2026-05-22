@@ -32,7 +32,6 @@ export function registerInitCommand(program: Command): void {
     .option("--name <name>", "Agent name (non-interactive)")
     .option("--description <desc>", "Agent description (non-interactive)")
     .option("--model <model>", "Model as provider/name (non-interactive)")
-    .option("--namespace <ns>", "Agent namespace (non-interactive)")
     .action(async (dir: string | undefined, opts) => {
       if (opts.fromSkill) {
         await initFromSkill(opts.fromSkill, opts);
@@ -42,15 +41,14 @@ export function registerInitCommand(program: Command): void {
     });
 }
 
-interface InitOptions {
+export interface InitOptions {
   force?: boolean;
   name?: string;
   description?: string;
   model?: string;
-  namespace?: string;
 }
 
-async function runInit(dir: string | undefined, opts: InitOptions): Promise<void> {
+export async function runInit(dir: string | undefined, opts: InitOptions): Promise<void> {
   const targetDir = dir ? resolve(dir) : process.cwd();
   const dirName = basename(targetDir);
 
@@ -78,8 +76,6 @@ async function runInit(dir: string | undefined, opts: InitOptions): Promise<void
     modelName = model.name;
   }
 
-  const namespace = opts.namespace ?? (await askText("Namespace?", "my"));
-
   // Create directory if needed
   if (dir && !existsSync(targetDir)) {
     mkdirSync(targetDir, { recursive: true });
@@ -88,9 +84,10 @@ async function runInit(dir: string | undefined, opts: InitOptions): Promise<void
   // Generate SKILL.md
   writeFileSync(skillPath, SKILL_MD_TEMPLATE(name, description), "utf-8");
 
-  // Generate agent.yaml
+  // Generate agent.yaml — namespace is assigned by the registry at push time
+  // (from your auth context), so the yaml only carries the slug.
   const config = AgentConfigSchema.parse({
-    name: `${namespace}/${name}`,
+    name,
     version: "1.0.0",
     model: { provider, name: modelName },
     inputs: [{ name: "query", type: "string", required: true }],

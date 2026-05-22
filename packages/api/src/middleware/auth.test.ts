@@ -70,6 +70,64 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
     expect(body.namespace).toBe("dev");
   });
 
+  // SEC-005 part B (4.3): role loading + dev-token=admin
+  it("loads user.role from DB on session-cookie auth (default user)", async () => {
+    const user = await db.createUser({ github_id: "gh-role-1", username: "carol" });
+    const sessionId = createSession(user.id);
+
+    const res = await app.request("/protected/me", {
+      headers: { Cookie: `skrun_session=${sessionId}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.role).toBe("user");
+  });
+
+  it("loads user.role from DB on API-key auth (default user)", async () => {
+    const user = await db.createUser({ github_id: "gh-role-2", username: "dan" });
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: user.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "k",
+    });
+    const res = await app.request("/protected/me", {
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.role).toBe("user");
+  });
+
+  it("session-cookie auth surfaces 'admin' role when DB row is admin", async () => {
+    const user = await db.createUser({ github_id: "gh-role-3", username: "erin" });
+    // Promote via raw DB (no API exposes elevation by design).
+    const internal = (db as unknown as { users: Map<string, { role: string }> }).users;
+    const stored = internal.get(user.id);
+    if (!stored) throw new Error("seed user missing");
+    stored.role = "admin";
+    const sessionId = createSession(user.id);
+
+    const res = await app.request("/protected/me", {
+      headers: { Cookie: `skrun_session=${sessionId}` },
+    });
+    const body = await res.json();
+    expect(body.role).toBe("admin");
+  });
+
+  it("dev-token grants admin role (Q-11)", async () => {
+    delete process.env.GITHUB_CLIENT_ID;
+    delete process.env.GITHUB_CLIENT_SECRET;
+
+    const res = await app.request("/protected/me", {
+      headers: { Authorization: "Bearer dev-token" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.role).toBe("admin");
+  });
+
   it("rejects dev-token when OAuth IS configured", async () => {
     const original = { ...process.env };
     process.env.GITHUB_CLIENT_ID = "id";

@@ -31,6 +31,7 @@ From the repo root:
 # 1. Push the agent to your local registry
 cd agents/csv-to-executive-report
 skrun build && skrun push
+skrun verify dev/csv-to-executive-report@0.2.0   # admin step; dev-token = auto-admin
 
 # 2. Call it (quick-try with the bundled 50-row revenue CSV)
 curl -X POST http://localhost:4000/api/agents/dev/csv-to-executive-report/run \

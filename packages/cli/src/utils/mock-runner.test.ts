@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { mockRun } from "./mock-runner.js";
 
 const baseConfig: AgentConfig = {
-  name: "test/agent",
+  name: "test-agent",
   version: "1.0.0",
   model: { provider: "anthropic", name: "claude-sonnet-4-20250514" },
   tools: [],

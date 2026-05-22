@@ -3,6 +3,7 @@ import { parseSSEStream } from "./sse.js";
 import type {
   AgentIdentifier,
   AgentMetadata,
+  AgentVersionInfo,
   AsyncRunResult,
   ListOptions,
   PaginatedList,
@@ -208,31 +209,58 @@ export class SkrunClient {
     if (options?.page) params.set("page", String(options.page));
     if (options?.limit) params.set("limit", String(options.limit));
     const qs = params.toString() ? `?${params.toString()}` : "";
-    const res = await this.request(`/api/agents${qs}`, { method: "GET" });
+    // Authorization header is required — the endpoint filters by ownership
+    // for non-admin callers and returns 401 to anonymous requests.
+    const res = await this.request(`/api/agents${qs}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
     return (await res.json()) as PaginatedList;
   }
 
   /** Get metadata for a specific agent. */
   async getAgent(agent: AgentIdentifier): Promise<AgentMetadata> {
     const { namespace, name } = this.parseAgent(agent);
-    const res = await this.request(`/api/agents/${namespace}/${name}`, { method: "GET" });
+    // Auth required — non-owner non-admin callers receive 404 NOT_FOUND
+    // indistinguishable from a genuine not-found (opacity by design).
+    const res = await this.request(`/api/agents/${namespace}/${name}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
     return (await res.json()) as AgentMetadata;
   }
 
   /** Get all published versions of an agent. */
   async getVersions(agent: AgentIdentifier): Promise<string[]> {
     const { namespace, name } = this.parseAgent(agent);
-    const res = await this.request(`/api/agents/${namespace}/${name}/versions`, { method: "GET" });
+    // Auth required — same 404 opacity as getAgent for non-owner readers.
+    const res = await this.request(`/api/agents/${namespace}/${name}/versions`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
     const body = (await res.json()) as {
       versions: Array<string | { version: string }>;
     };
     return body.versions.map((v) => (typeof v === "string" ? v : v.version));
   }
 
-  /** Set or unset the verified flag on an agent. */
-  async verify(agent: AgentIdentifier, verified: boolean): Promise<AgentMetadata> {
+  /**
+   * Set or unset the verified flag for a specific version of an agent. Admin
+   * only — non-admin callers receive 403. The runtime gate at `POST /run`
+   * consumes this flag; calls without verification return
+   * {@link SkrunNotVerifiedError}.
+   *
+   * @param agent - "namespace/name" string or { namespace, name } object
+   * @param version - Semver string (e.g. "1.2.0")
+   * @param verified - true to mint, false to revoke
+   */
+  async verifyVersion(
+    agent: AgentIdentifier,
+    version: string,
+    verified: boolean,
+  ): Promise<AgentVersionInfo> {
     const { namespace, name } = this.parseAgent(agent);
-    const res = await this.request(`/api/agents/${namespace}/${name}/verify`, {
+    const res = await this.request(`/api/agents/${namespace}/${name}/versions/${version}/verify`, {
       method: "PATCH",
       headers: {
         Authorization: `Bearer ${this.token}`,
@@ -240,7 +268,7 @@ export class SkrunClient {
       },
       body: JSON.stringify({ verified }),
     });
-    return (await res.json()) as AgentMetadata;
+    return (await res.json()) as AgentVersionInfo;
   }
 
   // --- Private helpers ---

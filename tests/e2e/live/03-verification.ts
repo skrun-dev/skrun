@@ -1,126 +1,122 @@
 /**
- * Phase 03 — agent verification flag (#10).
+ * Phase 03 — per-version verification (#83).
  *
- * Default verified=false on push, PATCH /verify flips it, non-dev token on a
- * non-verified agent with scripts/ surfaces an `agent_not_verified_scripts_disabled`
- * warning, dev-token bypasses the check.
- *
- * State cleanup at the end resets pdf-processing.verified=false because the
- * SQLite registry persists across `pnpm test:e2e:live` invocations on dev
- * machines.
+ * Default `agent_versions.verified = false` on push, PATCH per-version
+ * endpoint flips it, POST /run on an unverified version returns 403
+ * AGENT_NOT_VERIFIED, POST /run on a verified version reaches the gate-
+ * passed path. Cleans up by revoking the verification at the end so the
+ * SQLite registry's persisted state matches the default for the next
+ * `pnpm test:e2e:live` run.
  */
 
-import { join } from "node:path";
-import {
-  patchAgent,
-  postRun,
-  REGISTRY,
-  ROOT,
-  restoreAgent,
-  results,
-  skrun,
-  TOKEN,
-} from "./_ctx.js";
+import { postRun, REGISTRY, results, TOKEN } from "./_ctx.js";
+
+const NS = "dev";
+const AGENT = "pdf-processing";
+// The live test catalog is pushed before phase 03 runs; we lookup the latest
+// version dynamically rather than hardcoding.
+async function getLatestVersion(): Promise<string> {
+  const res = await fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}`, {
+    headers: { Authorization: `Bearer ${TOKEN}` },
+  });
+  const body = (await res.json()) as { latest_version: string };
+  return body.latest_version;
+}
+
+async function verifyVersion(version: string, verified: boolean): Promise<Response> {
+  return fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}/versions/${version}/verify`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ verified }),
+  });
+}
 
 export async function run(): Promise<void> {
-  console.log("Testing verification (default verified=false)...");
+  const version = await getLatestVersion();
+
+  // Reset to a known state — the SQLite registry persists across runs.
+  await verifyVersion(version, false);
+
+  console.log("Testing verification (default latest_version_verified=false)...");
   {
-    const res = await fetch(`${REGISTRY}/api/agents/dev/pdf-processing`);
+    const res = await fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
     const body = (await res.json()) as Record<string, unknown>;
     results.push({
       agent: "verification",
-      feature: "Default verified=false",
-      passed: body.verified === false,
+      feature: "Default latest_version_verified=false",
+      passed: body.latest_version_verified === false,
       duration: 0,
       cost: 0,
-      detail: `verified=${body.verified}`,
+      detail: `latest_version_verified=${body.latest_version_verified}`,
     });
   }
 
-  console.log("Testing verification (PATCH /verify → true)...");
+  console.log("Testing verification (POST /run on unverified → 403 AGENT_NOT_VERIFIED)...");
   {
-    const res = await fetch(`${REGISTRY}/api/agents/dev/pdf-processing/verify`, {
-      method: "PATCH",
+    const res = await fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}/run`, {
+      method: "POST",
       headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ verified: true }),
+      body: JSON.stringify({ input: { task: "summarize" } }),
     });
+    const body = (await res.json()) as { error?: { code?: string; message?: string } };
+    const passed = res.status === 403 && body.error?.code === "AGENT_NOT_VERIFIED";
+    results.push({
+      agent: "verification",
+      feature: "Unverified → 403 AGENT_NOT_VERIFIED",
+      passed,
+      duration: 0,
+      cost: 0,
+      detail: `status=${res.status} code=${body.error?.code ?? ""} version=${version}`,
+    });
+  }
+
+  console.log("Testing verification (PATCH .../versions/:v/verify → true)...");
+  {
+    const res = await verifyVersion(version, true);
     const body = (await res.json()) as Record<string, unknown>;
     results.push({
       agent: "verification",
-      feature: "PATCH /verify → true",
-      passed: body.verified === true,
+      feature: "PATCH /versions/:v/verify → true",
+      passed: body.verified === true && body.version === version,
       duration: 0,
       cost: 0,
-      detail: `verified=${body.verified}`,
+      detail: `verified=${body.verified} version=${body.version}`,
     });
   }
 
-  console.log("Testing verification (non-dev token + non-verified → warning)...");
+  console.log("Testing verification (verified version reaches gate-passed path)...");
   {
-    // The `agent_not_verified_scripts_disabled` warning only fires when an agent
-    // ACTUALLY has a `scripts/` directory. pdf-processing v1.1.0+ is vision-only
-    // (no scripts/), so we re-target on `changelog-generator` which has scripts/
-    // and a simple single-string input shape.
-    const cgDir = join(ROOT, "agents/changelog-generator");
-    const cgOriginal = patchAgent(cgDir, "dev", "google", "gemini-2.5-flash");
+    // After verify, POST /run no longer returns 403 — exercises the runtime
+    // gate flip. We use postRun which does the JSON LLM call; here we only
+    // assert it doesn't return 403 AGENT_NOT_VERIFIED. Downstream LLM errors
+    // are tolerated (this phase is the gate test, not the full run).
+    const res = await fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}/run`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ input: { task: "summarize" } }),
+    });
+    // Drain body so the response is consumed (avoids unhandled-rejection warnings).
+    let body: { error?: { code?: string } } = {};
     try {
-      skrun(["build"], cgDir);
-      try {
-        skrun(["push"], cgDir);
-      } catch {
-        // 409 already pushed in a prior run — agent is in the registry, proceed.
-      }
-
-      // Revoke verification first (default is false anyway, but ensure it).
-      await fetch(`${REGISTRY}/api/agents/dev/changelog-generator/verify`, {
-        method: "PATCH",
-        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ verified: false }),
-      });
-      const res = await fetch(`${REGISTRY}/api/agents/dev/changelog-generator/run`, {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer test-user-token",
-          "Content-Type": "application/json",
-          "X-LLM-API-Key": JSON.stringify({ google: "fake" }),
-        },
-        body: JSON.stringify({ input: { repo_path: "./fixtures/sample-repo.git-log.txt" } }),
-      });
-      const body = (await res.json()) as Record<string, unknown>;
-      const warnings = body.warnings as string[] | undefined;
-      results.push({
-        agent: "verification",
-        feature: "Non-dev + non-verified → warning",
-        passed: Array.isArray(warnings) && warnings.includes("agent_not_verified_scripts_disabled"),
-        duration: 0,
-        cost: 0,
-        detail: `warnings=${JSON.stringify(warnings)}`,
-      });
-    } finally {
-      restoreAgent(cgDir, cgOriginal);
-      // State cleanup: prior test (#2) PATCHes pdf-processing.verified=true.
-      // Reset it to false so the next live-test invocation starts the
-      // verification block with the expected default (SQLite persists state
-      // across `pnpm test:e2e:live` runs on dev machines).
-      await fetch(`${REGISTRY}/api/agents/dev/pdf-processing/verify`, {
-        method: "PATCH",
-        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ verified: false }),
-      });
+      body = (await res.json()) as { error?: { code?: string } };
+    } catch {
+      // SSE / non-JSON response — fine, the assertion only cares about status.
     }
-  }
-
-  console.log("Testing verification (dev-token bypass → no warning)...");
-  {
-    const res = await postRun("dev", "pdf-processing", { content: "test", task: "summarize" });
-    const warnings = res.warnings as string[] | undefined;
+    const passed = res.status !== 403 || body.error?.code !== "AGENT_NOT_VERIFIED";
     results.push({
       agent: "verification",
-      feature: "Dev-token bypass → no warning",
-      passed: warnings === undefined,
+      feature: "Verified → past 403 gate",
+      passed,
       duration: 0,
       cost: 0,
-      detail: `warnings=${JSON.stringify(warnings)}`,
+      detail: `status=${res.status} code=${body.error?.code ?? ""}`,
     });
+    void postRun;
   }
+
+  // State cleanup: revert to the pristine default so the next run starts at
+  // verified=false (SQLite persists across `pnpm test:e2e:live` runs).
+  await verifyVersion(version, false);
 }

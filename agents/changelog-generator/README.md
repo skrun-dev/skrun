@@ -26,7 +26,14 @@ From the repo root:
 cd agents/changelog-generator
 skrun build && skrun push
 
-# 2. Call it (quick-try with the bundled fixture)
+# 2. Verify the just-pushed version (admin step; dev-token is auto-admin)
+skrun verify dev/changelog-generator@1.0.0
+
+# 3. Call it via the CLI (or use curl below)
+skrun run dev/changelog-generator \
+  -i '{"repo_path": "./fixtures/sample-repo.git-log.txt", "project_name": "my-project"}'
+
+# Alternative — raw HTTP via curl:
 curl -X POST http://localhost:4000/api/agents/dev/changelog-generator/run \
   -H "Authorization: Bearer dev-token" \
   -H "Content-Type: application/json" \

@@ -7,7 +7,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
     openapi: "3.1.0",
     info: {
       title: "Skrun API",
-      version: "0.7.0",
+      version: "0.8.0",
       description:
         "Deploy any Agent Skill as an API. Multi-model, stateful, multimodal, open source.",
       license: { name: "MIT", url: "https://github.com/skrun-dev/skrun/blob/main/LICENSE" },
@@ -209,12 +209,12 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
           properties: {
             name: { type: "string" },
             namespace: { type: "string" },
-            verified: { type: "boolean" },
+            latest_version_verified: { type: "boolean" },
             latest_version: { type: "string" },
             created_at: { type: "string", format: "date-time" },
             updated_at: { type: "string", format: "date-time" },
           },
-          required: ["name", "namespace", "verified", "latest_version"],
+          required: ["name", "namespace", "latest_version_verified", "latest_version"],
         },
         PaginatedList: {
           type: "object",
@@ -294,7 +294,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
           summary: "Run an agent",
           operationId: "runAgent",
           description:
-            "Execute an agent. Supports sync (default), SSE streaming (Accept: text/event-stream), and async webhook (webhook_url in body).",
+            "Execute an agent. Supports sync (default), SSE streaming (Accept: text/event-stream), and async webhook (webhook_url in body). Webhook mode requires the `WEBHOOK_SIGNING_KEY` env var on the server — without it the runtime refuses to deliver the callback.",
           parameters: [
             { name: "namespace", in: "path", required: true, schema: { type: "string" } },
             { name: "name", in: "path", required: true, schema: { type: "string" } },
@@ -314,7 +314,8 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                     webhook_url: {
                       type: "string",
                       format: "uri",
-                      description: "URL for async webhook delivery (activates async mode)",
+                      description:
+                        "URL for async webhook delivery (activates async mode). Production: must be HTTPS and resolve to a public address (private IPs / cloud-metadata endpoints are refused). Dev mode (NODE_ENV != production) accepts http://localhost:NNNN/... for local testing.",
                     },
                     version: {
                       type: "string",
@@ -571,8 +572,9 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
       "/api/agents": {
         get: {
           summary: "List all agents",
+          description:
+            "Auth required. Returns the caller's own agents (filtered by `owner_id`) when role='user'; returns all agents instance-wide when role='admin' (dev-token in single-tenant self-host always satisfies this).",
           operationId: "listAgents",
-          security: [],
           parameters: [
             { name: "page", in: "query", schema: { type: "integer", default: 1 } },
             { name: "limit", in: "query", schema: { type: "integer", default: 20 } },
@@ -584,14 +586,21 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                 "application/json": { schema: { $ref: "#/components/schemas/PaginatedList" } },
               },
             },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
           },
         },
       },
       "/api/agents/{namespace}/{name}": {
         get: {
           summary: "Get agent metadata",
+          description:
+            "Auth required. Returns 404 when the caller is not the owner of the agent and not an admin — indistinguishable from a genuine not-found (existence is hidden from non-privileged readers).",
           operationId: "getAgent",
-          security: [],
           parameters: [
             { name: "namespace", in: "path", required: true, schema: { type: "string" } },
             { name: "name", in: "path", required: true, schema: { type: "string" } },
@@ -601,6 +610,12 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
               description: "Agent metadata",
               content: {
                 "application/json": { schema: { $ref: "#/components/schemas/AgentMetadata" } },
+              },
+            },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
             },
             "404": {
@@ -657,8 +672,9 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
       "/api/agents/{namespace}/{name}/versions": {
         get: {
           summary: "List agent versions",
+          description:
+            "Auth required. Returns 404 when the caller is not the owner and not an admin (existence hidden — same opacity pattern as the metadata route).",
           operationId: "getAgentVersions",
-          security: [],
           parameters: [
             { name: "namespace", in: "path", required: true, schema: { type: "string" } },
             { name: "name", in: "path", required: true, schema: { type: "string" } },
@@ -691,8 +707,13 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                               description:
                                 "Optional note attached at push time via `skrun push -m` or the X-Skrun-Version-Notes header. Plain text, max 500 chars. Null if not provided.",
                             },
+                            verified: {
+                              type: "boolean",
+                              description:
+                                "Per-version verified flag. Gated by `PATCH /api/agents/:ns/:name/versions/:version/verify` (admin only). `POST /run` returns 403 AGENT_NOT_VERIFIED when this is false for the resolved version.",
+                            },
                           },
-                          required: ["version", "size", "pushed_at", "notes"],
+                          required: ["version", "size", "pushed_at", "notes", "verified"],
                         },
                       },
                     },
@@ -700,8 +721,83 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                 },
               },
             },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
             "404": {
               description: "Agent not found",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+      },
+      "/api/agents/{namespace}/{name}/versions/{version}/verify": {
+        patch: {
+          summary: "Verify or unverify a version (admin only)",
+          operationId: "verifyVersion",
+          description:
+            "Set or unset the verified flag on a specific version. Only verified versions can be invoked via POST /run — unverified runs return 403 AGENT_NOT_VERIFIED. Restricted to callers with `user.role === 'admin'`. Promotion to admin is a manual SQL UPDATE on the users table — no HTTP endpoint for role elevation by design. The legacy agent-level `PATCH /api/agents/:ns/:name/verify` route (v0.7.x) was removed in v0.8.0.",
+          parameters: [
+            { name: "namespace", in: "path", required: true, schema: { type: "string" } },
+            { name: "name", in: "path", required: true, schema: { type: "string" } },
+            { name: "version", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: { verified: { type: "boolean" } },
+                  required: ["verified"],
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "Updated version row",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      version: { type: "string" },
+                      size: { type: "integer" },
+                      pushed_at: { type: "string" },
+                      notes: { type: ["string", "null"] },
+                      verified: { type: "boolean" },
+                    },
+                    required: ["version", "size", "pushed_at", "notes", "verified"],
+                  },
+                },
+              },
+            },
+            "400": {
+              description: "Invalid body",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description: "Caller is not an admin",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "404": {
+              description: "Agent or version not found",
               content: {
                 "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
@@ -745,55 +841,6 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
             "409": {
               description:
                 "LAST_VERSION — cannot delete the last remaining version. Use DELETE /api/agents/{namespace}/{name} for full removal.",
-              content: {
-                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
-              },
-            },
-          },
-        },
-      },
-      "/api/agents/{namespace}/{name}/verify": {
-        patch: {
-          summary: "Verify or unverify an agent",
-          operationId: "verifyAgent",
-          description: "Set the verified flag. Only verified agents can execute scripts.",
-          parameters: [
-            { name: "namespace", in: "path", required: true, schema: { type: "string" } },
-            { name: "name", in: "path", required: true, schema: { type: "string" } },
-          ],
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: { verified: { type: "boolean" } },
-                  required: ["verified"],
-                },
-              },
-            },
-          },
-          responses: {
-            "200": {
-              description: "Updated metadata",
-              content: {
-                "application/json": { schema: { $ref: "#/components/schemas/AgentMetadata" } },
-              },
-            },
-            "400": {
-              description: "Invalid body",
-              content: {
-                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
-              },
-            },
-            "401": {
-              description: "Unauthorized",
-              content: {
-                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
-              },
-            },
-            "404": {
-              description: "Agent not found",
               content: {
                 "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
@@ -1024,8 +1071,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
           summary: "Download a file produced by an agent run (run-scoped, backward-compat)",
           operationId: "getRunFile",
           description:
-            "Run-scoped download. Kept for backward compatibility. New clients should prefer the unified GET /api/files/{id}/content using `file_id` from the run response.",
-          security: [],
+            "Run-scoped download. Kept for backward compatibility. New clients should prefer the unified GET /api/files/{id}/content using `file_id` from the run response. Requires authentication AND that the caller owns the run.",
           parameters: [
             {
               name: "run_id",
@@ -1040,6 +1086,18 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
               description: "File content",
               content: {
                 "application/octet-stream": { schema: { type: "string", format: "binary" } },
+              },
+            },
+            "401": {
+              description: "Missing or invalid Authorization header",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description: "Caller is not the run owner",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
             },
             "404": {
@@ -1112,7 +1170,8 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
         get: {
           summary: "Get file metadata (input or output, unified namespace)",
           operationId: "getFileMetadata",
-          security: [],
+          description:
+            "Requires authentication; the caller must be either the uploader (input) or the run owner (output).",
           parameters: [
             {
               name: "id",
@@ -1128,6 +1187,18 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                 "application/json": {
                   schema: { $ref: "#/components/schemas/UploadedFileMetadata" },
                 },
+              },
+            },
+            "401": {
+              description: "Missing or invalid Authorization header",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description: "Caller is not the file owner",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
             },
             "404": {
@@ -1178,7 +1249,8 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
         get: {
           summary: "Download file binary content (input or output, unified namespace)",
           operationId: "getFileContent",
-          security: [],
+          description:
+            "Requires authentication; the caller must be either the uploader (input) or the run owner (output).",
           parameters: [
             {
               name: "id",
@@ -1192,6 +1264,18 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
               description: "Binary file content with Content-Type from upload",
               content: {
                 "application/octet-stream": { schema: { type: "string", format: "binary" } },
+              },
+            },
+            "401": {
+              description: "Missing or invalid Authorization header",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description: "Caller is not the file owner",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
             },
             "404": {
@@ -1288,7 +1372,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
           summary: "Per-agent stats with period comparison",
           operationId: "getAgentStats",
           description:
-            "Per-agent metrics over a rolling window. Returns current period + previous period (for delta) + 7-day daily arrays.",
+            "Per-agent metrics over a rolling window. Returns current period + previous period (for delta) + 7-day daily arrays. Auth required. Returns 404 when the caller is not the owner and not an admin (existence hidden — same opacity pattern as the other per-agent GET routes).",
           parameters: [
             { name: "namespace", in: "path", required: true, schema: { type: "string" } },
             { name: "name", in: "path", required: true, schema: { type: "string" } },
@@ -1354,6 +1438,18 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                     },
                   },
                 },
+              },
+            },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "404": {
+              description: "Agent not found",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
             },
           },

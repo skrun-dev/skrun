@@ -24,9 +24,27 @@ const server = setupServer(
   http.get("/api/agents/dev/test-agent/versions", () =>
     HttpResponse.json({
       versions: [
-        { id: "v1", version: "1.0.0", size: 1024, pushed_at: "2026-04-18T00:00:00Z" },
-        { id: "v2", version: "1.1.0", size: 1100, pushed_at: "2026-04-19T00:00:00Z" },
-        { id: "v3", version: "1.2.0", size: 1200, pushed_at: "2026-04-20T00:00:00Z" },
+        {
+          id: "v1",
+          version: "1.0.0",
+          size: 1024,
+          pushed_at: "2026-04-18T00:00:00Z",
+          verified: false,
+        },
+        {
+          id: "v2",
+          version: "1.1.0",
+          size: 1100,
+          pushed_at: "2026-04-19T00:00:00Z",
+          verified: true,
+        },
+        {
+          id: "v3",
+          version: "1.2.0",
+          size: 1200,
+          pushed_at: "2026-04-20T00:00:00Z",
+          verified: false,
+        },
       ],
     }),
   ),
@@ -73,7 +91,8 @@ describe("AgentDetailPage", () => {
     renderDetailPage();
     await waitFor(() => {
       expect(screen.getAllByText("dev/test-agent").length).toBeGreaterThan(0);
-      expect(screen.getByText("verified")).toBeInTheDocument();
+      // Agent-level verified badge removed in per-version migration; trust
+      // status now lives in the per-row badges of the versions table.
       expect(screen.getByText("1.0.0")).toBeInTheDocument();
       expect(screen.getAllByText("1.2.0").length).toBeGreaterThan(0);
     });
@@ -275,6 +294,125 @@ describe("AgentDetailPage", () => {
       expect(text).toContain("🚀");
       // Should NOT contain the second emoji (truncated)
       expect(text).not.toContain("🎉");
+    });
+  });
+
+  // DSH-A (audit/001 Task 4.11): verify-button visibility gated on user.role
+  // Server enforces SEC-005 admin-only PATCH /verify; the dashboard hides
+  // the button entirely for non-admin viewers so they don't get teased.
+  describe("DSH-A: verify-button gated on user.role", () => {
+    it("renders Verify button when /api/me returns role='admin'", async () => {
+      server.use(
+        http.get("/api/me", () =>
+          HttpResponse.json({
+            id: "u-admin",
+            username: "admin",
+            namespace: "admin",
+            role: "admin",
+          }),
+        ),
+      );
+      renderDetailPage();
+      await waitFor(() => {
+        // Admin sees Verify/Unverify buttons — the legacy agent-level one in
+        // the Danger zone AND per-version buttons in the versions table
+        // (Task 7.3). At least one must be present.
+        expect(screen.getAllByRole("button", { name: /unverify|verify/i }).length).toBeGreaterThan(
+          0,
+        );
+      });
+    });
+
+    it("hides Verify button when /api/me returns role='user'", async () => {
+      server.use(
+        http.get("/api/me", () =>
+          HttpResponse.json({
+            id: "u-regular",
+            username: "regular",
+            namespace: "regular",
+            role: "user",
+          }),
+        ),
+      );
+      renderDetailPage();
+      // Wait for the page to render — agent name appears in the breadcrumb.
+      // Delete button is also hidden for a non-admin viewer in a foreign
+      // namespace (per AC-22, post-#83), so we use the breadcrumb text as
+      // a stable "page loaded" sentinel instead.
+      await waitFor(() => {
+        expect(screen.getAllByText("dev/test-agent").length).toBeGreaterThan(0);
+      });
+      expect(screen.queryByRole("button", { name: /^(un)?verify$/i })).not.toBeInTheDocument();
+    });
+
+    it("hides Verify button when /api/me 401s (unauthenticated → least-privilege)", async () => {
+      server.use(http.get("/api/me", () => new HttpResponse(null, { status: 401 })));
+      renderDetailPage();
+      await waitFor(() => {
+        expect(screen.getAllByText("dev/test-agent").length).toBeGreaterThan(0);
+      });
+      expect(screen.queryByRole("button", { name: /^(un)?verify$/i })).not.toBeInTheDocument();
+    });
+  });
+
+  // ── Per-version Status + Actions in versions table (Phase 7.3 — UAT-21..24) ─
+  describe("versions table Status + Actions columns", () => {
+    it("UAT-21: renders per-row Status badge for each version", async () => {
+      renderDetailPage();
+      await waitFor(() => {
+        expect(screen.getAllByText("1.0.0").length).toBeGreaterThan(0);
+      });
+      // Fixture has 3 versions: v1.0.0 unverified, v1.1.0 verified, v1.2.0 unverified
+      // → 2 "unverified" Pills + 1 "verified" Pill (at minimum — could be more
+      // if other surfaces render the label).
+      const verifiedPills = screen.getAllByText("verified");
+      const unverifiedPills = screen.getAllByText("unverified");
+      expect(verifiedPills.length).toBeGreaterThanOrEqual(1);
+      expect(unverifiedPills.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it("UAT-22/23: admin sees Verify/Unverify button per row (mix of states)", async () => {
+      server.use(
+        http.get("/api/me", () =>
+          HttpResponse.json({
+            id: "u-admin",
+            username: "admin",
+            namespace: "admin",
+            role: "admin",
+          }),
+        ),
+      );
+      renderDetailPage();
+      await waitFor(() => {
+        expect(screen.getAllByText("1.0.0").length).toBeGreaterThan(0);
+      });
+      // Three versions in the table: 2 unverified → 2 "Verify" buttons,
+      // 1 verified → 1 "Unverify" button. Total at least 3.
+      const verifyButtons = screen.getAllByRole("button", { name: /^Verify$/ });
+      const unverifyButtons = screen.getAllByRole("button", { name: /^Unverify$/ });
+      expect(verifyButtons.length).toBeGreaterThanOrEqual(2);
+      expect(unverifyButtons.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("UAT-24: non-admin sees NO Verify/Unverify buttons", async () => {
+      server.use(
+        http.get("/api/me", () =>
+          HttpResponse.json({
+            id: "u-reg",
+            username: "regular",
+            namespace: "regular",
+            role: "user",
+          }),
+        ),
+      );
+      renderDetailPage();
+      await waitFor(() => {
+        expect(screen.getAllByText("1.0.0").length).toBeGreaterThan(0);
+      });
+      // Status Pills exist (badges visible to everyone), but no
+      // Verify/Unverify action buttons for non-admin.
+      expect(screen.queryByRole("button", { name: /^Verify$/ })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^Unverify$/ })).not.toBeInTheDocument();
     });
   });
 });

@@ -1,8 +1,28 @@
 import type { McpServer } from "@skrun-dev/schema";
+import { McpConnectError } from "../errors.js";
 import type { Logger } from "../logger.js";
 import { createLogger } from "../logger.js";
 import { isHostAllowed } from "../security/network.js";
 import type { ToolDefinition, ToolProvider, ToolResult } from "./types.js";
+
+// Bumped from 30s to 120s after empirical measurement: `npx -y @playwright/mcp`
+// cold-start (package resolve + Playwright init handshake) takes ~70s even
+// when chromium is already cached on disk. A 30s bound failed 100% of the
+// time on fresh registry processes — see the post-#83 investigation. 120s
+// leaves headroom for true cold cache (chromium download).
+const DEFAULT_MCP_CONNECT_TIMEOUT_MS = 120_000;
+
+// MCP SDK's JSON-RPC `RequestTimeout` error code (see
+// @modelcontextprotocol/sdk types.ts ErrorCode enum). Surfaced by the SDK
+// itself when `client.connect(transport, { timeout })` exceeds the bound.
+const MCP_SDK_REQUEST_TIMEOUT_CODE = -32001;
+
+function resolveConnectTimeoutMs(): number {
+  const raw = process.env.MCP_CONNECT_TIMEOUT_MS;
+  if (!raw) return DEFAULT_MCP_CONNECT_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MCP_CONNECT_TIMEOUT_MS;
+}
 
 /**
  * MCP Tool Provider — connects to an MCP server and exposes its tools.
@@ -20,14 +40,17 @@ export class McpToolProvider implements ToolProvider {
   private client: any = null;
 
   private allowedHosts: string[];
+  private connectTimeoutMs: number;
 
   constructor(
     private config: McpServer,
     logger?: Logger,
     allowedHosts: string[] = [],
+    connectTimeoutMs?: number,
   ) {
     this.logger = logger ?? createLogger("mcp");
     this.allowedHosts = allowedHosts;
+    this.connectTimeoutMs = connectTimeoutMs ?? resolveConnectTimeoutMs();
   }
 
   private getTransportMode(): "stdio" | "sse" | "streamable-http" {
@@ -67,17 +90,50 @@ export class McpToolProvider implements ToolProvider {
       this.connected = true;
     } catch (err) {
       const location = mode === "stdio" ? `command "${this.config.command}"` : `${this.config.url}`;
+      // The SDK throws `McpError` with code `-32001` (RequestTimeout) when
+      // `client.connect(transport, { timeout })` exceeds the bound — that's
+      // our timeout, plumbed through (see connectStdio/SSE/HTTP below).
+      const errCode =
+        err && typeof err === "object" && "code" in err ? (err as { code: unknown }).code : null;
+      const isTimeout = errCode === MCP_SDK_REQUEST_TIMEOUT_CODE;
       this.logger.warn(
         {
-          event: "mcp_connect_failed",
+          event: isTimeout ? "mcp_connect_timeout" : "mcp_connect_failed",
           server: this.config.name,
           transport: mode,
           location,
+          timeout_ms: isTimeout ? this.connectTimeoutMs : undefined,
           error: err instanceof Error ? err.message : String(err),
         },
-        `MCP connection failed for "${this.config.name}"`,
+        isTimeout
+          ? `MCP connect timed out for "${this.config.name}" after ${this.connectTimeoutMs}ms`
+          : `MCP connection failed for "${this.config.name}"`,
       );
+      // Tear down any half-open transport (subprocess / HTTP connection) so we
+      // don't leak resources when connect() throws partway through.
+      try {
+        await this.client?.close();
+      } catch {
+        // disconnect best-effort
+      }
+      this.client = null;
       this.tools = [];
+      // Surface the failure to the caller. Swallowing here previously let the
+      // run continue with `tools=[]`, the LLM would hallucinate plausible
+      // outputs, and output-validation repair retry would massage them into
+      // schema-compliant garbage — a silent success that masked a real
+      // connection bug. Fail loudly instead so the route can return
+      // MCP_CONNECT_FAILED to the caller.
+      throw new McpConnectError(
+        {
+          server: this.config.name,
+          transport: mode,
+          location,
+          isTimeout,
+          ...(isTimeout && { timeoutMs: this.connectTimeoutMs }),
+        },
+        err,
+      );
     }
   }
 
@@ -95,7 +151,11 @@ export class McpToolProvider implements ToolProvider {
       args,
     });
 
-    await this.client.connect(transport);
+    // Plumb our timeout through the SDK — without this option the SDK
+    // falls back to DEFAULT_REQUEST_TIMEOUT_MSEC (60s) and any larger
+    // skrun-side bound is unreachable (same constraint Anthropic
+    // documents in claude-code #16837). Single source of truth.
+    await this.client.connect(transport, { timeout: this.connectTimeoutMs });
   }
 
   private async connectSSE(): Promise<void> {
@@ -110,7 +170,7 @@ export class McpToolProvider implements ToolProvider {
     const { SSEClientTransport } = await import("@modelcontextprotocol/sdk/client/sse.js");
     const url = this.config.url ?? "";
     const transport = new SSEClientTransport(new URL(url));
-    await this.client.connect(transport);
+    await this.client.connect(transport, { timeout: this.connectTimeoutMs });
   }
 
   private async connectStreamableHTTP(): Promise<void> {
@@ -127,7 +187,7 @@ export class McpToolProvider implements ToolProvider {
     );
     const url = this.config.url ?? "";
     const transport = new StreamableHTTPClientTransport(new URL(url));
-    await this.client.connect(transport);
+    await this.client.connect(transport, { timeout: this.connectTimeoutMs });
   }
 
   async listTools(): Promise<ToolDefinition[]> {

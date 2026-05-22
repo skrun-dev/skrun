@@ -49,6 +49,7 @@ describe("InputCache", () => {
       media_type: mediaType,
       purpose: "input",
       expires_at: expiresAt,
+      owner_id: "test-owner",
     });
     const result = getInputFile("fil_test1");
     expect(result).toBeDefined();
@@ -73,6 +74,7 @@ describe("InputCache", () => {
       media_type: mediaType,
       purpose: "input",
       expires_at: new Date(Date.now() + 86_400_000),
+      owner_id: "test-owner",
     });
     expect(getInputFile("fil_test2")).toBeDefined();
 
@@ -111,6 +113,7 @@ describe("InputCache", () => {
       media_type: mediaType,
       purpose: "input",
       expires_at: new Date(Date.now() + 50),
+      owner_id: "test-owner",
     });
 
     await new Promise((resolve) => setTimeout(resolve, 100));

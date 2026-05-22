@@ -70,7 +70,7 @@ describe("generateAgentYaml", () => {
     const generated = generateAgentYaml(mockSkill);
     const fullConfig = {
       ...generated.config,
-      name: "acme/pdf-processing",
+      name: "pdf-processing",
       model: { provider: "anthropic", name: "claude-sonnet-4-20250514" },
       inputs: [{ name: "query", type: "string", required: true }],
       outputs: [{ name: "result", type: "string" }],
@@ -83,7 +83,7 @@ describe("generateAgentYaml", () => {
 describe("serializeAgentYaml", () => {
   it("should serialize and round-trip a config", () => {
     const config = AgentConfigSchema.parse({
-      name: "acme/test",
+      name: "test-agent",
       version: "1.0.0",
       model: { provider: "anthropic", name: "claude-sonnet-4-20250514" },
       inputs: [{ name: "query", type: "string" }],
@@ -91,7 +91,7 @@ describe("serializeAgentYaml", () => {
     });
 
     const yaml = serializeAgentYaml(config);
-    expect(yaml).toContain("acme/test");
+    expect(yaml).toContain("test-agent");
 
     const roundTripped = parseAgentYaml(yaml);
     expect(roundTripped.config.name).toBe(config.name);
@@ -102,7 +102,7 @@ describe("serializeAgentYaml", () => {
 
   it("should produce human-readable YAML", () => {
     const config = AgentConfigSchema.parse({
-      name: "acme/readable",
+      name: "readable",
       version: "1.0.0",
       model: { provider: "openai", name: "gpt-4o" },
       inputs: [{ name: "query", type: "string" }],
@@ -110,7 +110,7 @@ describe("serializeAgentYaml", () => {
     });
 
     const yaml = serializeAgentYaml(config);
-    expect(yaml).toContain("name: acme/readable");
+    expect(yaml).toContain("name: readable");
     expect(yaml).toContain("provider: openai");
   });
 });

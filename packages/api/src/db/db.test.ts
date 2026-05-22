@@ -33,12 +33,66 @@ describe("MemoryDb", () => {
     await db.createAgent({ name: "b", namespace: "ns", description: "", owner_id: "u" });
     await db.createAgent({ name: "c", namespace: "ns", description: "", owner_id: "u" });
 
-    const page1 = await db.listAgents(1, 2);
+    const page1 = await db.listAgents({ page: 1, limit: 2 });
     expect(page1.agents).toHaveLength(2);
     expect(page1.total).toBe(3);
 
-    const page2 = await db.listAgents(2, 2);
+    const page2 = await db.listAgents({ page: 2, limit: 2 });
     expect(page2.agents).toHaveLength(1);
+  });
+
+  // VT-1 (#80): listAgents multi-tenant — userId filter isolates rows (memory impl)
+  it("VT-1: listAgents — userId filter narrows to owner's agents only", async () => {
+    await db.createAgent({ name: "a1", namespace: "userA", description: "", owner_id: "user-A" });
+    await db.createAgent({ name: "a2", namespace: "userA", description: "", owner_id: "user-A" });
+    await db.createAgent({ name: "b1", namespace: "userB", description: "", owner_id: "user-B" });
+    await db.createAgent({ name: "b2", namespace: "userB", description: "", owner_id: "user-B" });
+    await db.createAgent({ name: "b3", namespace: "userB", description: "", owner_id: "user-B" });
+
+    const listA = await db.listAgents({ page: 1, limit: 20, userId: "user-A" });
+    expect(listA.agents).toHaveLength(2);
+    expect(listA.total).toBe(2);
+    expect(listA.agents.every((a) => a.owner_id === "user-A")).toBe(true);
+
+    const listB = await db.listAgents({ page: 1, limit: 20, userId: "user-B" });
+    expect(listB.agents).toHaveLength(3);
+    expect(listB.total).toBe(3);
+    expect(listB.agents.every((a) => a.owner_id === "user-B")).toBe(true);
+
+    // VT-3: no userId returns all (admin bypass / dev-token mode)
+    const listAll = await db.listAgents({ page: 1, limit: 20 });
+    expect(listAll.agents).toHaveLength(5);
+    expect(listAll.total).toBe(5);
+  });
+
+  // VT-9b (#80): listAgents multi-page accuracy with userId filter
+  it("VT-9b: listAgents — userId filter multi-page (25 agents, page 2, limit 20 → 5 agents, total 25)", async () => {
+    for (let i = 0; i < 25; i++) {
+      await db.createAgent({
+        name: `a${i}`,
+        namespace: "userA",
+        description: "",
+        owner_id: "user-A",
+      });
+    }
+    // 5 agents belonging to a different user — must be excluded from page-2 results
+    for (let i = 0; i < 5; i++) {
+      await db.createAgent({
+        name: `b${i}`,
+        namespace: "userB",
+        description: "",
+        owner_id: "user-B",
+      });
+    }
+
+    const page1 = await db.listAgents({ page: 1, limit: 20, userId: "user-A" });
+    expect(page1.agents).toHaveLength(20);
+    expect(page1.total).toBe(25);
+
+    const page2 = await db.listAgents({ page: 2, limit: 20, userId: "user-A" });
+    expect(page2.agents).toHaveLength(5);
+    expect(page2.total).toBe(25); // filtered total, NOT 30
+    expect(page2.agents.every((a) => a.owner_id === "user-A")).toBe(true);
   });
 
   it("should create and get versions", async () => {
@@ -104,7 +158,7 @@ describe("MemoryDb", () => {
     await db.createVersion(agent.id, { version: "2.0.0", size: 200, bundle_key: "k2" });
 
     // Pre-condition: listAgents aggregates capture run_count etc.
-    const before = await db.listAgents(1, 10);
+    const before = await db.listAgents({ page: 1, limit: 10 });
     const beforeStats = before.agents.find((a) => a.id === agent.id);
     expect(beforeStats).toBeDefined();
 
@@ -116,7 +170,7 @@ describe("MemoryDb", () => {
 
     // RT-3 collapsed in: listAgents aggregate counts (run_count, token_count, cost_total)
     // are unchanged because they join on `runs`, not `agent_versions`.
-    const after = await db.listAgents(1, 10);
+    const after = await db.listAgents({ page: 1, limit: 10 });
     const afterStats = after.agents.find((a) => a.id === agent.id);
     expect(afterStats?.run_count).toBe(beforeStats?.run_count);
     expect(afterStats?.token_count).toBe(beforeStats?.token_count);
@@ -133,13 +187,19 @@ describe("MemoryDb", () => {
     expect(await db.getLatestVersion(agent.id)).toBeNull();
   });
 
-  it("should set and get verified status", async () => {
-    await db.createAgent({ name: "a", namespace: "ns", description: "", owner_id: "u" });
-    const updated = await db.setVerified("ns", "a", true);
+  it("should set and get per-version verified status", async () => {
+    const agent = await db.createAgent({
+      name: "a",
+      namespace: "ns",
+      description: "",
+      owner_id: "u",
+    });
+    await db.createVersion(agent.id, { version: "1.0.0", size: 0, bundle_key: "k" });
+    const updated = await db.setVersionVerified("ns", "a", "1.0.0", true);
     expect(updated?.verified).toBe(true);
 
-    const agent = await db.getAgent("ns", "a");
-    expect(agent?.verified).toBe(true);
+    const v = await db.getVersionByNumber(agent.id, "1.0.0");
+    expect(v?.verified).toBe(true);
   });
 
   // --- Agent State (VT-2) ---

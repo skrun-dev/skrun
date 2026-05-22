@@ -51,7 +51,9 @@ export async function run(): Promise<void> {
       skrun(["push", "-m", noteText], dir);
 
       // Fetch versions and assert the latest one has our note
-      const res = await fetch(`${REGISTRY}/api/agents/dev/code-review/versions`);
+      const res = await fetch(`${REGISTRY}/api/agents/dev/code-review/versions`, {
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      });
       const body = (await res.json()) as {
         versions: Array<{ version: string; notes: string | null }>;
       };

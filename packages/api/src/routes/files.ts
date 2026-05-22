@@ -1,16 +1,19 @@
 import { existsSync, readFileSync } from "node:fs";
 import { extname, join, resolve, sep } from "node:path";
 import { SkrunError } from "@skrun-dev/schema";
-import type { MiddlewareHandler } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import {
   deleteInputFile,
+  getInputFile,
   getInputRetentionSeconds,
   registerInputFile,
 } from "../cache/input-cache.js";
-import { getOutputDir } from "../cache/output-cache.js";
+import { getOutputDir, getOutputRunId } from "../cache/output-cache.js";
+import type { DbAdapter } from "../db/adapter.js";
 import { resolveFileId } from "../files/file-id-resolver.js";
 import { writeInputFile } from "../files/input-store.js";
+import { getUser } from "../middleware/auth.js";
 
 const CONTENT_TYPES: Record<string, string> = {
   ".pdf": "application/pdf",
@@ -34,7 +37,63 @@ function isAllowedUploadMime(mime: string): boolean {
   return mime.startsWith("image/") || mime === "application/pdf" || mime.startsWith("audio/");
 }
 
-export function createFilesRoutes(authMiddleware: MiddlewareHandler): Hono {
+/**
+ * Assert the caller owns the file behind a `file_id`. Returns null when
+ * ownership is confirmed, or a Hono Response (403 / 404) to short-circuit.
+ *
+ * - Input files: `owner_id` is stored directly on InputFileMetadata at upload time.
+ * - Output files: ownership derives from the producing run's `user_id`. Output
+ *   file_ids without a backing run row (legacy / expired cache) are denied.
+ */
+async function assertFileOwnership(
+  c: Context,
+  db: DbAdapter,
+  fileId: string,
+): Promise<Response | null> {
+  const userId = getUser(c).id;
+
+  const input = getInputFile(fileId);
+  if (input) {
+    if (input.owner_id !== userId) {
+      return c.json(
+        {
+          error: {
+            code: "FORBIDDEN",
+            message: "You do not have access to this file",
+          },
+        },
+        403,
+      );
+    }
+    return null;
+  }
+
+  // Output side — look up the producing run and compare its user_id.
+  const runId = getOutputRunId(fileId);
+  if (runId) {
+    const run = await db.getRun(runId);
+    // run.user_id is nullable (SET NULL after parent delete). Treat null as
+    // "no longer owned" → refuse rather than expose orphans across tenants.
+    if (!run || run.user_id !== userId) {
+      return c.json(
+        {
+          error: {
+            code: "FORBIDDEN",
+            message: "You do not have access to this file",
+          },
+        },
+        403,
+      );
+    }
+    return null;
+  }
+
+  // file_id is unknown to both indexes — let the downstream handler return its
+  // own 404. Returning null here means "no ownership conflict; continue".
+  return null;
+}
+
+export function createFilesRoutes(db: DbAdapter, authMiddleware: MiddlewareHandler): Hono {
   const router = new Hono();
 
   router.post("/files", authMiddleware, async (c) => {
@@ -99,6 +158,7 @@ export function createFilesRoutes(authMiddleware: MiddlewareHandler): Hono {
       media_type: mediaType,
       purpose: "input",
       expires_at: expiresAt,
+      owner_id: getUser(c).id,
     });
 
     return c.json(
@@ -113,8 +173,10 @@ export function createFilesRoutes(authMiddleware: MiddlewareHandler): Hono {
     );
   });
 
-  router.get("/files/:id", (c) => {
+  router.get("/files/:id", authMiddleware, async (c) => {
     const { id } = c.req.param();
+    const ownership = await assertFileOwnership(c, db, id);
+    if (ownership) return ownership;
     const resolved = resolveFileId(id);
     if (!resolved) {
       return c.json(
@@ -136,8 +198,10 @@ export function createFilesRoutes(authMiddleware: MiddlewareHandler): Hono {
     });
   });
 
-  router.get("/files/:id/content", (c) => {
+  router.get("/files/:id/content", authMiddleware, async (c) => {
     const { id } = c.req.param();
+    const ownership = await assertFileOwnership(c, db, id);
+    if (ownership) return ownership;
     const resolved = resolveFileId(id);
     if (!resolved) {
       return c.json(
@@ -202,8 +266,28 @@ export function createFilesRoutes(authMiddleware: MiddlewareHandler): Hono {
     return c.body(null, 204);
   });
 
-  router.get("/runs/:run_id/files/:filename", (c) => {
+  router.get("/runs/:run_id/files/:filename", authMiddleware, async (c) => {
     const { run_id, filename } = c.req.param();
+
+    // Verify the caller owns the run before serving any byte.
+    const run = await db.getRun(run_id);
+    if (!run) {
+      return c.json(
+        { error: { code: "RUN_NOT_FOUND", message: `Run ${run_id} not found or expired` } },
+        404,
+      );
+    }
+    if (run.user_id !== getUser(c).id) {
+      return c.json(
+        {
+          error: {
+            code: "FORBIDDEN",
+            message: "You do not have access to this run's files",
+          },
+        },
+        403,
+      );
+    }
 
     const dir = getOutputDir(run_id);
     if (!dir) {

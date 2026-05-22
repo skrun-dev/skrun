@@ -1,4 +1,4 @@
-name: dev/pdf-processing
+name: pdf-processing
 version: 1.1.0
 
 # v1.1.0: vision-native. Accepts a PDF directly via Skrun's multimodal-inputs (#56).

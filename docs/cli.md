@@ -15,10 +15,11 @@ skrun init --from-skill ./existing-skill
 |------|-------------|
 | `--from-skill <path>` | Import an existing Agent Skill directory |
 | `--force` | Overwrite existing files |
-| `--name <name>` | Agent name (non-interactive) |
+| `--name <name>` | Agent slug (non-interactive). Lowercase letters, digits, hyphens. |
 | `--description <desc>` | Agent description (non-interactive) |
 | `--model <provider/name>` | Model (non-interactive) |
-| `--namespace <ns>` | Namespace (non-interactive) |
+
+The generated `agent.yaml` carries only the slug — the namespace is assigned by the registry at push time from your auth context (your GitHub username on cloud, `dev` for the local `dev-token`).
 
 ## skrun dev
 
@@ -105,6 +106,8 @@ Requires authentication and a built `.agent` bundle (`skrun build` first).
 - Sent to the server via the `X-Skrun-Version-Notes` HTTP header (not a query param — avoids leaking notes into proxy/CDN logs).
 - If the server doesn't support this feature yet (old registry), the CLI surfaces a visible warning. The push still succeeds — the note is just not stored.
 
+**Post-push warning**: every pushed version lands at `verified=false`. The CLI prints a stderr warning after a successful push reminding the operator to run `skrun verify <ns>/<name>@<version>` before the version can be invoked via `POST /run`. Pushes never fail because of trust state — the warning is informational only.
+
 ## skrun pull
 
 Download an agent from the registry.
@@ -115,6 +118,61 @@ skrun pull acme/seo-audit@1.0.0
 ```
 
 Downloads and extracts the agent into a local directory.
+
+## skrun run
+
+Invoke an agent against the registry and print the output to stdout. The runtime equivalent of `curl POST /api/agents/.../run`, but with proper auth + typed errors. Pushed versions are unverified by default — see `skrun verify` below.
+
+```bash
+# Latest version (no pin) — resolves to most recent push
+skrun run acme/seo-audit -i '{"url": "https://example.com"}'
+
+# Pinned version
+skrun run acme/seo-audit@1.0.0 -i '{"url": "https://example.com"}'
+
+# Input from a file (recommended for secrets — avoids shell history)
+skrun run acme/seo-audit -f input.json
+
+# Input piped via stdin
+cat input.json | skrun run acme/seo-audit --stdin
+```
+
+**Flags**: `-i, --input <json>` (inline JSON), `-f, --file <path>` (file path), `--stdin` (read fd 0). Mutually exclusive — pick one. The input must be a JSON **object**; arrays and primitives are rejected.
+
+**Output**: pretty-printed JSON to stdout on success (exit 0); `<code>: <message>` to stderr on error (exit non-zero). The CLI never prints the raw response body on error — it only surfaces the typed `error.code` + `error.message` so internal details can't leak.
+
+**Verification gate**: if the resolved version is not verified, the call returns `403 AGENT_NOT_VERIFIED` and the CLI prints:
+
+```
+Error: Agent acme/seo-audit version 1.0.0 is not verified.
+Ask an admin to verify it, or run `skrun verify acme/seo-audit@1.0.0` if you are admin.
+```
+
+**Security**: prefer `-f` or `--stdin` over `-i '<inline>'` when the input contains secrets — the inline form is preserved in shell history (`~/.bash_history`, etc.). The CLI does not write input or output to disk by default.
+
+## skrun verify
+
+Mark a specific version of an agent as verified. Admin only — non-admin callers get a clear 403 error.
+
+```bash
+# Verify v1.0.0 of acme/seo-audit
+skrun verify acme/seo-audit@1.0.0
+
+# Symmetric — revoke verification
+skrun unverify acme/seo-audit@1.0.0
+```
+
+**Syntax**: `<namespace>/<name>@<version>` — the `@<version>` is required; verification is per version, not per agent. Pushing a new version creates a row at `verified=false` regardless of the agent's other versions — admins re-verify each version they want runnable.
+
+**Why admin only**: pre-v0.8.0, any namespace owner could verify their own agents — a self-served trust signal. From v0.8.0, only the `admin` role can flip the flag. Promotion to admin is a manual SQL update on the `users` table (see [self-hosting → Admin role](self-hosting.md#admin-role)).
+
+**Dev mode**: when OAuth is not configured (`dev-token` mode), the local caller is auto-admin so `skrun verify` works without setup — preserves zero-friction local development.
+
+**Audit trail**: every successful verify/unverify writes a structured pino log entry on the server (`event: "agent_version_verify"`) with the actor identity and target version. Pipe the registry's stdout to your log aggregator for a forensic record.
+
+## skrun unverify
+
+Revoke verification on a specific version. Symmetric with `skrun verify`. After unverify, `POST /run` on that version returns `403 AGENT_NOT_VERIFIED` until a re-verify.
 
 ## skrun login
 

@@ -1,5 +1,6 @@
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { EmptyState } from "../components/shared/empty-state";
+import { FilesBlock, type RunFile } from "../components/shared/files-block";
 import { IconChevRight, IconPlay } from "../components/shared/icons";
 import { JsonViewer } from "../components/shared/json-viewer";
 import { Btn, Card, PageHeader, Pill, StatusPill } from "../components/shared/ui";
@@ -139,6 +140,13 @@ export function RunDetailPage() {
         ))}
       </div>
 
+      {/* Files produced by the run (if any) */}
+      {run.files && run.files.length > 0 && (
+        <div className="mb-5">
+          <FilesBlock files={run.files as RunFile[]} />
+        </div>
+      )}
+
       {/* I/O */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 mb-5">
         <Card
@@ -217,6 +225,7 @@ export function RunDetailPage() {
                       : tone === "red"
                         ? "bg-red-500 ring-4 ring-red-500/10"
                         : "bg-gray-400 ring-4 ring-gray-400/10";
+              const isToolError = e.type === "tool_call_error";
               return (
                 <div key={`event-${i}`} className="relative flex items-start gap-3 py-2">
                   <div
@@ -229,9 +238,18 @@ export function RunDetailPage() {
                     )}
                   </div>
                   <Pill tone={tone}>{e.type}</Pill>
-                  <span className="text-[11.5px] text-gray-500 dark:text-gray-400 flex-1 truncate font-mono">
-                    {formatEventDetail(e)}
-                  </span>
+                  <div className="flex-1 min-w-0">
+                    <p
+                      className={`text-[11.5px] font-mono truncate ${isToolError ? "text-red-700 dark:text-red-400" : "text-gray-500 dark:text-gray-400"}`}
+                    >
+                      {formatEventDetail(e)}
+                    </p>
+                    {isToolError && (
+                      <p className="text-[10.5px] text-red-600/70 dark:text-red-400/70 italic mt-0.5">
+                        (LLM still received this; run continues)
+                      </p>
+                    )}
+                  </div>
                   {e.timestamp && (
                     <span className="text-[10.5px] text-gray-400 dark:text-gray-600 font-mono tabular-nums">
                       {new Date(e.timestamp).toLocaleTimeString()}
@@ -254,15 +272,22 @@ export function RunDetailPage() {
 }
 
 function getEventTone(type: string): "emerald" | "sky" | "violet" | "red" | "neutral" {
+  // `tool_call_error` matches both "tool" and "error" — error takes precedence
+  // so a failed tool call renders red rather than sky-blue.
+  if (type.includes("error") || type.includes("fail")) return "red";
   if (type.includes("complete") || type.includes("result")) return "emerald";
   if (type.includes("tool")) return "sky";
   if (type.includes("llm") || type.includes("chunk")) return "violet";
-  if (type.includes("error") || type.includes("fail")) return "red";
   return "neutral";
 }
 
 function formatEventDetail(event: RunEvent): string {
   const d = event.data;
+  if (event.type === "tool_call_error") {
+    const tool = d.tool ? String(d.tool) : "?";
+    const msg = d.message ? String(d.message) : "(no message)";
+    return `Tool error: ${tool} — ${msg}`;
+  }
   if (d.message) return String(d.message);
   if (d.tool_name) return `${d.tool_name}(${d.args ? "..." : ""})`;
   if (d.output) return String(d.output).slice(0, 100);

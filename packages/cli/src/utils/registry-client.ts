@@ -46,9 +46,18 @@ export class RegistryClient {
     const res = await fetch(url, { headers: this.authHeaders() });
 
     if (!res.ok) {
-      const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
-      const msg = (body as { error?: { message?: string } }).error?.message ?? res.statusText;
-      throw new Error(`Pull failed (${res.status}): ${msg}`);
+      const errBody = await res
+        .json()
+        .catch(() => ({ error: { code: "UNKNOWN", message: res.statusText } }));
+      const code = (errBody as { error?: { code?: string } }).error?.code ?? "UNKNOWN";
+      const msg = (errBody as { error?: { message?: string } }).error?.message ?? res.statusText;
+      // Mirror the run() pattern: preserve `code` + `status` on the thrown
+      // Error so callers can distinguish 404 NOT_FOUND from other failures
+      // and render context-appropriate messages (e.g. 3-cause hint for 404).
+      const err = new Error(msg) as Error & { code: string; status: number };
+      err.code = code;
+      err.status = res.status;
+      throw err;
     }
 
     return Buffer.from(await res.arrayBuffer());
@@ -56,8 +65,69 @@ export class RegistryClient {
 
   async list(page = 1, limit = 20): Promise<Record<string, unknown>> {
     const url = `${this.baseUrl}/api/agents?page=${page}&limit=${limit}`;
-    const res = await fetch(url);
+    // Auth header required since the endpoint is no longer public —
+    // anonymous callers get 401. The token's role determines whether the
+    // server returns the caller's own agents or all agents instance-wide.
+    const res = await fetch(url, { headers: this.authHeaders() });
     if (!res.ok) throw new Error(`List failed (${res.status})`);
+    return (await res.json()) as Record<string, unknown>;
+  }
+
+  /**
+   * Invoke POST /run synchronously. Returns the full SdkRunResult-shaped JSON.
+   * Errors carry `{ code, status }` on the thrown Error so callers can render
+   * `<code>: <message>` without leaking the raw response body — required by
+   * AC-27c security hygiene for the CLI `skrun run` command.
+   */
+  async run(
+    namespace: string,
+    name: string,
+    input: Record<string, unknown>,
+    opts?: { version?: string },
+  ): Promise<Record<string, unknown>> {
+    const url = `${this.baseUrl}/api/agents/${namespace}/${name}/run`;
+    const body: Record<string, unknown> = { input };
+    if (opts?.version) body.version = opts.version;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { ...this.authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const errBody = await res
+        .json()
+        .catch(() => ({ error: { code: "UNKNOWN", message: res.statusText } }));
+      const code = (errBody as { error?: { code?: string } }).error?.code ?? "UNKNOWN";
+      const msg = (errBody as { error?: { message?: string } }).error?.message ?? res.statusText;
+      const err = new Error(msg) as Error & { code: string; status: number };
+      err.code = code;
+      err.status = res.status;
+      throw err;
+    }
+
+    return (await res.json()) as Record<string, unknown>;
+  }
+
+  async verifyVersion(
+    namespace: string,
+    name: string,
+    version: string,
+    verified: boolean,
+  ): Promise<Record<string, unknown>> {
+    const url = `${this.baseUrl}/api/agents/${namespace}/${name}/versions/${version}/verify`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: { ...this.authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ verified }),
+    });
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
+      const msg = (body as { error?: { message?: string } }).error?.message ?? res.statusText;
+      throw new Error(`Verify failed (${res.status}): ${msg}`);
+    }
+
     return (await res.json()) as Record<string, unknown>;
   }
 }

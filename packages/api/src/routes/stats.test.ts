@@ -13,6 +13,7 @@ function createTestApp(userId = "test-user") {
       id: userId,
       namespace: "test",
       username: "test",
+      role: "user",
     });
     await next();
   };
@@ -54,6 +55,7 @@ describe("GET /api/stats", () => {
       id: "run-abc",
       agent_id: null,
       agent_version: "1.0.0",
+      user_id: "test-user",
       status: "completed",
     });
     await db.updateRun(run.id, { usage_total_tokens: 200, duration_ms: 1500 });
@@ -130,7 +132,7 @@ describe("GET /api/stats", () => {
       const sharedDb = new MemoryDb();
       const buildApp = (userId: string) => {
         const fakeAuth = async (c: Context, next: () => Promise<void>) => {
-          c.set("user", { id: userId, namespace: "test", username: "test" });
+          c.set("user", { id: userId, namespace: "test", username: "test", role: "user" });
           await next();
         };
         const a = new Hono();
@@ -172,6 +174,127 @@ describe("GET /api/stats", () => {
       const bodyB = await resB.json();
       expect(bodyB.cache_savings_today).toBeCloseTo(3.0, 6);
       expect(bodyB.runs_today).toBe(3);
+    });
+
+    it("VT-2 (SEC-002): GET /api/runs/:id returns 403 when caller is not the owner", async () => {
+      const sharedDb = new MemoryDb();
+      const buildApp = (userId: string) => {
+        const fakeAuth = async (c: Context, next: () => Promise<void>) => {
+          c.set("user", { id: userId, namespace: "test", username: "test", role: "user" });
+          await next();
+        };
+        const a = new Hono();
+        a.route("/api", createStatsRoutes(sharedDb, fakeAuth));
+        return a;
+      };
+      const appA = buildApp("user-A");
+      const appB = buildApp("user-B");
+
+      await sharedDb.createRun({
+        id: "run-of-A",
+        agent_id: "ag1",
+        agent_version: "1.0.0",
+        user_id: "user-A",
+        status: "completed",
+      });
+
+      // Owner gets 200
+      const resA = await appA.request("/api/runs/run-of-A");
+      expect(resA.status).toBe(200);
+
+      // Non-owner gets 403 (not 404 — we acknowledge existence to the rightful owner only)
+      const resB = await appB.request("/api/runs/run-of-A");
+      expect(resB.status).toBe(403);
+      const bodyB = await resB.json();
+      expect(bodyB.error.code).toBe("FORBIDDEN");
+    });
+
+    // VT-14 (#80): per-agent stats — non-owner non-admin → 404 opaque.
+    // Same byte-identical-body pattern as the registry GET routes.
+    it("VT-14 (#80): GET /api/agents/:ns/:name/stats — non-owner gets 404 NOT_FOUND", async () => {
+      const sharedDb = new MemoryDb();
+      const buildApp = (userId: string) => {
+        const fakeAuth = async (c: Context, next: () => Promise<void>) => {
+          c.set("user", { id: userId, namespace: "test", username: "test", role: "user" });
+          await next();
+        };
+        const a = new Hono();
+        a.route("/api", createStatsRoutes(sharedDb, fakeAuth));
+        return a;
+      };
+      const appA = buildApp("user-A");
+      const appB = buildApp("user-B");
+
+      // user-B owns an agent + has 1 run
+      const agent = await sharedDb.createAgent({
+        name: "private-agent",
+        namespace: "user-b",
+        description: "",
+        owner_id: "user-B",
+      });
+      await sharedDb.createRun({
+        id: "run-B1",
+        agent_id: agent.id,
+        agent_version: "1.0.0",
+        user_id: "user-B",
+        status: "completed",
+      });
+
+      // Owner (user-B) reads stats → 200 with the run counted
+      const resB = await appB.request("/api/agents/user-b/private-agent/stats");
+      expect(resB.status).toBe(200);
+      const bodyB = await resB.json();
+      expect(bodyB.runs).toBe(1);
+
+      // Non-owner (user-A) reads stats → 404 NOT_FOUND (opaque) with byte-equal
+      // body shape to a genuine agent-not-found 404. No stats payload leaked.
+      const resA = await appA.request("/api/agents/user-b/private-agent/stats");
+      expect(resA.status).toBe(404);
+      const bodyA = await resA.json();
+      expect(bodyA).toEqual({
+        error: { code: "NOT_FOUND", message: "Agent user-b/private-agent not found" },
+      });
+      // No stats fields leaked
+      expect(bodyA.runs).toBeUndefined();
+      expect(bodyA.tokens).toBeUndefined();
+    });
+
+    it("VT-1 (SEC-001): GET /api/runs filters by user_id — B does not see A's runs", async () => {
+      const sharedDb = new MemoryDb();
+      const buildApp = (userId: string) => {
+        const fakeAuth = async (c: Context, next: () => Promise<void>) => {
+          c.set("user", { id: userId, namespace: "test", username: "test", role: "user" });
+          await next();
+        };
+        const a = new Hono();
+        a.route("/api", createStatsRoutes(sharedDb, fakeAuth));
+        return a;
+      };
+      const appA = buildApp("user-A");
+      const appB = buildApp("user-B");
+
+      await sharedDb.createRun({
+        id: "run-A1",
+        agent_id: "ag1",
+        agent_version: "1.0.0",
+        user_id: "user-A",
+        status: "completed",
+      });
+      await sharedDb.createRun({
+        id: "run-B1",
+        agent_id: "ag1",
+        agent_version: "1.0.0",
+        user_id: "user-B",
+        status: "completed",
+      });
+
+      const resA = await appA.request("/api/runs");
+      const runsA: Array<{ id: string }> = await resA.json();
+      expect(runsA.map((r) => r.id).sort()).toEqual(["run-A1"]);
+
+      const resB = await appB.request("/api/runs");
+      const runsB: Array<{ id: string }> = await resB.json();
+      expect(runsB.map((r) => r.id).sort()).toEqual(["run-B1"]);
     });
   });
 });

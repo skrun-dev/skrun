@@ -7,7 +7,7 @@ import { StateConfigSchema } from "./state-config.js";
 import { TestCaseSchema } from "./test-case.js";
 import { ToolConfigSchema } from "./tool-config.js";
 
-const AGENT_NAME_REGEX = /^[a-z0-9-]+\/[a-z0-9-]+$/;
+const AGENT_NAME_REGEX = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
 const SEMVER_REGEX = /^\d+\.\d+\.\d+$/;
 
 export const AgentConfigSchema = z
@@ -17,8 +17,9 @@ export const AgentConfigSchema = z
       .min(1, "Agent name is required")
       .regex(
         AGENT_NAME_REGEX,
-        'Agent name must be in "namespace/slug" format (e.g., "acme/seo-audit")',
-      ),
+        'Agent name must be a slug like "email-drafter" (lowercase letters, digits, hyphens; no namespace prefix). The registry derives the namespace from your auth token at push — remove the prefix from your agent.yaml.',
+      )
+      .refine((s) => !s.includes("--"), "Agent name must not contain consecutive hyphens"),
     version: z.string().regex(SEMVER_REGEX, 'Version must be semver format (e.g., "1.0.0")'),
     model: ModelConfigSchema,
     tools: z

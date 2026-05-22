@@ -9,6 +9,7 @@ import { ScriptDepsResolver } from "./script-deps-resolver.js";
 import type { ToolDefinition, ToolProvider, ToolResult } from "./types.js";
 
 const SCRIPT_TIMEOUT = 30_000; // 30 seconds
+const SCRIPT_MAX_BUFFER_BYTES = 5 * 1024 * 1024; // 5 MB (Node default is 1 MB)
 const SUPPORTED_EXTENSIONS = new Set([".ts", ".js", ".py"]);
 
 /** Optional dependencies for script-deps resolution. */
@@ -33,6 +34,12 @@ export class ScriptToolProvider implements ToolProvider {
 
   private allowedHosts: string[];
   private outputDir: string;
+  // When set, scripts are spawned with this as their cwd so relative paths
+  // (e.g. `./fixtures/sample.csv`) resolve from the bundle root, not from the
+  // registry's own cwd. Optional for back-compat with callers that don't pass
+  // a bundle (legacy in-memory tests). When unset, scripts inherit the parent
+  // process's cwd as before.
+  private bundleRoot?: string;
   private depsResolver?: ScriptDepsResolver;
   // Memoized resolution promise. Cached for both success AND failure:
   // retrying every tool call after a persistent install failure would hammer
@@ -48,6 +55,7 @@ export class ScriptToolProvider implements ToolProvider {
   ) {
     this.allowedHosts = allowedHosts;
     this.outputDir = outputDir;
+    this.bundleRoot = options.bundleRoot;
     this.ajv = new Ajv({ allErrors: true, strict: false });
     for (const cfg of toolConfigs) {
       this.toolConfigs.set(cfg.name, cfg);
@@ -149,9 +157,28 @@ export class ScriptToolProvider implements ToolProvider {
         {
           timeout: SCRIPT_TIMEOUT,
           env: spawnEnv,
+          // When bundleRoot is set, spawn the script with cwd anchored at the
+          // bundle root so relative paths (e.g. `./fixtures/sample.csv`) in
+          // user-authored scripts resolve from the bundle, not from the
+          // registry's own process.cwd(). Falls back to the parent process's
+          // cwd when bundleRoot is unset (legacy in-memory tests).
+          cwd: this.bundleRoot,
+          // Explicit 5MB cap on combined stdout+stderr. Node's default is
+          // 1MB which silently buffer-overflows on large outputs; capping
+          // explicitly + surfacing ENOBUFS as a clear message avoids opaque
+          // "stdout maxBuffer length exceeded" errors leaking to the LLM.
+          maxBuffer: SCRIPT_MAX_BUFFER_BYTES,
         },
         (error, stdout, stderr) => {
           if (error) {
+            const errno = (error as NodeJS.ErrnoException).code;
+            if (errno === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || /maxBuffer/i.test(error.message)) {
+              resolve({
+                content: `Script output exceeded the ${SCRIPT_MAX_BUFFER_BYTES} byte (${SCRIPT_MAX_BUFFER_BYTES / (1024 * 1024)}MB) buffer cap — truncate the script's output or write to disk via SKRUN_OUTPUT_DIR.`,
+                isError: true,
+              });
+              return;
+            }
             resolve({ content: stderr || error.message, isError: true });
           } else {
             resolve({ content: stdout.trim(), isError: false });
@@ -208,22 +235,63 @@ function resolveCommand(ext: string, resolvedDeps: ResolvedDeps | null): string 
 }
 
 /**
- * Build the env passed to the spawned script. Always inherits `process.env`
- * + skrun-specific advisory vars (allowed_hosts, output_dir). Adds NODE_PATH
- * pointing at the resolved `node_modules` when Node deps are present —
- * Node's module resolution then sees the cached deps without polluting
- * the bundle directory itself.
+ * Env vars passed to spawned scripts. The previous behaviour spread
+ * `process.env` wholesale, which exfiltrated every server secret (LLM API
+ * keys, OAuth client secret, webhook signing key, DB credentials) to the
+ * script — a self-verified malicious agent could echo
+ * `process.env.ANTHROPIC_API_KEY` to stdout and the LLM tool-loop would
+ * surface it back to the caller. Now strict allowlist:
+ *
+ *   - OS/runtime essentials (PATH, HOME, temp/profile, locale).
+ *   - Python interop (PYTHONPATH, PYTHONIOENCODING).
+ *   - All `SKRUN_*` vars (advisory context the runtime already publishes).
+ *   - NODE_PATH (conditional on resolved Node deps, set below).
+ *   - `SKRUN_ALLOWED_HOSTS` + `SKRUN_OUTPUT_DIR` (always set explicitly).
  */
+const SCRIPT_SAFE_ENV_VARS = [
+  // OS-required for binary discovery + temp / home
+  "PATH",
+  "HOME",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "USERPROFILE",
+  // Locale (UTF-8 default for Python and Node)
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  // Python interop
+  "PYTHONPATH",
+  "PYTHONIOENCODING",
+] as const;
+
 function buildSpawnEnv(
   allowedHosts: string[],
   outputDir: string,
   resolvedDeps: ResolvedDeps | null,
 ): NodeJS.ProcessEnv {
-  const base: NodeJS.ProcessEnv = {
-    ...process.env,
-    SKRUN_ALLOWED_HOSTS: allowedHosts.join(","),
-    SKRUN_OUTPUT_DIR: outputDir,
-  };
+  const base: NodeJS.ProcessEnv = {};
+
+  // 1. Allowlisted OS / locale / Python vars.
+  for (const name of SCRIPT_SAFE_ENV_VARS) {
+    const value = process.env[name];
+    if (value !== undefined) base[name] = value;
+  }
+
+  // 2. All SKRUN_* vars — these are the contract the runtime publishes for
+  //    scripts to consume (deps dir, output dir, allowed hosts, ...).
+  //    Safe by design: anything skrun puts under this prefix is meant to
+  //    be visible to scripts.
+  for (const [name, value] of Object.entries(process.env)) {
+    if (name.startsWith("SKRUN_") && value !== undefined) base[name] = value;
+  }
+
+  // 3. Per-run advisory vars (always set last so they overwrite any inherited
+  //    SKRUN_* value of the same name).
+  base.SKRUN_ALLOWED_HOSTS = allowedHosts.join(",");
+  base.SKRUN_OUTPUT_DIR = outputDir;
+
+  // 4. NODE_PATH when Node deps were resolved.
   if (resolvedDeps?.ecosystem === "node") {
     base.NODE_PATH = join(resolvedDeps.depsPath, "node_modules");
   }

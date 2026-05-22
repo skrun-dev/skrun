@@ -160,7 +160,7 @@ describe("detectManifest — none ecosystem", () => {
 
   it("returns ecosystem: 'none' when only unrelated files exist", () => {
     writeFile("SKILL.md", "# Skill\n");
-    writeFile("agent.yaml", "name: dev/test\n");
+    writeFile("agent.yaml", "name: test-agent\n");
     const result = detectManifest(bundleRoot);
     expect(result.ecosystem).toBe("none");
   });

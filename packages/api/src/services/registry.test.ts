@@ -81,6 +81,37 @@ describe("RegistryService", () => {
     expect(meta.versions).toEqual(["1.0.0"]);
   });
 
+  // VT-21 (CODE-113): buildMetadata previously returned hardcoded zeros.
+  // Now run_count and token_count reflect the actual db.listRuns aggregate
+  // for the agent.
+  it("VT-21: getMetadata returns real run_count + token_count", async () => {
+    await service.push("acme", "stats-agent", "1.0.0", Buffer.from("v1"), "user-1");
+    const agent = await db.getAgent("acme", "stats-agent");
+    if (!agent) throw new Error("seed agent missing");
+
+    // 5 runs, total 1000 tokens
+    for (let i = 0; i < 5; i++) {
+      await db.createRun({
+        id: `r-${i}`,
+        agent_id: agent.id,
+        agent_version: "acme/stats-agent@1.0.0",
+        status: "completed",
+      });
+      await db.updateRun(`r-${i}`, { usage_total_tokens: 200 });
+    }
+
+    const meta = await service.getMetadata("acme", "stats-agent");
+    expect(meta.run_count).toBe(5);
+    expect(meta.token_count).toBe(1000);
+  });
+
+  it("VT-21b: getMetadata returns 0/0 for an agent with no runs (no false positives)", async () => {
+    await service.push("acme", "empty-agent", "1.0.0", Buffer.from("v1"), "user-1");
+    const meta = await service.getMetadata("acme", "empty-agent");
+    expect(meta.run_count).toBe(0);
+    expect(meta.token_count).toBe(0);
+  });
+
   it("should get versions list", async () => {
     await service.push("acme", "agent", "1.0.0", Buffer.from("v1"), "user-1");
     await service.push("acme", "agent", "2.0.0", Buffer.from("v2"), "user-1");
@@ -255,6 +286,87 @@ describe("RegistryService", () => {
 
       expect(bundleCache.get("dev/multi/1.0.0")).toBeUndefined();
       expect(bundleCache.get("dev/multi/2.0.0")).toBeUndefined();
+    });
+  });
+
+  // ── Per-version verify (Phase 8.2 — service layer) ──────────────────
+  describe("setVersionVerified", () => {
+    it("flips the specified version's verified flag to true", async () => {
+      await service.push("acme", "v-test", "1.0.0", Buffer.from("v1"), "u");
+      const result = await service.setVersionVerified("acme", "v-test", "1.0.0", true);
+      expect(result.verified).toBe(true);
+      expect(result.version).toBe("1.0.0");
+    });
+
+    it("flips back to false (revoke)", async () => {
+      await service.push("acme", "v-test", "1.0.0", Buffer.from("v1"), "u");
+      await service.setVersionVerified("acme", "v-test", "1.0.0", true);
+      const result = await service.setVersionVerified("acme", "v-test", "1.0.0", false);
+      expect(result.verified).toBe(false);
+    });
+
+    it("throws NOT_FOUND when agent is missing", async () => {
+      await expect(service.setVersionVerified("ghost", "none", "1.0.0", true)).rejects.toThrow(
+        RegistryError,
+      );
+    });
+
+    it("throws VERSION_NOT_FOUND when version is missing", async () => {
+      await service.push("acme", "v-test", "1.0.0", Buffer.from("v1"), "u");
+      await expect(service.setVersionVerified("acme", "v-test", "9.9.9", true)).rejects.toThrow(
+        "Version 9.9.9 not found",
+      );
+    });
+
+    it("only touches the targeted version (BR-2: pinned-caller protection)", async () => {
+      await service.push("acme", "multi", "1.0.0", Buffer.from("v1"), "u");
+      await service.push("acme", "multi", "2.0.0", Buffer.from("v2"), "u");
+      // Verify v1.0.0 only
+      await service.setVersionVerified("acme", "multi", "1.0.0", true);
+      const versions = await service.getVersions("acme", "multi");
+      const v1 = versions.find((v) => v.version === "1.0.0");
+      const v2 = versions.find((v) => v.version === "2.0.0");
+      expect(v1?.verified).toBe(true);
+      expect(v2?.verified).toBe(false);
+    });
+  });
+
+  // ── latest_version_verified computation (Phase 8.2) ────────────────────
+  describe("latest_version_verified computation", () => {
+    it("buildMetadata returns false when no version is verified", async () => {
+      await service.push("acme", "a", "1.0.0", Buffer.from("v1"), "u");
+      const meta = await service.getMetadata("acme", "a");
+      expect(meta.latest_version_verified).toBe(false);
+    });
+
+    it("buildMetadata returns true when latest version is verified", async () => {
+      await service.push("acme", "a", "1.0.0", Buffer.from("v1"), "u");
+      await service.setVersionVerified("acme", "a", "1.0.0", true);
+      const meta = await service.getMetadata("acme", "a");
+      expect(meta.latest_version_verified).toBe(true);
+    });
+
+    it("buildMetadata reflects only the LATEST version's flag (older verified, newer not)", async () => {
+      // v1.0.0 verified, v2.0.0 pushed unverified — latest_version_verified
+      // tracks v2.0.0 (the latest), not v1.0.0.
+      await service.push("acme", "mixed", "1.0.0", Buffer.from("v1"), "u");
+      await service.setVersionVerified("acme", "mixed", "1.0.0", true);
+      await service.push("acme", "mixed", "2.0.0", Buffer.from("v2"), "u");
+      const meta = await service.getMetadata("acme", "mixed");
+      expect(meta.latest_version).toBe("2.0.0");
+      expect(meta.latest_version_verified).toBe(false);
+    });
+
+    it("list() exposes latest_version_verified on each row", async () => {
+      await service.push("ns1", "verified-one", "1.0.0", Buffer.from("v1"), "u");
+      await service.setVersionVerified("ns1", "verified-one", "1.0.0", true);
+      await service.push("ns2", "unverified-one", "1.0.0", Buffer.from("v2"), "u");
+
+      const result = await service.list(1, 10);
+      const verified = result.agents.find((a) => a.name === "verified-one");
+      const unverified = result.agents.find((a) => a.name === "unverified-one");
+      expect(verified?.latest_version_verified).toBe(true);
+      expect(unverified?.latest_version_verified).toBe(false);
     });
   });
 });

@@ -9,14 +9,32 @@ export interface DbAdapter {
     description: string;
     owner_id: string;
   }): Promise<Agent>;
-  listAgents(
-    page: number,
-    limit: number,
-  ): Promise<{
+  /**
+   * Paginated list of agents. When `userId` is set, filters to agents
+   * whose `owner_id === userId` (multi-tenant isolation for OAuth/API-key
+   * users with `role === 'user'`). When `userId` is undefined, returns
+   * all agents (admin bypass or dev-token single-tenant mode).
+   *
+   * `total` reflects the FILTERED count when `userId` is set — required
+   * for accurate dashboard pagination. Mirrors the dual-mode `getStats({ userId? })`
+   * pattern used elsewhere in this adapter.
+   */
+  listAgents(opts: { page: number; limit: number; userId?: string }): Promise<{
     agents: (Agent & { run_count: number; token_count: number; cost_total: number })[];
     total: number;
   }>;
-  setVerified(namespace: string, name: string, verified: boolean): Promise<Agent | null>;
+  /**
+   * Per-version verification gate. Flips `agent_versions.verified` for the
+   * specified version of the specified agent. Returns the updated row, or
+   * null if the agent or version doesn't exist. Admin-only at the route
+   * layer (`PATCH /api/agents/:ns/:name/versions/:version/verify`).
+   */
+  setVersionVerified(
+    namespace: string,
+    name: string,
+    version: string,
+    verified: boolean,
+  ): Promise<AgentVersion | null>;
   deleteAgent(namespace: string, name: string): Promise<boolean>;
 
   // --- Agent Versions ---

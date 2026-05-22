@@ -131,4 +131,69 @@ describe("RunDetailPage", () => {
     });
     expect(screen.queryByTestId("cost-cell-saved")).not.toBeInTheDocument();
   });
+
+  // ── Bug D: FilesBlock wiring ────────────────────────────────────────
+
+  it("renders the Files block when the run produced files", async () => {
+    server.use(
+      http.get("/api/runs/run-with-files", () =>
+        HttpResponse.json({
+          ...mockRun,
+          id: "run-with-files",
+          files: [
+            { name: "report.pdf", size: 8192, file_id: "fil_abc123" },
+            { name: "summary.csv", size: 512, file_id: "fil_def456" },
+          ],
+        }),
+      ),
+    );
+    renderRunDetail("run-with-files");
+    await waitFor(() => {
+      expect(screen.getByText("Files (2)")).toBeInTheDocument();
+      expect(screen.getByText("report.pdf")).toBeInTheDocument();
+      expect(screen.getByText("summary.csv")).toBeInTheDocument();
+    });
+  });
+
+  it("hides the Files block when the run produced no files", async () => {
+    // mockRun has no `files` field → block must not render
+    renderRunDetail("run-abc-123-def-456");
+    await waitFor(() => {
+      expect(screen.getByText("Re-run")).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/^Files \(/)).not.toBeInTheDocument();
+  });
+
+  // ── Bug C: tool_call_error event styling ─────────────────────────────
+
+  it("renders tool_call_error events in red with a 'LLM still received this' subtitle", async () => {
+    server.use(
+      http.get("/api/runs/run-with-tool-error", () =>
+        HttpResponse.json({
+          ...mockRun,
+          id: "run-with-tool-error",
+          output: {
+            result: "ok",
+            _events: [
+              {
+                type: "tool_call_error",
+                data: {
+                  type: "tool_call_error",
+                  tool: "fetch_data",
+                  message: "Connection refused",
+                  code: "ECONNREFUSED",
+                },
+                timestamp: "2026-04-21T10:00:00Z",
+              },
+            ],
+          },
+        }),
+      ),
+    );
+    renderRunDetail("run-with-tool-error");
+    await waitFor(() => {
+      expect(screen.getByText(/Tool error: fetch_data — Connection refused/)).toBeInTheDocument();
+      expect(screen.getByText(/LLM still received this; run continues/)).toBeInTheDocument();
+    });
+  });
 });

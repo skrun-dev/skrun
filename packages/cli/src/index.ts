@@ -12,7 +12,11 @@ import { registerLogoutCommand } from "./commands/logout.js";
 import { registerLogsCommand } from "./commands/logs.js";
 import { registerPullCommand } from "./commands/pull.js";
 import { registerPushCommand } from "./commands/push.js";
+import { registerRunCommand } from "./commands/run.js";
 import { registerTestCommand } from "./commands/test.js";
+import { registerUnverifyCommand } from "./commands/unverify.js";
+import { registerVerifyCommand } from "./commands/verify.js";
+import { registerWhoamiCommand } from "./commands/whoami.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf8")) as {
@@ -34,8 +38,12 @@ registerLoginCommand(program);
 registerLogoutCommand(program);
 registerPushCommand(program);
 registerPullCommand(program);
+registerRunCommand(program);
+registerVerifyCommand(program);
+registerUnverifyCommand(program);
 registerDeployCommand(program);
 registerLogsCommand(program);
 registerCacheCommand(program);
+registerWhoamiCommand(program);
 
 program.parse();

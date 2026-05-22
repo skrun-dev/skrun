@@ -1,17 +1,54 @@
-import type { MiddlewareHandler } from "hono";
+import { createLogger } from "@skrun-dev/runtime";
+import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
+import type { DbAdapter } from "../db/adapter.js";
 import { getUser } from "../middleware/auth.js";
-import { RegistryError, type RegistryService } from "../services/registry.js";
+import { assertAgentVisibleOrThrow } from "../services/access.js";
+import type { RegistryService } from "../services/registry.js";
+import { dispatchRegistryError } from "./_helpers.js";
+
+const logger = createLogger("registry");
+
+/**
+ * Agent namespace + name URL path segments. Lowercase-kebab, length ≤64.
+ * Applied at the route boundary so a malformed URL never reaches the storage
+ * layer where it could decode into a path-traversal sequence.
+ *
+ * Note: this is intentionally a touch more permissive than
+ * @skrun-dev/schema's `AGENT_NAME_REGEX` (which enforces no leading/trailing
+ * hyphens and no `--`). The path segment regex covers both the namespace
+ * (registry-side identifier, e.g. GitHub username) AND the name (agent slug),
+ * and the namespace shape isn't owned by the schema package.
+ */
+const PATH_SEGMENT_REGEX = /^[a-z0-9-]{1,64}$/;
+
+function validateAgentParams(c: Context, namespace: string, name: string): Response | null {
+  if (!PATH_SEGMENT_REGEX.test(namespace) || !PATH_SEGMENT_REGEX.test(name)) {
+    return c.json(
+      {
+        error: {
+          code: "INVALID_AGENT_NAME",
+          message: "namespace and name must be lowercase kebab-case (a-z, 0-9, hyphen, ≤64 chars).",
+        },
+      },
+      400,
+    );
+  }
+  return null;
+}
 
 export function createRegistryRoutes(
   service: RegistryService,
   authMiddleware: MiddlewareHandler,
+  db: DbAdapter,
 ): Hono {
   const router = new Hono();
 
   // Push — auth required
   router.post("/agents/:namespace/:name/push", authMiddleware, async (c) => {
     const { namespace, name } = c.req.param();
+    const _invalidName = validateAgentParams(c, namespace, name);
+    if (_invalidName) return _invalidName;
     const version = c.req.query("version");
     const user = getUser(c);
 
@@ -87,110 +124,114 @@ export function createRegistryRoutes(
       const metadata = await service.push(namespace, name, version, buffer, user.id, notes);
       return c.json(metadata);
     } catch (err) {
-      if (err instanceof RegistryError) {
-        return c.json(
-          { error: { code: err.code, message: err.message } },
-          err.status as 400 | 404 | 409 | 500,
-        );
-      }
-      throw err;
+      return dispatchRegistryError(c, err);
     }
   });
 
-  // Pull latest — auth required
+  // Pull latest — auth required, 404 opaque for non-owner non-admin.
+  // Ownership check fires BEFORE storage fetch: non-owner path throws
+  // NOT_FOUND in `assertAgentVisibleOrThrow` and never reaches
+  // `service.pull` / `storage.get`. Bundle bytes are never read on
+  // ownership-404 (verified by VT-15b mock-spy).
   router.get("/agents/:namespace/:name/pull", authMiddleware, async (c) => {
     const { namespace, name } = c.req.param();
+    const _invalidName = validateAgentParams(c, namespace, name);
+    if (_invalidName) return _invalidName;
     try {
-      const result = await service.pull(namespace, name);
+      const agent = await db.getAgent(namespace, name);
+      assertAgentVisibleOrThrow(agent, getUser(c), namespace, name);
+      const result = await service.pull(namespace, name, undefined, { preloadedAgent: agent });
       c.header("Content-Type", "application/octet-stream");
       c.header("Content-Disposition", `attachment; filename="${name}-${result.version}.agent"`);
       c.header("X-Agent-Version", result.version);
       return c.body(new Uint8Array(result.buffer));
     } catch (err) {
-      if (err instanceof RegistryError) {
-        return c.json(
-          { error: { code: err.code, message: err.message } },
-          err.status as 400 | 404 | 409 | 500,
-        );
-      }
-      throw err;
+      return dispatchRegistryError(c, err);
     }
   });
 
-  // Pull specific version — auth required
+  // Pull specific version — auth required, 404 opaque for non-owner non-admin.
   router.get("/agents/:namespace/:name/pull/:version", authMiddleware, async (c) => {
     const { namespace, name, version } = c.req.param();
+    const _invalidNameV = validateAgentParams(c, namespace, name);
+    if (_invalidNameV) return _invalidNameV;
     try {
-      const result = await service.pull(namespace, name, version);
+      const agent = await db.getAgent(namespace, name);
+      assertAgentVisibleOrThrow(agent, getUser(c), namespace, name);
+      const result = await service.pull(namespace, name, version, { preloadedAgent: agent });
       c.header("Content-Type", "application/octet-stream");
       c.header("Content-Disposition", `attachment; filename="${name}-${result.version}.agent"`);
       c.header("X-Agent-Version", result.version);
       return c.body(new Uint8Array(result.buffer));
     } catch (err) {
-      if (err instanceof RegistryError) {
-        return c.json(
-          { error: { code: err.code, message: err.message } },
-          err.status as 400 | 404 | 409 | 500,
-        );
-      }
-      throw err;
+      return dispatchRegistryError(c, err);
     }
   });
 
-  // List — public
-  router.get("/agents", async (c) => {
+  // List — auth required, filtered by ownership for non-admin callers.
+  // Admins (dev-token, or OAuth users with role='admin') see all agents
+  // instance-wide. Non-admin OAuth / sk_live_* callers see only agents
+  // they own (owner_id === user.id). Anonymous → 401.
+  router.get("/agents", authMiddleware, async (c) => {
     const page = Number(c.req.query("page") ?? "1");
     const limit = Number(c.req.query("limit") ?? "20");
-    const result = await service.list(page, limit);
+    const user = getUser(c);
+    const userId = user.role === "admin" ? undefined : user.id;
+    const result = await service.list(page, limit, userId);
     return c.json({ ...result, page, limit });
   });
 
-  // Metadata — public
-  router.get("/agents/:namespace/:name", async (c) => {
+  // Metadata — auth required, 404 opaque for non-owner non-admin.
+  // Non-owner readers get the SAME 404 body as a genuine agent-not-found —
+  // existence is hidden from non-privileged callers (read-side opacity).
+  router.get("/agents/:namespace/:name", authMiddleware, async (c) => {
     const { namespace, name } = c.req.param();
+    const _invalidName = validateAgentParams(c, namespace, name);
+    if (_invalidName) return _invalidName;
     try {
+      const agent = await db.getAgent(namespace, name);
+      assertAgentVisibleOrThrow(agent, getUser(c), namespace, name);
       const metadata = await service.getMetadata(namespace, name);
       return c.json(metadata);
     } catch (err) {
-      if (err instanceof RegistryError) {
-        return c.json(
-          { error: { code: err.code, message: err.message } },
-          err.status as 400 | 404 | 409 | 500,
-        );
-      }
-      throw err;
+      return dispatchRegistryError(c, err);
     }
   });
 
-  // Versions — public
-  router.get("/agents/:namespace/:name/versions", async (c) => {
+  // Versions — auth required, 404 opaque for non-owner non-admin.
+  router.get("/agents/:namespace/:name/versions", authMiddleware, async (c) => {
     const { namespace, name } = c.req.param();
+    const _invalidName = validateAgentParams(c, namespace, name);
+    if (_invalidName) return _invalidName;
     try {
+      const agent = await db.getAgent(namespace, name);
+      assertAgentVisibleOrThrow(agent, getUser(c), namespace, name);
       const versions = await service.getVersions(namespace, name);
       return c.json({ versions });
     } catch (err) {
-      if (err instanceof RegistryError) {
-        return c.json(
-          { error: { code: err.code, message: err.message } },
-          err.status as 400 | 404 | 409 | 500,
-        );
-      }
-      throw err;
+      return dispatchRegistryError(c, err);
     }
   });
 
-  // Verify — auth required, namespace owner only
-  router.patch("/agents/:namespace/:name/verify", authMiddleware, async (c) => {
-    const { namespace, name } = c.req.param();
+  // Verify a specific version — admin-only. Per-version trust: each version
+  // is reviewed independently, push of a new version starts at verified=false,
+  // and pinned production callers keep their verified status through author
+  // iteration. Promotion to admin is a manual SQL UPDATE — there is
+  // intentionally no API for elevation. dev-token in self-host mode auto-
+  // grants admin so the local-dev UX still works.
+  router.patch("/agents/:namespace/:name/versions/:version/verify", authMiddleware, async (c) => {
+    const { namespace, name, version } = c.req.param();
+    const _invalidName = validateAgentParams(c, namespace, name);
+    if (_invalidName) return _invalidName;
     const user = getUser(c);
 
-    // Namespace ownership check
-    if (namespace !== user.namespace) {
+    if (user.role !== "admin") {
       return c.json(
         {
           error: {
             code: "FORBIDDEN",
-            message: `You don't have permission to verify agents in namespace '${namespace}'`,
+            message:
+              "Only an admin can verify agent versions. Promotion to admin requires a manual SQL UPDATE on the users table (see docs/self-hosting.md → Admin role).",
           },
         },
         403,
@@ -212,28 +253,41 @@ export function createRegistryRoutes(
     }
 
     try {
-      const metadata = await service.setVerified(namespace, name, body.verified);
-      return c.json(metadata);
+      const updated = await service.setVersionVerified(namespace, name, version, body.verified);
+
+      // Structured log emission — forensic trail for "who verified what when".
+      // The deferred audit-log UI on agent-detail will surface these events;
+      // until then, operators grep pino logs for `event:agent_version_verify`.
+      logger.info(
+        {
+          event: "agent_version_verify",
+          actor: { user_id: user.id, namespace: user.namespace, role: user.role },
+          target: { namespace, name, version },
+          action: body.verified ? "verify" : "unverify",
+          timestamp: new Date().toISOString(),
+        },
+        `${user.namespace} ${body.verified ? "verified" : "unverified"} ${namespace}/${name}@${version}`,
+      );
+
+      return c.json(updated);
     } catch (err) {
-      if (err instanceof RegistryError) {
-        return c.json(
-          { error: { code: err.code, message: err.message } },
-          err.status as 400 | 404 | 409 | 500,
-        );
-      }
-      throw err;
+      return dispatchRegistryError(c, err);
     }
   });
 
-  // Delete a single version — auth required, namespace owner only.
+  // Delete a single version — auth required, namespace owner OR admin.
   // MUST be registered BEFORE the whole-agent DELETE below: Hono is first-match-wins
   // and the more-specific path with /versions/:version must be registered first to
   // guarantee future-proofing against shadowing (see #77 plan B-1).
+  // Admin override mirrors the whole-agent DELETE — same operator scenario
+  // (moderation of squatter/abusive versions across namespaces).
   router.delete("/agents/:namespace/:name/versions/:version", authMiddleware, async (c) => {
     const { namespace, name, version } = c.req.param();
+    const _invalidNameV = validateAgentParams(c, namespace, name);
+    if (_invalidNameV) return _invalidNameV;
     const user = getUser(c);
 
-    if (namespace !== user.namespace) {
+    if (namespace !== user.namespace && user.role !== "admin") {
       return c.json(
         {
           error: {
@@ -249,22 +303,21 @@ export function createRegistryRoutes(
       await service.deleteVersion(namespace, name, version);
       return c.body(null, 204);
     } catch (err) {
-      if (err instanceof RegistryError) {
-        return c.json(
-          { error: { code: err.code, message: err.message } },
-          err.status as 400 | 404 | 409 | 500,
-        );
-      }
-      throw err;
+      return dispatchRegistryError(c, err);
     }
   });
 
-  // Delete whole agent — auth required, namespace owner only
+  // Delete whole agent — auth required, namespace owner OR admin.
+  // Admin override lets operators clean up squatter/abusive agents in any
+  // namespace without impersonation. Promotion to admin remains a manual
+  // SQL UPDATE — there's no API for elevation.
   router.delete("/agents/:namespace/:name", authMiddleware, async (c) => {
     const { namespace, name } = c.req.param();
+    const _invalidName = validateAgentParams(c, namespace, name);
+    if (_invalidName) return _invalidName;
     const user = getUser(c);
 
-    if (namespace !== user.namespace) {
+    if (namespace !== user.namespace && user.role !== "admin") {
       return c.json(
         {
           error: {
@@ -280,13 +333,7 @@ export function createRegistryRoutes(
       await service.deleteAgent(namespace, name);
       return c.body(null, 204);
     } catch (err) {
-      if (err instanceof RegistryError) {
-        return c.json(
-          { error: { code: err.code, message: err.message } },
-          err.status as 400 | 404 | 409 | 500,
-        );
-      }
-      throw err;
+      return dispatchRegistryError(c, err);
     }
   });
 

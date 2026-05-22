@@ -88,6 +88,27 @@ export interface ToolResultEvent extends BaseRunEvent {
   is_error: boolean;
 }
 
+/**
+ * Informational event emitted when a tool returns `{is_error: true}`.
+ *
+ * Emitted BEFORE the matching `tool_result` event. The tool_result content
+ * still flows back to the LLM normally — the LLM decides what to do
+ * (retry, fallback, give up gracefully). This event exists only to make
+ * tool failures visible in the SSE stream and the dashboard event timeline
+ * (rendered in red) without changing the LLM-recovery contract.
+ *
+ * Aligned with CMA/Bedrock/Vertex industry default (permissive tool error
+ * handling). Strict-by-default abort was considered and deliberately rejected
+ * for v0.9.0.
+ */
+export interface ToolCallErrorEvent extends BaseRunEvent {
+  type: "tool_call_error";
+  tool: string;
+  message: string;
+  /** Optional machine-readable error code surfaced by the tool. */
+  code?: string;
+}
+
 export interface LlmCompleteEvent extends BaseRunEvent {
   type: "llm_complete";
   provider: string;
@@ -112,6 +133,30 @@ export interface RunCompleteEvent extends BaseRunEvent {
   files: FileInfo[];
 }
 
+/**
+ * Informational event emitted when the LLM's final output fails Zod validation
+ * against the agent's declared `outputs` schema (e.g., missing required key,
+ * wrong type at top level). Emitted BEFORE the retry attempt — if the retry
+ * succeeds the run terminates with `run_complete`, otherwise with `run_error`
+ * (code `OUTPUT_SCHEMA_INVALID`). The `errors` field carries the Zod issues
+ * for diagnostics; shape is intentionally `unknown[]` since Zod's issue type
+ * is not part of the public wire contract.
+ */
+export interface OutputValidationWarningEvent extends BaseRunEvent {
+  type: "output_validation_warning";
+  errors: unknown[];
+}
+
+/**
+ * Terminus event for an unrecoverable run failure.
+ *
+ * Known `error.code` values:
+ *  - `OUTPUT_SCHEMA_INVALID` — final LLM output failed validation against the
+ *    declared `outputs` schema, and the auto-repair retry also failed.
+ *  - any provider/runtime-specific code (LLM error, timeout, etc.) — the field
+ *    is intentionally typed as `string` to accommodate future codes without a
+ *    coordinated SDK release.
+ */
 export interface RunErrorEvent extends BaseRunEvent {
   type: "run_error";
   error: { code: string; message: string };
@@ -121,6 +166,8 @@ export type RunEvent =
   | RunStartEvent
   | ToolCallEvent
   | ToolResultEvent
+  | ToolCallErrorEvent
   | LlmCompleteEvent
+  | OutputValidationWarningEvent
   | RunCompleteEvent
   | RunErrorEvent;

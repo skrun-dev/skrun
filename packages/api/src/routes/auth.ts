@@ -281,6 +281,9 @@ export function createAuthRoutes(db: DbAdapter, authMiddleware: MiddlewareHandle
       email: user.email ?? null,
       avatar_url: user.avatar_url ?? null,
       plan: user.plan ?? "free",
+      // Dashboard needs `role` to conditionally render admin-only UI
+      // (e.g. the <verify-button>).
+      role: user.role,
     });
   });
 

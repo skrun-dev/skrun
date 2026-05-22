@@ -19,7 +19,7 @@ const mockAgents = [
     namespace: "dev",
     description: "Drafts emails",
     owner_id: "u1",
-    verified: true,
+    latest_version_verified: true,
     run_count: 0,
     token_count: 0,
     cost_total: 0,
@@ -32,7 +32,7 @@ const mockAgents = [
     namespace: "dev",
     description: "Reviews code",
     owner_id: "u1",
-    verified: false,
+    latest_version_verified: false,
     run_count: 0,
     token_count: 0,
     cost_total: 0,
@@ -45,7 +45,7 @@ const mockAgents = [
     namespace: "alice",
     description: "Analyzes data",
     owner_id: "u2",
-    verified: false,
+    latest_version_verified: false,
     run_count: 0,
     token_count: 0,
     cost_total: 0,
@@ -109,5 +109,23 @@ describe("AgentsPage", () => {
     await waitFor(() => {
       expect(screen.getByText("No agents registered")).toBeInTheDocument();
     });
+  });
+
+  // UAT-20: per-row badge sources from `latest_version_verified` (not the
+  // removed legacy `verified` field). Verified agents show "verified" Pill,
+  // unverified show "unverified" Pill. Per peer-review tooltip surfaces the
+  // "latest only" semantic.
+  it("UAT-20: per-row Status badge reflects latest_version_verified", async () => {
+    renderWithProviders(<AgentsPage />);
+    await waitFor(() => {
+      expect(screen.getByText(byTextContent("dev/email-drafter"))).toBeInTheDocument();
+    });
+
+    // email-drafter is verified=true → one "verified" badge; the other two
+    // unverified rows → at least two "unverified" badges.
+    const verifiedPills = screen.getAllByText("verified");
+    const unverifiedPills = screen.getAllByText("unverified");
+    expect(verifiedPills.length).toBeGreaterThanOrEqual(1);
+    expect(unverifiedPills.length).toBeGreaterThanOrEqual(2);
   });
 });

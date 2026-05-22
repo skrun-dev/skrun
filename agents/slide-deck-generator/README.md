@@ -28,6 +28,7 @@ From the repo root:
 # 1. Push the agent to your local registry
 cd agents/slide-deck-generator
 skrun build && skrun push
+skrun verify dev/slide-deck-generator@0.2.0   # admin step; dev-token = auto-admin
 
 # 2. Call it (quick-try with the bundled outline — 6-slide Q2 update)
 curl -X POST http://localhost:4000/api/agents/dev/slide-deck-generator/run \

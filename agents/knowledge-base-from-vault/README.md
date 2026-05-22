@@ -28,6 +28,7 @@ From the repo root:
 # 1. Push the agent to your local registry
 cd agents/knowledge-base-from-vault
 skrun build && skrun push
+skrun verify dev/knowledge-base-from-vault@0.2.0   # admin step; dev-token = auto-admin
 
 # 2. Call it (quick-try with the bundled vault — 5 notes, light theme)
 curl -X POST http://localhost:4000/api/agents/dev/knowledge-base-from-vault/run \

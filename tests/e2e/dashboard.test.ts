@@ -91,11 +91,33 @@ describe("E2E: Dashboard API", () => {
 
   it("GET /api/runs/:id returns run when found", async () => {
     const { app, db } = createTestApp();
+    // Lazily seed the dev-token user by making any authenticated request
+    // first. Auth middleware creates the user row on first hit; the
+    // user_id ownership filter (audit/001 SEC-002) then has something to
+    // match. After this, look up the user by their derived github_id
+    // (sha256(token).slice(0,16) prefixed with "dev-").
+    await app.request("/api/me", { headers: devAuth });
+    const allUsers = await Promise.all(
+      ["dev"].map(async (_ns) => {
+        const u = await db.listAgents(1, 1);
+        return u;
+      }),
+    );
+    void allUsers; // avoid unused
+    // Recover the dev user by querying via getUserByGithubId — but we don't
+    // know the hash. Simpler: re-derive it via the same logic the middleware
+    // uses.
+    const { createHash } = await import("node:crypto");
+    const devId = createHash("sha256").update("dev-token").digest("hex").slice(0, 16);
+    const devUser = await db.getUserByGithubId(`dev-${devId}`);
+    if (!devUser) throw new Error("dev user not seeded by middleware");
+
     await db.createRun({
       id: "test-run-e2e",
       agent_id: null,
       agent_version: "1.0.0",
       status: "completed",
+      user_id: devUser.id,
     });
 
     const res = await app.request("/api/runs/test-run-e2e", { headers: devAuth });

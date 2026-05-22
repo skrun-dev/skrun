@@ -34,6 +34,7 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
             email: user.email || undefined,
             avatar_url: user.avatar_url || undefined,
             plan: user.plan || undefined,
+            role: user.role,
           };
           c.set(USER_CONTEXT_KEY, ctx);
           return next();
@@ -82,6 +83,7 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
           email: user.email || undefined,
           avatar_url: user.avatar_url || undefined,
           plan: user.plan || undefined,
+          role: user.role,
         };
         c.set(USER_CONTEXT_KEY, ctx);
         return next();
@@ -107,10 +109,15 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
           }
         }
 
+        // dev-token only fires when OAuth is NOT configured (self-host
+        // single-user mode), so the caller IS the instance operator and
+        // gets admin role unconditionally. This preserves the local-dev UX
+        // for admin-gated routes (per-version verify, DELETE override).
         const ctx: UserContext = {
           id: devUser?.id ?? devId,
           namespace,
           username: namespace,
+          role: "admin",
         };
         c.set(USER_CONTEXT_KEY, ctx);
         return next();

@@ -1,4 +1,4 @@
-name: dev/semgrep-rule-creator
+name: semgrep-rule-creator
 version: 0.1.0
 
 model:

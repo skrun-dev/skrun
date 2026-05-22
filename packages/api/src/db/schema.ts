@@ -4,7 +4,6 @@ export interface Agent {
   namespace: string;
   description: string;
   owner_id: string;
-  verified: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -18,6 +17,7 @@ export interface AgentVersion {
   config_snapshot?: Record<string, unknown>;
   notes: string | null;
   pushed_at: string;
+  verified: boolean;
 }
 
 export interface AgentState {
@@ -26,6 +26,8 @@ export interface AgentState {
   updated_at: string;
 }
 
+export type UserRole = "admin" | "user";
+
 export interface User {
   id: string;
   github_id: string;
@@ -33,6 +35,14 @@ export interface User {
   email: string;
   avatar_url: string;
   plan: string;
+  /**
+   * Instance-level privilege. `admin` is the only role allowed to call
+   * `PATCH /api/agents/:ns/:name/verify`. Default `user` for all newly
+   * created accounts; dev-token in self-host mode is mapped to `admin` to
+   * preserve the single-user UX. Promotion to admin in production requires
+   * a manual SQL UPDATE — there is intentionally no API for elevation.
+   */
+  role: UserRole;
   created_at: string;
   updated_at: string;
 }

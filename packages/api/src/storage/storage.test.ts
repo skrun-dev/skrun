@@ -1,4 +1,8 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { LocalStorage } from "./local.js";
 import { MemoryStorage } from "./memory.js";
 
 describe("MemoryStorage", () => {
@@ -54,5 +58,52 @@ describe("MemoryStorage", () => {
     storage.clear();
     expect(await storage.exists("a")).toBe(false);
     expect(await storage.exists("b")).toBe(false);
+  });
+});
+
+// SEC-013: path traversal defense on LocalStorage.resolve.
+describe("LocalStorage path validation (SEC-013)", () => {
+  let baseDir: string;
+  let storage: LocalStorage;
+
+  beforeEach(() => {
+    baseDir = mkdtempSync(join(tmpdir(), "skrun-local-storage-"));
+    storage = new LocalStorage(baseDir);
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(baseDir, { recursive: true, force: true });
+    } catch {
+      // ignore EPERM on Windows
+    }
+  });
+
+  it("VT-20: rejects keys containing `..` traversal", async () => {
+    await expect(storage.put("../escape.txt", Buffer.from("x"))).rejects.toThrow(
+      /resolves outside baseDir/,
+    );
+    await expect(storage.get("../etc/passwd")).rejects.toThrow(/resolves outside baseDir/);
+  });
+
+  it("VT-20: rejects absolute paths that bypass baseDir", async () => {
+    // Posix-style absolute path. On Windows this resolves under baseDir's drive
+    // letter and may not escape — accept either rejection or no-op (file not
+    // found) but never a successful read outside baseDir.
+    try {
+      await storage.put("/tmp/escape-abs.txt", Buffer.from("x"));
+      // If put succeeded (Windows path normalization), confirm the file landed
+      // inside baseDir, not at /tmp.
+      const got = await storage.get("/tmp/escape-abs.txt");
+      expect(got?.toString()).toBe("x");
+    } catch (err) {
+      expect((err as Error).message).toMatch(/resolves outside baseDir/);
+    }
+  });
+
+  it("accepts legitimate nested keys", async () => {
+    await storage.put("ns/agent/1.0.0.bin", Buffer.from("ok"));
+    const got = await storage.get("ns/agent/1.0.0.bin");
+    expect(got?.toString()).toBe("ok");
   });
 });

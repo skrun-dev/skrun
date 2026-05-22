@@ -8,6 +8,15 @@ export interface AuthUser {
   email?: string;
   avatar_url?: string;
   plan?: string;
+  /**
+   * Instance role — `'admin'` is required to call the per-version verify
+   * endpoint + delete agents across namespaces. The dashboard reads this
+   * to gate admin-only UI (per-row Verify/Unverify buttons in the versions
+   * table, Delete admin override visibility). Optional for compatibility
+   * with older servers that pre-date the field; a missing value is treated
+   * as `'user'` (least-privilege).
+   */
+  role?: "admin" | "user";
 }
 
 interface AuthContextValue {
@@ -29,23 +38,38 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     async function fetchUser() {
       try {
-        const res = await fetch("/api/me", { credentials: "same-origin" });
-        if (res.ok) {
-          const data = await res.json();
-          if (!cancelled) {
-            setUser(data);
-            // In OAuth mode with valid session, no token needed (cookies handle it)
-            setAuthToken("none");
-          }
-        } else if (res.status === 401) {
+        // 1. First try the session-cookie path (OAuth mode).
+        let res = await fetch("/api/me", { credentials: "same-origin" });
+        let usedDevToken = false;
+
+        if (res.status === 401) {
+          // 2. Cookie didn't work — see whether the server has OAuth configured.
           const body = await res.json().catch(() => null);
           const isOAuth = body?.error?.oauth === true;
-          if (!cancelled) {
-            setIsOAuthMode(isOAuth);
-            if (!isOAuth) {
-              // Local dev mode — use dev-token for all API calls
-              setAuthToken("dev-token");
-            }
+          if (!cancelled) setIsOAuthMode(isOAuth);
+          if (isOAuth) {
+            // OAuth-configured but no valid session → operator must log in.
+            return;
+          }
+          // 3. Local dev mode. Wire the dev-token for future API calls AND
+          // re-fetch /api/me with the Bearer header so `user` actually loads
+          // (including `role: "admin"` which gates admin-only UI like the
+          // Verify button). Without this 2nd fetch, `user` would stay null
+          // and `user?.role === "admin"` would be falsy in dev mode.
+          setAuthToken("dev-token");
+          usedDevToken = true;
+          res = await fetch("/api/me", {
+            credentials: "same-origin",
+            headers: { Authorization: "Bearer dev-token" },
+          });
+        }
+
+        if (res.ok && !cancelled) {
+          const data = await res.json();
+          setUser(data);
+          if (!usedDevToken) {
+            // Cookie-authed (OAuth) — no Bearer token needed for future calls.
+            setAuthToken("none");
           }
         }
       } catch {

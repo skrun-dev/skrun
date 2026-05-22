@@ -34,26 +34,29 @@ export class SupabaseDb implements DbAdapter {
   }): Promise<Agent> {
     const { data: agent, error } = await this.client
       .from("agents")
-      .insert({ ...data, verified: false })
+      .insert({ ...data })
       .select()
       .single();
     if (error) throw new Error(`createAgent failed: ${error.message}`);
     return agent;
   }
 
-  async listAgents(
-    page: number,
-    limit: number,
-  ): Promise<{
+  async listAgents(opts: { page: number; limit: number; userId?: string }): Promise<{
     agents: (Agent & { run_count: number; token_count: number; cost_total: number })[];
     total: number;
   }> {
+    const { page, limit, userId } = opts;
     const from = (page - 1) * limit;
     const to = from + limit - 1;
-    const { data, error, count } = await this.client
-      .from("agents")
-      .select("*", { count: "exact" })
-      .range(from, to);
+    // Build query then conditionally narrow by owner_id. The `count: "exact"`
+    // option respects the WHERE filter — Supabase returns the FILTERED count
+    // (verified per Supabase docs). idx_agents_owner from migration 001:60
+    // ensures this stays O(log n) on Postgres.
+    let query = this.client.from("agents").select("*", { count: "exact" });
+    if (userId) {
+      query = query.eq("owner_id", userId);
+    }
+    const { data, error, count } = await query.range(from, to);
     if (error) throw new Error(`listAgents failed: ${error.message}`);
 
     const agents = data ?? [];
@@ -84,15 +87,22 @@ export class SupabaseDb implements DbAdapter {
     return (count ?? 0) > 0;
   }
 
-  async setVerified(namespace: string, name: string, verified: boolean): Promise<Agent | null> {
+  async setVersionVerified(
+    namespace: string,
+    name: string,
+    version: string,
+    verified: boolean,
+  ): Promise<AgentVersion | null> {
+    const agent = await this.getAgent(namespace, name);
+    if (!agent) return null;
     const { data, error } = await this.client
-      .from("agents")
-      .update({ verified, updated_at: new Date().toISOString() })
-      .eq("namespace", namespace)
-      .eq("name", name)
+      .from("agent_versions")
+      .update({ verified })
+      .eq("agent_id", agent.id)
+      .eq("version", version)
       .select()
       .maybeSingle();
-    if (error) throw new Error(`setVerified failed: ${error.message}`);
+    if (error) throw new Error(`setVersionVerified failed: ${error.message}`);
     return data;
   }
 
@@ -140,6 +150,12 @@ export class SupabaseDb implements DbAdapter {
       .select("*")
       .eq("agent_id", agentId)
       .order("pushed_at", { ascending: false })
+      // Tiebreaker on `id DESC` — Postgres doesn't break ties otherwise, so
+      // two rows with identical `pushed_at` (same millisecond pushes) would
+      // return non-deterministic "latest" results. Matches the SQLite adapter's
+      // `rowid DESC` tiebreaker. Security-relevant once the per-version
+      // verified gate consumes this resolution.
+      .order("id", { ascending: false })
       .limit(1)
       .maybeSingle();
     if (error) throw new Error(`getLatestVersion failed: ${error.message}`);
@@ -227,6 +243,7 @@ export class SupabaseDb implements DbAdapter {
         email: data.email ?? "",
         avatar_url: data.avatar_url ?? "",
         plan: "free",
+        role: "user",
       })
       .select()
       .single();

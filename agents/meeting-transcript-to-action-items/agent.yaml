@@ -1,4 +1,4 @@
-name: dev/meeting-transcript-to-action-items
+name: meeting-transcript-to-action-items
 version: 0.2.0
 
 # v0.2.0: audio-native. Accepts a meeting recording directly via Skrun's multimodal-inputs (#56).

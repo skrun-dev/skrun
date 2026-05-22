@@ -1,4 +1,4 @@
-name: acme/persistent-skill
+name: persistent-skill
 version: 1.0.0
 model:
   provider: anthropic

@@ -5,9 +5,10 @@ import { join } from "node:path";
 import type { FileInfo, RunEvent } from "@skrun-dev/runtime";
 import {
   createLogger,
-  estimateCacheSavings,
+  isHostAllowed,
   LLMRouter,
   LocalAdapter,
+  McpConnectError,
   McpToolProvider,
   ResolveError,
   redactSecretsFromString,
@@ -30,9 +31,26 @@ import { getUser } from "../middleware/auth.js";
 import type { RegistryService } from "../services/registry.js";
 import { RegistryError } from "../services/registry.js";
 import { formatSSEEvent } from "../utils/sse.js";
+import { dispatchRegistryError, persistRunCompletion } from "./_helpers.js";
 
 const globalRouter = new LLMRouter();
 const logger = createLogger("api");
+
+/**
+ * Wrap a DB's getState/setState so the runtime adapter's slug-only `name` is
+ * automatically scoped under the request's namespace. The `agent_state` row
+ * is keyed as `<namespace>/<slug>` — preventing two same-slug agents in
+ * different namespaces from colliding on the same state.
+ *
+ * Exported so the multi-tenant wiring contract is testable in isolation.
+ */
+export function createNamespacedStateCallbacks(db: DbAdapter, namespace: string) {
+  return {
+    getState: (slug: string) => db.getState(`${namespace}/${slug}`),
+    setState: (slug: string, state: Record<string, unknown>) =>
+      db.setState(`${namespace}/${slug}`, state),
+  };
+}
 
 // MCP connection cache — reuse connected providers across runs
 const DEFAULT_MCP_TTL_S = 600;
@@ -164,6 +182,23 @@ export function createRunRoutes(
             400,
           );
         }
+        // Reject private / cloud-metadata / link-local hosts even in
+        // unrestricted ["*"] mode (isHostAllowed defense-in-depth via isPrivateHost).
+        // Dev mode bypass: same rationale as the HTTPS check above — local
+        // webhook listeners on `http://localhost:NNNN/...` are the standard
+        // way to test webhook delivery during development. Production keeps
+        // the guard so AWS IMDS / localhost services are unreachable.
+        if (!isDev && !isHostAllowed(url.hostname, ["*"])) {
+          return c.json(
+            {
+              error: {
+                code: "INVALID_WEBHOOK_URL",
+                message: "webhook_url resolves to a private or reserved address",
+              },
+            },
+            400,
+          );
+        }
       } catch {
         return c.json(
           {
@@ -236,36 +271,47 @@ export function createRunRoutes(
     // 3. Load agent from registry (optionally pinned to `requestedVersion`)
     let bundleBuffer: Buffer;
     let resolvedVersion: string;
+    let resolvedVerified: boolean;
     try {
       const result = await service.pull(namespace, name, requestedVersion);
       bundleBuffer = result.buffer;
       resolvedVersion = result.version;
+      resolvedVerified = result.verified;
     } catch (err) {
-      if (err instanceof RegistryError) {
-        // Enrich VERSION_NOT_FOUND with up to 10 most recent versions so the
-        // caller can recover without a separate round-trip.
-        if (err.code === "VERSION_NOT_FOUND") {
-          let available: string[] = [];
-          try {
-            const all = await service.getVersions(namespace, name);
-            available = all
-              .map((v) => v.version)
-              .slice(-10)
-              .reverse();
-          } catch {
-            // Swallow — don't mask the original 404 if listing itself fails.
-          }
-          return c.json(
-            { error: { code: err.code, message: err.message, available } },
-            err.status as 400 | 404 | 409 | 500,
-          );
+      // Special-case: enrich VERSION_NOT_FOUND with up to 10 most recent
+      // versions so the caller can recover without a separate round-trip.
+      // All other RegistryError shapes go through the shared helper.
+      if (err instanceof RegistryError && err.code === "VERSION_NOT_FOUND") {
+        let available: string[] = [];
+        try {
+          const all = await service.getVersions(namespace, name);
+          available = all
+            .map((v) => v.version)
+            .slice(-10)
+            .reverse();
+        } catch {
+          // Swallow — don't mask the original 404 if listing itself fails.
         }
-        return c.json(
-          { error: { code: err.code, message: err.message } },
-          err.status as 400 | 404 | 409 | 500,
-        );
+        return c.json({ error: { code: err.code, message: err.message, available } }, err.status);
       }
-      throw err;
+      return dispatchRegistryError(c, err);
+    }
+
+    // 3b. Hard verified gate — admin must approve a version before it can run.
+    // Per-version flag enables incremental trust: a new push starts unverified
+    // without invalidating prior verified versions (pinned callers protected).
+    // Pre-empts LLM allocation, MCP connect, file alloc, DB write — none of
+    // which should happen for an unapproved version.
+    if (!resolvedVerified) {
+      return c.json(
+        {
+          error: {
+            code: "AGENT_NOT_VERIFIED",
+            message: `Agent ${namespace}/${name} version ${resolvedVersion} must be verified by an admin before it can run.`,
+          },
+        },
+        403,
+      );
     }
 
     // 4. Extract bundle to disk (cached by namespace/name/version)
@@ -449,41 +495,48 @@ export function createRunRoutes(
       const { existsSync } = await import("node:fs");
       const scriptsDir = join(bundleDir, "scripts");
       if (existsSync(scriptsDir)) {
-        const token = c.req.header("Authorization")?.slice(7).trim() ?? "";
-        const isDevToken = token === "dev-token";
-        let isVerified = false;
-        try {
-          const metadata = await service.getMetadata(namespace, name);
-          isVerified = metadata.verified;
-        } catch {
-          // Agent not found in registry — treat as unverified
-        }
-
-        if (isVerified || isDevToken) {
-          const scriptProvider = new ScriptToolProvider(
-            scriptsDir,
-            agentConfig.tools,
-            allowedHosts,
-            runOutputDir,
-            { bundleRoot: bundleDir, depsCache },
-          );
-          await toolRegistry.addProvider(scriptProvider);
-        } else {
-          warnings.push("agent_not_verified_scripts_disabled");
-        }
+        // Hard 403 verified gate upstream (Phase 3b) ensures only admin-approved
+        // versions reach this code path — scripts register unconditionally now.
+        const scriptProvider = new ScriptToolProvider(
+          scriptsDir,
+          agentConfig.tools,
+          allowedHosts,
+          runOutputDir,
+          { bundleRoot: bundleDir, depsCache },
+        );
+        await toolRegistry.addProvider(scriptProvider);
       }
     }
 
-    for (const mcpServer of agentConfig.mcp_servers) {
-      const tempProvider = new McpToolProvider(mcpServer, undefined, allowedHosts);
-      const configKey = `${tempProvider.getConfigKey()}:${JSON.stringify(allowedHosts)}`;
-      let mcpProvider = mcpCache.get(configKey);
-      if (!mcpProvider) {
-        mcpProvider = tempProvider;
-        await mcpProvider.listTools(); // triggers connect
-        mcpCache.set(configKey, mcpProvider);
+    try {
+      for (const mcpServer of agentConfig.mcp_servers) {
+        const tempProvider = new McpToolProvider(mcpServer, undefined, allowedHosts);
+        const configKey = `${tempProvider.getConfigKey()}:${JSON.stringify(allowedHosts)}`;
+        let mcpProvider = mcpCache.get(configKey);
+        if (!mcpProvider) {
+          mcpProvider = tempProvider;
+          // Throws `McpConnectError` on timeout / transport failure. Only
+          // cache on success — caching a broken provider would lock the
+          // bad state in for the TTL window.
+          await mcpProvider.listTools();
+          mcpCache.set(configKey, mcpProvider);
+        }
+        await toolRegistry.addProvider(mcpProvider);
       }
-      await toolRegistry.addProvider(mcpProvider);
+    } catch (err) {
+      if (err instanceof McpConnectError) {
+        return c.json(
+          {
+            error: {
+              code: err.code,
+              message: err.message,
+              details: err.details,
+            },
+          },
+          502,
+        );
+      }
+      throw err;
     }
 
     // 8. Track run in database
@@ -511,13 +564,14 @@ export function createRunRoutes(
       agent: `${namespace}/${name}`,
       agent_version: resolvedVersion,
     });
+    // State callbacks: the runtime passes `config.name` (slug-only) as the
+    // key. We prefix with the request's namespace so the DB row is scoped to
+    // `<namespace>/<slug>`. Two same-slug agents in different namespaces stay
+    // isolated.
     const adapter = new LocalAdapter(
       globalRouter,
       toolRegistry,
-      {
-        getState: (name) => db.getState(name),
-        setState: (name, s) => db.setState(name, s),
-      },
+      createNamespacedStateCallbacks(db, namespace),
       log,
     );
     const runRequest = {
@@ -572,30 +626,39 @@ export function createRunRoutes(
               // Update run in DB (same as sync mode)
               const sseCacheReadTokens = event.usage.cache_read_tokens ?? 0;
               const sseCacheWriteTokens = event.usage.cache_write_tokens ?? 0;
-              const sseCacheSavingsUsd = estimateCacheSavings(
+              persistRunCompletion(
+                db,
+                log,
+                runId,
                 modelForCostLookup,
-                sseCacheReadTokens,
+                {
+                  output: event.output,
+                  promptTokens: event.usage.prompt_tokens,
+                  completionTokens: event.usage.completion_tokens,
+                  totalTokens: event.usage.total_tokens,
+                  cacheReadTokens: sseCacheReadTokens,
+                  cacheWriteTokens: sseCacheWriteTokens,
+                  estimatedCost: event.cost?.estimated ?? 0,
+                  durationMs: event.duration_ms,
+                  files: event.files,
+                },
+                "sse",
               );
-              db.updateRun(runId, {
-                status: "completed",
-                output: event.output,
-                usage_prompt_tokens: event.usage.prompt_tokens,
-                usage_completion_tokens: event.usage.completion_tokens,
-                usage_total_tokens: event.usage.total_tokens,
-                usage_estimated_cost: event.cost?.estimated ?? 0,
-                usage_cache_read_tokens: sseCacheReadTokens,
-                usage_cache_write_tokens: sseCacheWriteTokens,
-                usage_cache_savings_usd: sseCacheSavingsUsd,
-                duration_ms: event.duration_ms,
-                files: event.files?.map((f) => ({ name: f.name, size: f.size })) ?? null,
-                completed_at: new Date().toISOString(),
-              }).catch(() => {});
             } else if (event.type === "run_error") {
               db.updateRun(runId, {
                 status: "failed",
                 error: event.error.message,
                 completed_at: new Date().toISOString(),
-              }).catch(() => {});
+              }).catch((err) =>
+                log.error(
+                  {
+                    event: "db_update_failed",
+                    run_id: runId,
+                    error: err instanceof Error ? err.message : String(err),
+                  },
+                  "DB updateRun failed (SSE error)",
+                ),
+              );
             }
             const sanitized = sanitizeEvent(event);
             const { event: eventName, data } = formatSSEEvent(sanitized);
@@ -626,23 +689,24 @@ export function createRunRoutes(
               // stats and run-detail.
               const whCacheReadTokens = event.usage.cache_read_tokens ?? 0;
               const whCacheWriteTokens = event.usage.cache_write_tokens ?? 0;
-              const whCacheSavingsUsd = estimateCacheSavings(modelForCostLookup, whCacheReadTokens);
-              await db
-                .updateRun(runId, {
-                  status: "completed",
+              const { cacheSavingsUsd: whCacheSavingsUsd } = await persistRunCompletion(
+                db,
+                log,
+                runId,
+                modelForCostLookup,
+                {
                   output: event.output,
-                  usage_prompt_tokens: event.usage.prompt_tokens,
-                  usage_completion_tokens: event.usage.completion_tokens,
-                  usage_total_tokens: event.usage.total_tokens,
-                  usage_estimated_cost: event.cost?.estimated ?? 0,
-                  usage_cache_read_tokens: whCacheReadTokens,
-                  usage_cache_write_tokens: whCacheWriteTokens,
-                  usage_cache_savings_usd: whCacheSavingsUsd,
-                  duration_ms: event.duration_ms,
-                  files: event.files?.map((f) => ({ name: f.name, size: f.size })) ?? null,
-                  completed_at: new Date().toISOString(),
-                })
-                .catch(() => {});
+                  promptTokens: event.usage.prompt_tokens,
+                  completionTokens: event.usage.completion_tokens,
+                  totalTokens: event.usage.total_tokens,
+                  cacheReadTokens: whCacheReadTokens,
+                  cacheWriteTokens: whCacheWriteTokens,
+                  estimatedCost: event.cost?.estimated ?? 0,
+                  durationMs: event.duration_ms,
+                  files: event.files,
+                },
+                "webhook",
+              );
               finalResult = {
                 run_id: runId,
                 status: "completed",
@@ -669,7 +733,16 @@ export function createRunRoutes(
                   error: event.error.message,
                   completed_at: new Date().toISOString(),
                 })
-                .catch(() => {});
+                .catch((err) =>
+                  log.error(
+                    {
+                      event: "db_update_failed",
+                      run_id: runId,
+                      error: err instanceof Error ? err.message : String(err),
+                    },
+                    "DB updateRun failed (webhook error)",
+                  ),
+                );
               finalResult = {
                 run_id: runId,
                 status: "failed",
@@ -705,34 +778,49 @@ export function createRunRoutes(
         registerOutput(runId, runRequest.outputDir, result.files);
       }
 
-      // Compute cache-savings snapshot at write time (matches usage_estimated_cost
-      // pattern). Always 0 for failed runs since the runtime returns 0 cacheReadTokens
-      // and the formula short-circuits.
+      // Track completed run. Cache-savings snapshot is computed at write
+      // time (matches usage_estimated_cost pattern); always 0 for failed runs.
       const cacheReadTokens = result.usage.cacheReadTokens ?? 0;
       const cacheWriteTokens = result.usage.cacheWriteTokens ?? 0;
-      const cacheSavingsUsd =
-        result.status === "completed"
-          ? estimateCacheSavings(modelForCostLookup, cacheReadTokens)
-          : 0;
-
-      // Track completed run
-      await db
-        .updateRun(runId, {
-          status: result.status === "completed" ? "completed" : "failed",
-          output: result.output,
-          error: result.error ?? null,
-          usage_prompt_tokens: result.usage.promptTokens,
-          usage_completion_tokens: result.usage.completionTokens,
-          usage_total_tokens: result.usage.totalTokens,
-          usage_estimated_cost: result.usage.estimatedCost,
-          usage_cache_read_tokens: cacheReadTokens,
-          usage_cache_write_tokens: cacheWriteTokens,
-          usage_cache_savings_usd: cacheSavingsUsd,
-          duration_ms: result.durationMs,
-          files: result.files?.map((f) => ({ name: f.name, size: f.size })) ?? null,
-          completed_at: new Date().toISOString(),
-        })
-        .catch(() => {}); // Non-critical — don't fail the response
+      let cacheSavingsUsd = 0;
+      if (result.status === "completed") {
+        ({ cacheSavingsUsd } = await persistRunCompletion(
+          db,
+          log,
+          runId,
+          modelForCostLookup,
+          {
+            output: result.output,
+            promptTokens: result.usage.promptTokens,
+            completionTokens: result.usage.completionTokens,
+            totalTokens: result.usage.totalTokens,
+            cacheReadTokens,
+            cacheWriteTokens,
+            estimatedCost: result.usage.estimatedCost,
+            durationMs: result.durationMs,
+            files: result.files,
+          },
+          "sync",
+        ));
+      } else {
+        // Failed run — write status=failed + error, omit usage_* (DB DEFAULT 0).
+        await db
+          .updateRun(runId, {
+            status: "failed",
+            error: result.error ?? null,
+            completed_at: new Date().toISOString(),
+          })
+          .catch((err) =>
+            log.error(
+              {
+                event: "db_update_failed",
+                run_id: runId,
+                error: err instanceof Error ? err.message : String(err),
+              },
+              "DB updateRun failed (sync failed-result path)",
+            ),
+          );
+      }
 
       return c.json({
         run_id: result.runId,
@@ -777,7 +865,16 @@ export function createRunRoutes(
           error: errorMessage,
           completed_at: new Date().toISOString(),
         })
-        .catch(() => {}); // Non-critical
+        .catch((err) =>
+          log.error(
+            {
+              event: "db_update_failed",
+              run_id: runId,
+              error: err instanceof Error ? err.message : String(err),
+            },
+            "DB updateRun failed (sync error path)",
+          ),
+        );
 
       return c.json(
         {

@@ -1,6 +1,6 @@
 {
   "name": "@skrun-dev/api",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "exports": {
     ".": {
@@ -17,7 +17,7 @@
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "dev": "node --env-file=../../.env --import tsx src/dev.ts"
+    "dev": "node --use-system-ca --env-file=../../.env --import tsx src/dev.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.0.1",

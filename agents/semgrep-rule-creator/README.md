@@ -24,6 +24,7 @@ From the repo root:
 # 1. Push the agent to your local registry
 cd agents/semgrep-rule-creator
 skrun build && skrun push
+skrun verify dev/semgrep-rule-creator@0.1.0   # admin step; dev-token = auto-admin
 
 # 2. Call it (quick-try with the bundled SSRF fixture)
 curl -X POST http://localhost:4000/api/agents/dev/semgrep-rule-creator/run \

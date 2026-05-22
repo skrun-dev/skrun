@@ -5,7 +5,8 @@ import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import type { DbAdapter } from "../db/adapter.js";
 import { getUser } from "../middleware/auth.js";
-import { RegistryError, type RegistryService } from "../services/registry.js";
+import type { RegistryService } from "../services/registry.js";
+import { dispatchRegistryError } from "./_helpers.js";
 
 // --- Tar builder (replicates CLI skrun build logic) ---
 
@@ -182,13 +183,7 @@ export function createScanRoutes(
       const metadata = await service.push(user.namespace, name, version, bundle, user.id);
       return c.json(metadata);
     } catch (err) {
-      if (err instanceof RegistryError) {
-        return c.json(
-          { error: { code: err.code, message: err.message } },
-          err.status as 400 | 404 | 409 | 500,
-        );
-      }
-      throw err;
+      return dispatchRegistryError(c, err);
     }
   });
 

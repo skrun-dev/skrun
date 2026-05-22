@@ -12,7 +12,6 @@ import { askModel, askText } from "../utils/prompts.js";
 interface FromSkillOptions {
   force?: boolean;
   model?: string;
-  namespace?: string;
 }
 
 export async function initFromSkill(skillPath: string, opts: FromSkillOptions): Promise<void> {
@@ -68,9 +67,6 @@ export async function initFromSkill(skillPath: string, opts: FromSkillOptions): 
     modelName = model.name;
   }
 
-  // Resolve namespace
-  const namespace = opts.namespace ?? (await askText("Namespace?", "my"));
-
   // Resolve input
   const inputStr = await askText("Main input name and type? (name:type)", "query:string");
   const [inputName, inputType] = inputStr.split(":");
@@ -87,10 +83,11 @@ export async function initFromSkill(skillPath: string, opts: FromSkillOptions): 
         .filter(Boolean)
     : [];
 
-  // Build full config
+  // Build full config — namespace is assigned by the registry at push time
+  // (from your auth context), so the yaml only carries the slug from SKILL.md.
   const fullConfig = AgentConfigSchema.parse({
     ...generated.config,
-    name: `${namespace}/${skill.frontmatter.name}`,
+    name: skill.frontmatter.name,
     model: { provider, name: modelName },
     inputs: [{ name: inputName || "query", type: inputType || "string", required: true }],
     outputs: [{ name: "result", type: "string" }],

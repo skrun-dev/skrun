@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -68,5 +68,29 @@ describe("collectOutputFiles", () => {
 
     expect(files).toHaveLength(1);
     expect(files[0].name).toBe("file.txt");
+  });
+
+  // VT-12 (SEC-009): symbolic links must not be served as run output files.
+  // A malicious script could `ln -s /etc/passwd output/leak.txt` and the file
+  // routes would otherwise expose the linked content.
+  it("VT-12: rejects symlinks (skip with warning, don't follow)", () => {
+    writeFileSync(join(dir, "real.txt"), "real content");
+
+    // Symlink pointing to a "system" file outside the output dir
+    const target = join(dir, "real.txt");
+    const linkPath = join(dir, "leak.txt");
+    try {
+      symlinkSync(target, linkPath);
+    } catch (err) {
+      // Windows requires elevated rights for symlinkSync by default.
+      // Skip the assertion if symlink creation fails — the production check
+      // still applies (lstatSync detects whatever the FS gives back).
+      if ((err as NodeJS.ErrnoException).code === "EPERM") return;
+      throw err;
+    }
+
+    const files = collectOutputFiles(dir);
+    // Only the real file should be present, not the symlink.
+    expect(files.map((f) => f.name)).toEqual(["real.txt"]);
   });
 });

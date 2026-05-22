@@ -3,7 +3,6 @@ import type { Logger } from "@skrun-dev/runtime";
 
 const MAX_RETRIES = 3;
 const BACKOFF_BASE_MS = 1000; // 1s, 4s, 16s (base^2 per retry)
-const DEFAULT_SIGNING_KEY = "skrun-dev-webhook-secret";
 
 /**
  * Deliver a webhook payload with HMAC-SHA256 signature and retry logic.
@@ -15,7 +14,13 @@ export async function deliverWebhook(
   signingKey?: string,
   logger?: Logger,
 ): Promise<void> {
-  const key = signingKey ?? process.env.WEBHOOK_SIGNING_KEY ?? DEFAULT_SIGNING_KEY;
+  const key = signingKey ?? process.env.WEBHOOK_SIGNING_KEY;
+  if (!key) {
+    throw new Error(
+      "WEBHOOK_SIGNING_KEY is not configured — refusing to deliver webhook with an insecure default. " +
+        "Set the WEBHOOK_SIGNING_KEY environment variable (see .env.example).",
+    );
+  }
   const body = JSON.stringify(payload);
   const signature = createHmac("sha256", key).update(body).digest("hex");
 

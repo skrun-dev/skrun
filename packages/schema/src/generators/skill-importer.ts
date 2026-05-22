@@ -42,7 +42,7 @@ export function generateAgentYaml(skill: ParsedSkill): GeneratedAgentYaml {
   }));
 
   const config: Partial<AgentConfig> = {
-    // name will be prefixed with namespace by CLI: `${namespace}/${skill.frontmatter.name}`
+    // name is set to skill.frontmatter.name (slug-only); namespace is assigned at push by the registry
     version: "1.0.0",
     tools,
     mcp_servers: [],

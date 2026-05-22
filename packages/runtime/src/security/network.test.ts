@@ -77,6 +77,25 @@ describe("isHostAllowed", () => {
     expect(isHostAllowed("[::1]", ["*"])).toBe(false);
   });
 
+  // VT-8 (SEC-006): IPv4-mapped IPv6 (::ffff:*) must not bypass the IPv4 allowlist
+  it("VT-8: blocks IPv4-mapped IPv6 ::ffff:* (with and without brackets)", () => {
+    // AWS metadata endpoint via IPv4-mapped — the headline exploit
+    expect(isHostAllowed("::ffff:169.254.169.254", ["*"])).toBe(false);
+    expect(isHostAllowed("[::ffff:169.254.169.254]", ["*"])).toBe(false);
+    // Private IPv4 ranges via mapping
+    expect(isHostAllowed("::ffff:10.0.0.1", ["*"])).toBe(false);
+    expect(isHostAllowed("::ffff:127.0.0.1", ["*"])).toBe(false);
+    expect(isHostAllowed("[::ffff:192.168.1.1]", ["*"])).toBe(false);
+  });
+
+  // VT-9 (SEC-006): link-local IPv6 fe80::/10 must be blocked
+  it("VT-9: blocks link-local IPv6 fe80:* (with and without brackets)", () => {
+    expect(isHostAllowed("fe80::1", ["*"])).toBe(false);
+    expect(isHostAllowed("[fe80::1]", ["*"])).toBe(false);
+    expect(isHostAllowed("fe80::abcd:1234", ["*"])).toBe(false);
+    expect(isHostAllowed("FE80::1", ["*"])).toBe(false); // case-insensitive
+  });
+
   // Additional: case insensitive matching
   it("matches case-insensitively", () => {
     expect(isHostAllowed("API.GitHub.COM", ["api.github.com"])).toBe(true);

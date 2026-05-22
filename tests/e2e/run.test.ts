@@ -118,8 +118,11 @@ describe("E2E: POST /run", () => {
   // --- Files API (#12) ---
 
   it("GET /runs/:run_id/files/:filename → 404 for unknown run", async () => {
+    // Auth required since audit/001; missing header → 401 before reaching
+    // the run lookup. Use devAuth to reach the 404 branch.
     const res = await ctx.app.request("/api/runs/nonexistent-run/files/test.txt", {
       method: "GET",
+      headers: devAuth,
     });
     expect(res.status).toBe(404);
     const body = await res.json();

@@ -217,12 +217,15 @@ export async function run(): Promise<void> {
 
     let signatureValid = false;
     if (webhookPayload && webhookSignature) {
-      // Verify HMAC (using default dev key)
+      // SEC-008 (Task 1.4): the dev-default `"skrun-dev-webhook-secret"`
+      // constant was removed; the registry now signs with WEBHOOK_SIGNING_KEY
+      // from its env. The test runner sets this same env var in .env, and the
+      // spawn inherits it (see _ctx.ts), so reading process.env here gives the
+      // exact key the registry used.
+      const signingKey = process.env.WEBHOOK_SIGNING_KEY;
       const sigMatch = webhookSignature.match(/^sha256=([a-f0-9]+)$/);
-      if (sigMatch) {
-        const expected = createHmac("sha256", "skrun-dev-webhook-secret")
-          .update(webhookPayload)
-          .digest("hex");
+      if (sigMatch && signingKey) {
+        const expected = createHmac("sha256", signingKey).update(webhookPayload).digest("hex");
         signatureValid = sigMatch[1] === expected;
       }
     }

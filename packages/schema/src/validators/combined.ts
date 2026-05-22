@@ -1,6 +1,6 @@
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { ValidationIssue } from "../errors.js";
+import { ValidationError, type ValidationIssue } from "../errors.js";
 import { detectManifest, hasNonStdlibImports } from "../manifests.js";
 import type { ParsedAgentYaml } from "../parsers/agent-yaml.js";
 import { parseAgentYaml } from "../parsers/agent-yaml.js";
@@ -82,11 +82,25 @@ export async function validateAgent(dir: string): Promise<ValidationResult> {
     agentConfig = parseAgentYaml(content);
     agentConfig.filePath = agentYamlPath;
   } catch (cause) {
-    errors.push({
-      code: "INVALID_AGENT_YAML",
-      message: `Failed to parse agent.yaml: ${cause instanceof Error ? cause.message : String(cause)}`,
-      file: "agent.yaml",
-    });
+    // Surface every field-level issue from a ValidationError so the user sees
+    // the actual remediation hint (e.g., "drop the namespace prefix"). Without
+    // this, the CLI flattens to a generic "Invalid agent.yaml" and the Zod
+    // message gets lost.
+    if (cause instanceof ValidationError && cause.issues.length > 0) {
+      for (const issue of cause.issues) {
+        errors.push({
+          code: "INVALID_AGENT_YAML",
+          message: issue.message,
+          file: "agent.yaml",
+        });
+      }
+    } else {
+      errors.push({
+        code: "INVALID_AGENT_YAML",
+        message: `Failed to parse agent.yaml: ${cause instanceof Error ? cause.message : String(cause)}`,
+        file: "agent.yaml",
+      });
+    }
     return { valid: false, errors, warnings, parsed: null };
   }
 
@@ -117,11 +131,11 @@ export async function validateAgent(dir: string): Promise<ValidationResult> {
 
   // Cross-file warnings: name consistency
   const skillName = skill.frontmatter.name;
-  const agentSlug = agentConfig.config.name.split("/")[1];
-  if (agentSlug && skillName !== agentSlug) {
+  const agentName = agentConfig.config.name;
+  if (skillName !== agentName) {
     warnings.push({
       code: "NAME_MISMATCH",
-      message: `SKILL.md name "${skillName}" does not match agent.yaml slug "${agentSlug}"`,
+      message: `SKILL.md name "${skillName}" does not match agent.yaml name "${agentName}"`,
     });
   }
 

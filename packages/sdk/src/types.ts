@@ -9,7 +9,18 @@ export interface SkrunClientOptions {
   timeout?: number;
 }
 
-/** Agent identifier: "namespace/name" string or { namespace, name } object */
+/**
+ * Agent identifier for SDK calls — the registry-qualified reference
+ * `<namespace>/<name>` (e.g., `"acme/seo-audit"`) or the equivalent
+ * `{ namespace, name }` object.
+ *
+ * **This is distinct from `agent.yaml`'s `name` field**, which is slug-only
+ * (e.g., `"seo-audit"`). The SDK requires the full `<namespace>/<name>`
+ * form because it needs to construct the registry URL
+ * (`/api/agents/<namespace>/<name>/run`). The namespace under which an
+ * agent was published is recorded by the registry at push time from the
+ * publisher's auth context — it does not live in the bundle's yaml.
+ */
 export type AgentIdentifier = string | { namespace: string; name: string };
 
 /**
@@ -118,7 +129,12 @@ export interface AsyncRunResult {
 export interface AgentMetadata {
   name: string;
   namespace: string;
-  verified: boolean;
+  /**
+   * Verified state of the latest version (by push time). Drives badges in the
+   * dashboard listing. Matches `agent_versions.verified` of the most recently
+   * pushed version. False when the agent has no versions.
+   */
+  latest_version_verified: boolean;
   latest_version: string;
   created_at: string;
   updated_at: string;
@@ -149,6 +165,13 @@ export interface AgentVersionInfo {
   config_snapshot?: Record<string, unknown>;
   /** Optional note attached to the version at push time (≤ 500 chars, plain text). */
   notes: string | null;
+  /**
+   * Per-version verified state. Gated by
+   * `PATCH /api/agents/:ns/:name/versions/:version/verify` (admin only).
+   * `POST /run` returns 403 AGENT_NOT_VERIFIED when the resolved version's
+   * flag is false.
+   */
+  verified: boolean;
 }
 
 export interface ListOptions {
@@ -183,6 +206,18 @@ export interface ToolResultEvent extends BaseRunEvent {
   is_error: boolean;
 }
 
+/**
+ * Informational event emitted when a tool returns `{is_error: true}`.
+ * Mirrors `runtime.ToolCallErrorEvent`. Emitted BEFORE the matching
+ * `tool_result`; the LLM still receives the error normally.
+ */
+export interface ToolCallErrorEvent extends BaseRunEvent {
+  type: "tool_call_error";
+  tool: string;
+  message: string;
+  code?: string;
+}
+
 export interface LlmCompleteEvent extends BaseRunEvent {
   type: "llm_complete";
   provider: string;
@@ -215,6 +250,26 @@ export interface RunCompleteEvent extends BaseRunEvent {
   files?: SdkFileInfo[];
 }
 
+/**
+ * Informational event emitted when the LLM's final output fails Zod validation
+ * against the agent's declared `outputs` schema. Mirrors `runtime.OutputValidationWarningEvent`.
+ * Emitted BEFORE the retry attempt. The `errors` field carries the Zod issues
+ * for diagnostics; shape is `unknown[]` since Zod's issue type is not part of
+ * the public wire contract.
+ */
+export interface OutputValidationWarningEvent extends BaseRunEvent {
+  type: "output_validation_warning";
+  errors: unknown[];
+}
+
+/**
+ * Terminus event for an unrecoverable run failure.
+ *
+ * Known `error.code` values:
+ *  - `OUTPUT_SCHEMA_INVALID` — final LLM output failed validation against the
+ *    declared `outputs` schema and the auto-repair retry also failed.
+ *  - any provider/runtime-specific code.
+ */
 export interface RunErrorEvent extends BaseRunEvent {
   type: "run_error";
   error: { code: string; message: string };
@@ -224,6 +279,8 @@ export type RunEvent =
   | RunStartEvent
   | ToolCallEvent
   | ToolResultEvent
+  | ToolCallErrorEvent
   | LlmCompleteEvent
+  | OutputValidationWarningEvent
   | RunCompleteEvent
   | RunErrorEvent;

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { createLogger } from "../logger.js";
 import type { FileInfo } from "../types.js";
 
@@ -31,7 +31,17 @@ export function collectOutputFiles(dir: string, options?: CollectOptions): FileI
   const files: FileInfo[] = [];
 
   for (const name of entries.sort()) {
-    const stat = statSync(`${dir}/${name}`);
+    // Use lstatSync so symlinks are detected before they are followed. A
+    // script-created symlink to /etc/passwd would otherwise be served via
+    // the file routes.
+    const stat = lstatSync(`${dir}/${name}`);
+    if (stat.isSymbolicLink()) {
+      logger.warn(
+        { event: "symlink_rejected", file: name, dir },
+        `File "${name}" is a symbolic link, refused`,
+      );
+      continue;
+    }
     if (!stat.isFile()) continue;
 
     if (stat.size > maxSizeBytes) {

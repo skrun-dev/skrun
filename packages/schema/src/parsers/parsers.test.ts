@@ -100,7 +100,7 @@ describe("parseAgentYaml", () => {
     const content = await readFile(resolve(FIXTURES, "valid-agent.yaml"), "utf-8");
     const result = parseAgentYaml(content);
 
-    expect(result.config.name).toBe("acme/seo-audit");
+    expect(result.config.name).toBe("seo-audit");
     expect(result.config.version).toBe("1.0.0");
     expect(result.config.model.provider).toBe("anthropic");
     expect(result.config.model.fallback?.provider).toBe("openai");
@@ -111,12 +111,12 @@ describe("parseAgentYaml", () => {
     expect(result.config.environment.max_cost).toBe(0.5);
     expect(result.config.state.type).toBe("kv");
     expect(result.config.tests).toHaveLength(1);
-    expect(result.raw).toContain("acme/seo-audit");
+    expect(result.raw).toContain("seo-audit");
   });
 
   it("should parse a minimal agent.yaml with defaults", () => {
     const yaml = `
-name: acme/simple
+name: simple
 version: 1.0.0
 model:
   provider: anthropic
@@ -162,9 +162,11 @@ outputs:
     expect(() => parseAgentYaml(yaml)).toThrow(ValidationError);
   });
 
-  it("should throw on invalid name format (no namespace)", () => {
-    const yaml = `
-name: no-namespace
+  // VT-2 — legacy `<ns>/<slug>` form is now rejected; error message guides
+  // the user to drop the prefix and explains namespace-at-push.
+  it("VT-2: rejects legacy <ns>/<slug> name with a remediation hint", () => {
+    const legacyYaml = `
+name: acme/seo-audit
 version: 1.0.0
 model:
   provider: anthropic
@@ -176,13 +178,52 @@ outputs:
   - name: r
     type: string
 `;
-    expect(() => parseAgentYaml(yaml)).toThrow(ValidationError);
+    expect(() => parseAgentYaml(legacyYaml)).toThrow(ValidationError);
+    try {
+      parseAgentYaml(legacyYaml);
+      expect.fail("Should have thrown");
+    } catch (err) {
+      const ve = err as ValidationError;
+      const nameIssue = ve.issues.find((i) => i.field?.includes("name"));
+      expect(nameIssue?.message).toMatch(/remove the prefix/i);
+      expect(nameIssue?.message).toMatch(/registry derives the namespace/i);
+    }
+  });
+
+  // VT-3..VT-7 — slug-only regex rejects uppercase, spaces, consecutive
+  // hyphens, leading/trailing hyphens, and double-slash. All variants must
+  // surface as a ValidationError on the `name` field.
+  function yamlWithName(invalidName: string): string {
+    return `
+name: ${invalidName}
+version: 1.0.0
+model:
+  provider: anthropic
+  name: test
+inputs:
+  - name: q
+    type: string
+outputs:
+  - name: r
+    type: string
+`;
+  }
+
+  it.each([
+    ["VT-3 uppercase", "EmailDrafter"],
+    ["VT-4 spaces", "foo bar"],
+    ["VT-5 consecutive hyphens", "foo--bar"],
+    ["VT-6a leading hyphen", "-foo"],
+    ["VT-6b trailing hyphen", "foo-"],
+    ["VT-7 double-slash", "a/b/c"],
+  ])("rejects invalid slug %s (`%s`)", (_id, invalidName) => {
+    expect(() => parseAgentYaml(yamlWithName(invalidName))).toThrow(ValidationError);
   });
 
   it("should throw with field-level error details", () => {
     try {
       parseAgentYaml(`
-name: acme/test
+name: test-agent
 version: bad
 model:
   provider: anthropic
@@ -204,7 +245,7 @@ outputs:
 
   it("should throw on empty inputs array", () => {
     const yaml = `
-name: acme/test
+name: test-agent
 version: 1.0.0
 model:
   provider: anthropic
@@ -222,7 +263,7 @@ outputs:
   });
 
   it("should preserve raw content", () => {
-    const yaml = `name: acme/test
+    const yaml = `name: test-agent
 version: 1.0.0
 model:
   provider: anthropic

@@ -16,7 +16,7 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { REGISTRY, ROOT, results, skrun, TOKEN } from "./_ctx.js";
+import { REGISTRY, ROOT, results, skrun, TOKEN, verifyLatestVersion } from "./_ctx.js";
 
 /** Best-effort delete of dev/<slug>@<version>. 204/404 OK; anything else logs warn. Per #77. */
 async function cleanupVersion(agentSlug: string, version: string): Promise<void> {
@@ -212,6 +212,9 @@ export async function run(): Promise<void> {
     try {
       skrun(["build"], dir);
       skrun(["push"], dir);
+      // Verify the just-pushed version so POST /run reaches past the
+      // per-version verified gate (#83). dev-token = admin.
+      await verifyLatestVersion("dev", "receipts-to-expenses");
 
       // Upload 3 receipt images
       const fileIds = await Promise.all([

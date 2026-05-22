@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { outputsToZod } from "@skrun-dev/schema";
 import { collectOutputFiles } from "../files/output-collector.js";
 import type { SkrunPart } from "../llm/parts.js";
 import type { ToolCallRequest, ToolCallResult } from "../llm/providers/types.js";
@@ -216,6 +217,30 @@ export class LocalAdapter implements RuntimeAdapter {
         `Tool ${call.name} ${result.isError ? "failed" : "completed"}`,
       );
 
+      // Emit a visibility-only `tool_call_error` event BEFORE the existing
+      // `tool_result` when the tool returned isError. The tool_result still
+      // flows back to the LLM normally — the LLM decides what to do (retry,
+      // fallback, graceful failure). This event exists so failures are
+      // visible in the SSE stream + dashboard event timeline (rendered in
+      // red) without changing the recovery contract. Same emit path covers
+      // both script tools and MCP tools (this.tools is the unified
+      // ToolRegistry).
+      if (result.isError) {
+        // Extract optional structured code from the script-provider's
+        // `[CODE] message` content prefix (e.g. `[SCRIPT_DEPS_INSTALL_FAILED] ...`)
+        // for machine-readable consumers; falls back to undefined for
+        // free-form error strings.
+        const codeMatch = /^\[([A-Z_]+)\]\s*/.exec(result.content);
+        events.push({
+          type: "tool_call_error",
+          run_id: request.runId,
+          timestamp: new Date().toISOString(),
+          tool: call.name,
+          message: codeMatch ? result.content.slice(codeMatch[0].length) : result.content,
+          ...(codeMatch?.[1] ? { code: codeMatch[1] } : {}),
+        });
+      }
+
       events.push({
         type: "tool_result",
         run_id: request.runId,
@@ -300,7 +325,144 @@ export class LocalAdapter implements RuntimeAdapter {
       await this.stateCallbacks.setState(config.name, newState);
     }
 
-    const costResult = checkCost(llmResponse.estimatedCost, config.environment.max_cost);
+    // Track aggregate usage so a follow-up retry call can add to the same
+    // accumulators without duplicating the run_complete construction below.
+    let aggPromptTokens = llmResponse.usage.promptTokens;
+    let aggCompletionTokens = llmResponse.usage.completionTokens;
+    let aggTotalTokens = llmResponse.usage.totalTokens;
+    let aggCacheReadTokens = llmResponse.usage.cacheReadTokens;
+    let aggCacheWriteTokens = llmResponse.usage.cacheWriteTokens;
+    let aggCost = llmResponse.estimatedCost;
+
+    // Post-loop output validation against the agent's declared `outputs`
+    // schema. On success the run proceeds unchanged. On failure we emit an
+    // `output_validation_warning` and issue a SINGLE isolated repair LLM
+    // call (no tools, no agentic loop). Retry success → `run_complete`
+    // with the corrected output + summed usage. Retry failure (JSON parse
+    // or schema mismatch) → `run_error` with code `OUTPUT_SCHEMA_INVALID`.
+    if (config.outputs.length > 0) {
+      const outputSchema = outputsToZod(config.outputs);
+      const validation = outputSchema.safeParse(output);
+      if (!validation.success) {
+        events.push({
+          type: "output_validation_warning",
+          run_id: request.runId,
+          timestamp: new Date().toISOString(),
+          errors: validation.error.issues,
+        });
+        this.logger.warn(
+          {
+            event: "output_validation_failed",
+            agent: config.name,
+            issues: validation.error.issues.length,
+          },
+          "Final output did not match declared outputs schema — issuing repair retry",
+        );
+
+        const schemaDescription = config.outputs
+          .map((o) => `  - ${o.name} (${o.type})${o.description ? `: ${o.description}` : ""}`)
+          .join("\n");
+        const repairPrompt = `Your previous JSON output did not match the agent's declared output schema.
+
+Validation errors:
+${JSON.stringify(validation.error.issues, null, 2)}
+
+Required top-level fields (all required; extra keys allowed):
+${schemaDescription}
+
+Re-emit the output as a single JSON object matching this schema. Output only the JSON object, no commentary.`;
+
+        const retryResponse = await this.router.call(
+          config.model,
+          systemPrompt,
+          [{ kind: "text", text: repairPrompt }],
+          undefined,
+          undefined,
+          config.model.temperature,
+          request.callerKeys,
+          undefined,
+          undefined,
+          agentContext,
+        );
+
+        events.push({
+          type: "llm_complete",
+          run_id: request.runId,
+          timestamp: new Date().toISOString(),
+          provider: retryResponse.provider,
+          model: retryResponse.model,
+          tokens: retryResponse.usage.totalTokens,
+        });
+
+        aggPromptTokens += retryResponse.usage.promptTokens;
+        aggCompletionTokens += retryResponse.usage.completionTokens;
+        aggTotalTokens += retryResponse.usage.totalTokens;
+        if (retryResponse.usage.cacheReadTokens !== undefined) {
+          aggCacheReadTokens = (aggCacheReadTokens ?? 0) + retryResponse.usage.cacheReadTokens;
+        }
+        if (retryResponse.usage.cacheWriteTokens !== undefined) {
+          aggCacheWriteTokens = (aggCacheWriteTokens ?? 0) + retryResponse.usage.cacheWriteTokens;
+        }
+        aggCost += retryResponse.estimatedCost;
+
+        let retryParseError: string | null = null;
+        let retryOutput: Record<string, unknown> = {};
+        try {
+          const jsonMatch = retryResponse.content.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            if (parsed._state !== undefined) parsed._state = undefined;
+            retryOutput = parsed;
+          } else {
+            retryParseError = "Retry output did not contain a JSON object";
+          }
+        } catch (err) {
+          retryParseError = `Retry output was not valid JSON: ${err instanceof Error ? err.message : String(err)}`;
+        }
+
+        if (retryParseError) {
+          this.logger.warn(
+            { event: "output_retry_parse_failed", agent: config.name },
+            retryParseError,
+          );
+          return {
+            events,
+            result: {
+              type: "run_error",
+              run_id: request.runId,
+              timestamp: new Date().toISOString(),
+              error: { code: "OUTPUT_SCHEMA_INVALID", message: retryParseError },
+            },
+          };
+        }
+
+        const retryValidation = outputSchema.safeParse(retryOutput);
+        if (!retryValidation.success) {
+          const message = `Output validation failed after repair retry: ${JSON.stringify(retryValidation.error.issues)}`;
+          this.logger.warn(
+            {
+              event: "output_retry_validation_failed",
+              agent: config.name,
+              issues: retryValidation.error.issues.length,
+            },
+            "Repair retry output still did not match declared schema",
+          );
+          return {
+            events,
+            result: {
+              type: "run_error",
+              run_id: request.runId,
+              timestamp: new Date().toISOString(),
+              error: { code: "OUTPUT_SCHEMA_INVALID", message },
+            },
+          };
+        }
+
+        output = retryOutput;
+      }
+    }
+
+    const costResult = checkCost(aggCost, config.environment.max_cost);
     if (costResult.exceeded) {
       this.logger.warn(
         {
@@ -316,7 +478,7 @@ export class LocalAdapter implements RuntimeAdapter {
     const durationMs = Date.now() - start;
 
     this.logger.info(
-      { event: "run_complete", agent: config.name, durationMs, cost: llmResponse.estimatedCost },
+      { event: "run_complete", agent: config.name, durationMs, cost: aggCost },
       "Agent run completed",
     );
 
@@ -326,17 +488,13 @@ export class LocalAdapter implements RuntimeAdapter {
       timestamp: new Date().toISOString(),
       output,
       usage: {
-        prompt_tokens: llmResponse.usage.promptTokens,
-        completion_tokens: llmResponse.usage.completionTokens,
-        total_tokens: llmResponse.usage.totalTokens,
-        ...(llmResponse.usage.cacheReadTokens !== undefined && {
-          cache_read_tokens: llmResponse.usage.cacheReadTokens,
-        }),
-        ...(llmResponse.usage.cacheWriteTokens !== undefined && {
-          cache_write_tokens: llmResponse.usage.cacheWriteTokens,
-        }),
+        prompt_tokens: aggPromptTokens,
+        completion_tokens: aggCompletionTokens,
+        total_tokens: aggTotalTokens,
+        ...(aggCacheReadTokens !== undefined && { cache_read_tokens: aggCacheReadTokens }),
+        ...(aggCacheWriteTokens !== undefined && { cache_write_tokens: aggCacheWriteTokens }),
       },
-      cost: { estimated: llmResponse.estimatedCost },
+      cost: { estimated: aggCost },
       duration_ms: durationMs,
       files: [],
     };

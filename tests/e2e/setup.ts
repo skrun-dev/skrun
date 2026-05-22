@@ -160,13 +160,29 @@ export function parseSSEEvents(
   return events;
 }
 
-/** Set verification flag on an agent */
-export async function verifyAgent(
+/**
+ * Set verification flag on a specific version of an agent. Per-version
+ * verification (#83) replaces the legacy per-agent flag. dev-token is auto-
+ * admin (audit/001 SEC-005 part B) so this call passes the admin gate.
+ */
+export async function verifyVersion(
   app: ReturnType<typeof createApp>,
-  opts: { ns?: string; name?: string; verified?: boolean; token?: string } = {},
+  opts: {
+    ns?: string;
+    name?: string;
+    version?: string;
+    verified?: boolean;
+    token?: string;
+  } = {},
 ) {
-  const { ns = "dev", name = "test-agent", verified = true, token = DEV_TOKEN } = opts;
-  return app.request(`/api/agents/${ns}/${name}/verify`, {
+  const {
+    ns = "dev",
+    name = "test-agent",
+    version = "1.0.0",
+    verified = true,
+    token = DEV_TOKEN,
+  } = opts;
+  return app.request(`/api/agents/${ns}/${name}/versions/${version}/verify`, {
     method: "PATCH",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ verified }),

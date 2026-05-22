@@ -319,7 +319,7 @@ export function HomePage() {
                           <span className="text-[12.5px] text-gray-800 dark:text-gray-200 truncate">
                             {agent.name}
                           </span>
-                          {agent.verified && (
+                          {agent.latest_version_verified && (
                             <IconCheck className="w-3 h-3 text-sky-500 shrink-0" />
                           )}
                         </div>

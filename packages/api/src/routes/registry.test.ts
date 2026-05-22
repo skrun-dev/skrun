@@ -1,15 +1,41 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { generateApiKey } from "../auth/api-key.js";
 import { MemoryDb } from "../db/memory.js";
 import { createApp } from "../index.js";
 import { MemoryStorage } from "../storage/memory.js";
 
+// Capture logger.info calls so we can assert the structured-log shape emitted
+// by the per-version verify route (AC-9). vi.mock is hoisted to the top of
+// the file; vi.hoisted lets the spy be declared in lock-step so it's defined
+// when the mock factory runs. We replace only `createLogger`; the rest of
+// @skrun-dev/runtime is left intact.
+const { logInfoSpy } = vi.hoisted(() => ({ logInfoSpy: vi.fn() }));
+vi.mock("@skrun-dev/runtime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@skrun-dev/runtime")>();
+  return {
+    ...actual,
+    createLogger: () => ({
+      info: logInfoSpy,
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+      trace: vi.fn(),
+      fatal: vi.fn(),
+      level: "info",
+      child: () => ({ info: logInfoSpy }),
+    }),
+  };
+});
+
 describe("Registry Routes", () => {
   let app: ReturnType<typeof createApp>;
+  let db: MemoryDb;
 
   beforeEach(() => {
     const storage = new MemoryStorage();
-    const db = new MemoryDb();
+    db = new MemoryDb();
     app = createApp(storage, db);
+    logInfoSpy.mockClear();
   });
 
   const authHeader = { Authorization: "Bearer dev-token" };
@@ -113,36 +139,458 @@ describe("Registry Routes", () => {
     expect(res.status).toBe(404);
   });
 
-  it("GET /agents lists agents (public)", async () => {
+  it("GET /agents lists agents (auth required, dev-token admin sees all)", async () => {
     await pushAgent("dev", "a", "1.0.0");
     await pushAgent("dev", "b", "1.0.0");
 
-    const res = await app.request("/api/agents");
+    const res = await app.request("/api/agents", { headers: authHeader });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.agents).toHaveLength(2);
     expect(body.total).toBe(2);
   });
 
+  // ── #80 multi-tenant filter on GET /agents ───────────────────────────
+
+  // VT-8 (#80): anonymous → 401 (auth-required gate)
+  it("VT-8 (#80): GET /agents returns 401 without Authorization header", async () => {
+    const res = await app.request("/api/agents");
+    expect(res.status).toBe(401);
+  });
+
+  // VT-4 + VT-5 (#80): cross-tenant isolation — each non-admin OAuth user
+  // sees only their own agents. Two sk_live_* users prove the filter
+  // narrows correctly across owners.
+  it("VT-4 + VT-5 (#80): GET /agents — non-admin users see only own agents (cross-tenant isolated)", async () => {
+    // Seed user A + 2 agents
+    const userA = await db.createUser({ github_id: "gh-A", username: "user-a" });
+    const a = generateApiKey();
+    await db.createApiKey({
+      user_id: userA.id,
+      key_hash: a.keyHash,
+      key_prefix: a.keyPrefix,
+      name: "key-a",
+    });
+    await app.request("/api/agents/user-a/agent-1/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${a.key}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bundle,
+    });
+    await app.request("/api/agents/user-a/agent-2/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${a.key}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bundle,
+    });
+
+    // Seed user B + 1 agent
+    const userB = await db.createUser({ github_id: "gh-B", username: "user-b" });
+    const b = generateApiKey();
+    await db.createApiKey({
+      user_id: userB.id,
+      key_hash: b.keyHash,
+      key_prefix: b.keyPrefix,
+      name: "key-b",
+    });
+    await app.request("/api/agents/user-b/agent-x/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${b.key}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bundle,
+    });
+
+    // VT-4: User A sees only their 2 agents
+    const resA = await app.request("/api/agents", {
+      headers: { Authorization: `Bearer ${a.key}` },
+    });
+    expect(resA.status).toBe(200);
+    const bodyA = (await resA.json()) as { agents: { namespace: string }[]; total: number };
+    expect(bodyA.agents).toHaveLength(2);
+    expect(bodyA.total).toBe(2);
+    expect(bodyA.agents.every((ag) => ag.namespace === "user-a")).toBe(true);
+
+    // VT-5: User B sees only their 1 agent (NOT A's)
+    const resB = await app.request("/api/agents", {
+      headers: { Authorization: `Bearer ${b.key}` },
+    });
+    expect(resB.status).toBe(200);
+    const bodyB = (await resB.json()) as { agents: { namespace: string }[]; total: number };
+    expect(bodyB.agents).toHaveLength(1);
+    expect(bodyB.total).toBe(1);
+    expect(bodyB.agents[0].namespace).toBe("user-b");
+  });
+
+  // VT-6 (#80): dev-token mode → role='admin' → instance-wide visibility.
+  // Combined with VT-7 (any-mode admin sees all) since the underlying code
+  // path is the same — `user.role === 'admin'` triggers the bypass
+  // regardless of which auth chain set the role.
+  it("VT-6 + VT-7 (#80): GET /agents with admin token returns all agents across namespaces", async () => {
+    // Seed an agent under a different namespace (api-key user)
+    const owner = await db.createUser({ github_id: "gh-owner", username: "owner-x" });
+    const k = generateApiKey();
+    await db.createApiKey({
+      user_id: owner.id,
+      key_hash: k.keyHash,
+      key_prefix: k.keyPrefix,
+      name: "owner-key",
+    });
+    await app.request("/api/agents/owner-x/their-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${k.key}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bundle,
+    });
+    // Plus a dev/ agent
+    await pushAgent("dev", "my-agent", "1.0.0");
+
+    // dev-token call → role='admin' → sees BOTH namespaces
+    const res = await app.request("/api/agents", { headers: authHeader });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { agents: { namespace: string }[]; total: number };
+    expect(body.agents).toHaveLength(2);
+    expect(body.total).toBe(2);
+    const namespaces = body.agents.map((a) => a.namespace).sort();
+    expect(namespaces).toEqual(["dev", "owner-x"]);
+  });
+
+  // VT-9 (#80): pagination total reflects the FILTERED count when userId is
+  // applied — not the global count. Without this, the dashboard would show
+  // "1 of 10 pages" with only 5 visible rows.
+  it("VT-9 (#80): pagination total reflects filtered count when userId narrows", async () => {
+    // 5 agents owned by A
+    const userA = await db.createUser({ github_id: "gh-pag-A", username: "pag-a" });
+    const a = generateApiKey();
+    await db.createApiKey({
+      user_id: userA.id,
+      key_hash: a.keyHash,
+      key_prefix: a.keyPrefix,
+      name: "key-pag-a",
+    });
+    for (let i = 0; i < 5; i++) {
+      await app.request(`/api/agents/pag-a/agent-${i}/push?version=1.0.0`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${a.key}`,
+          "Content-Type": "application/octet-stream",
+        },
+        body: bundle,
+      });
+    }
+    // 5 agents owned by B (must NOT count toward A's total)
+    const userB = await db.createUser({ github_id: "gh-pag-B", username: "pag-b" });
+    const b = generateApiKey();
+    await db.createApiKey({
+      user_id: userB.id,
+      key_hash: b.keyHash,
+      key_prefix: b.keyPrefix,
+      name: "key-pag-b",
+    });
+    for (let i = 0; i < 5; i++) {
+      await app.request(`/api/agents/pag-b/agent-${i}/push?version=1.0.0`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${b.key}`,
+          "Content-Type": "application/octet-stream",
+        },
+        body: bundle,
+      });
+    }
+
+    // A queries with limit 20 → sees 5 + total 5 (filtered, NOT 10)
+    const res = await app.request("/api/agents?page=1&limit=20", {
+      headers: { Authorization: `Bearer ${a.key}` },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { agents: unknown[]; total: number };
+    expect(body.agents).toHaveLength(5);
+    expect(body.total).toBe(5); // NOT 10
+  });
+
   it("GET /agents/:ns/:name returns metadata (public)", async () => {
     await pushAgent();
-    const res = await app.request("/api/agents/dev/test-agent");
+    const res = await app.request("/api/agents/dev/test-agent", { headers: authHeader });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.name).toBe("test-agent");
     expect(body.versions).toEqual(["1.0.0"]);
   });
 
-  it("GET /agents/:ns/:name metadata includes verified=false by default", async () => {
+  it("GET /agents/:ns/:name metadata includes latest_version_verified=false by default", async () => {
     await pushAgent();
-    const res = await app.request("/api/agents/dev/test-agent");
+    const res = await app.request("/api/agents/dev/test-agent", { headers: authHeader });
     const body = await res.json();
-    expect(body.verified).toBe(false);
+    expect(body.latest_version_verified).toBe(false);
   });
 
-  it("PATCH /verify sets verified=true", async () => {
+  // ── #80 multi-tenant filter on GET /agents/:ns/:name + /versions ─────
+
+  // VT-10 + VT-10b (#80): metadata GET — non-owner non-admin gets 404 opaque,
+  // response body byte-identical to a genuine 404 (no client-side discriminator).
+  it("VT-10 + VT-10b (#80): metadata GET — non-owner gets 404 with byte-identical body to genuine 404", async () => {
+    // Seed user B + their agent
+    const userB = await db.createUser({ github_id: "gh-B-meta", username: "user-b" });
+    const b = generateApiKey();
+    await db.createApiKey({
+      user_id: userB.id,
+      key_hash: b.keyHash,
+      key_prefix: b.keyPrefix,
+      name: "key-b-meta",
+    });
+    await app.request("/api/agents/user-b/private-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${b.key}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bundle,
+    });
+
+    // Seed user A (no agents owned)
+    const userA = await db.createUser({ github_id: "gh-A-meta", username: "user-a" });
+    const a = generateApiKey();
+    await db.createApiKey({
+      user_id: userA.id,
+      key_hash: a.keyHash,
+      key_prefix: a.keyPrefix,
+      name: "key-a-meta",
+    });
+
+    // VT-10: user A queries B's agent → 404 NOT_FOUND
+    const ownershipRes = await app.request("/api/agents/user-b/private-agent", {
+      headers: { Authorization: `Bearer ${a.key}` },
+    });
+    expect(ownershipRes.status).toBe(404);
+    const ownershipBody = await ownershipRes.json();
+    expect(ownershipBody.error.code).toBe("NOT_FOUND");
+    expect(ownershipBody.error.message).toBe("Agent user-b/private-agent not found");
+
+    // VT-10b: byte-identical body to a genuine-404 (user A queries a name that
+    // does not exist anywhere). The two response shapes MUST be indistinguishable.
+    const genuineRes = await app.request("/api/agents/user-b/ghost-agent", {
+      headers: { Authorization: `Bearer ${a.key}` },
+    });
+    expect(genuineRes.status).toBe(404);
+    const genuineBody = await genuineRes.json();
+    // Same code, same message shape — no `forbidden` flag, no `code: "FORBIDDEN"`,
+    // no differential payload. The opacity invariant.
+    expect(genuineBody.error.code).toBe(ownershipBody.error.code);
+    expect(JSON.stringify(genuineBody)).toBe(
+      JSON.stringify({
+        error: { code: "NOT_FOUND", message: "Agent user-b/ghost-agent not found" },
+      }),
+    );
+    // And the ownership-404 body has the EXACT same JSON shape (different name
+    // segment only). No extra fields, no role hint, no permission hint.
+    expect(JSON.stringify(ownershipBody)).toBe(
+      JSON.stringify({
+        error: { code: "NOT_FOUND", message: "Agent user-b/private-agent not found" },
+      }),
+    );
+  });
+
+  // VT-11 + VT-12 (#80): metadata GET — owner sees own (200), admin sees any (200).
+  it("VT-11 + VT-12 (#80): metadata GET — owner reads own + admin reads cross-namespace", async () => {
+    const owner = await db.createUser({ github_id: "gh-owner-meta", username: "owner-y" });
+    const k = generateApiKey();
+    await db.createApiKey({
+      user_id: owner.id,
+      key_hash: k.keyHash,
+      key_prefix: k.keyPrefix,
+      name: "owner-key-meta",
+    });
+    await app.request("/api/agents/owner-y/my-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${k.key}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bundle,
+    });
+
+    // VT-11: owner reads own → 200 with metadata
+    const ownerRes = await app.request("/api/agents/owner-y/my-agent", {
+      headers: { Authorization: `Bearer ${k.key}` },
+    });
+    expect(ownerRes.status).toBe(200);
+    const ownerBody = await ownerRes.json();
+    expect(ownerBody.name).toBe("my-agent");
+    expect(ownerBody.namespace).toBe("owner-y");
+
+    // VT-12: admin (dev-token) reads cross-namespace → 200
+    const adminRes = await app.request("/api/agents/owner-y/my-agent", { headers: authHeader });
+    expect(adminRes.status).toBe(200);
+    const adminBody = await adminRes.json();
+    expect(adminBody.name).toBe("my-agent");
+  });
+
+  // VT-13 (#80): versions GET — non-owner non-admin → 404 opaque.
+  it("VT-13 (#80): versions GET — non-owner gets 404 NOT_FOUND (opaque)", async () => {
+    const userB = await db.createUser({ github_id: "gh-B-vers", username: "user-b" });
+    const b = generateApiKey();
+    await db.createApiKey({
+      user_id: userB.id,
+      key_hash: b.keyHash,
+      key_prefix: b.keyPrefix,
+      name: "key-b-vers",
+    });
+    await app.request("/api/agents/user-b/agent-with-versions/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${b.key}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bundle,
+    });
+    await app.request("/api/agents/user-b/agent-with-versions/push?version=2.0.0", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${b.key}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bundle,
+    });
+
+    const userA = await db.createUser({ github_id: "gh-A-vers", username: "user-a" });
+    const a = generateApiKey();
+    await db.createApiKey({
+      user_id: userA.id,
+      key_hash: a.keyHash,
+      key_prefix: a.keyPrefix,
+      name: "key-a-vers",
+    });
+
+    const res = await app.request("/api/agents/user-b/agent-with-versions/versions", {
+      headers: { Authorization: `Bearer ${a.key}` },
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error.code).toBe("NOT_FOUND");
+    expect(body.error.message).toBe("Agent user-b/agent-with-versions not found");
+    // No `versions` array leaked
+    expect(body.versions).toBeUndefined();
+  });
+
+  // VT-15 + VT-15b (#80): pull cross-tenant → 404 opaque + zero storage reads.
+  // The ordering constraint (SC-8b) is the critical part — `storage.get` MUST
+  // not be called when the ownership check throws. Otherwise a timing oracle
+  // would let attackers distinguish "agent exists (storage hit)" from "agent
+  // doesn't exist (no storage hit)" via latency.
+  it("VT-15 + VT-15b (#80): pull non-owner → 404 + no octet-stream headers + storage.get not called", async () => {
+    // Seed user B + agent
+    const userB = await db.createUser({ github_id: "gh-B-pull", username: "user-b" });
+    const b = generateApiKey();
+    await db.createApiKey({
+      user_id: userB.id,
+      key_hash: b.keyHash,
+      key_prefix: b.keyPrefix,
+      name: "key-b-pull",
+    });
+    await app.request("/api/agents/user-b/protected-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${b.key}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bundle,
+    });
+
+    // Seed user A (no agents)
+    const userA = await db.createUser({ github_id: "gh-A-pull", username: "user-a" });
+    const a = generateApiKey();
+    await db.createApiKey({
+      user_id: userA.id,
+      key_hash: a.keyHash,
+      key_prefix: a.keyPrefix,
+      name: "key-a-pull",
+    });
+
+    // VT-15b: spy on MemoryStorage.get BEFORE the request so we can count
+    // calls. The route's ownership check fires before service.pull, which
+    // is the only caller of storage.get for the pull path. Zero calls
+    // means the bundle bytes never reached the route handler.
+    const storageGetSpy = vi.spyOn(MemoryStorage.prototype, "get");
+    storageGetSpy.mockClear();
+
+    try {
+      // VT-15: pull as user A → 404
+      const res = await app.request("/api/agents/user-b/protected-agent/pull", {
+        headers: { Authorization: `Bearer ${a.key}` },
+      });
+      expect(res.status).toBe(404);
+
+      // VT-15: response is JSON error, NOT octet-stream
+      expect(res.headers.get("Content-Type")).toMatch(/application\/json/);
+      // VT-15: no bundle download headers
+      expect(res.headers.get("Content-Disposition")).toBeNull();
+      expect(res.headers.get("X-Agent-Version")).toBeNull();
+
+      // VT-15: body is identical to genuine NOT_FOUND shape
+      const body = await res.json();
+      expect(body).toEqual({
+        error: { code: "NOT_FOUND", message: "Agent user-b/protected-agent not found" },
+      });
+
+      // VT-15b: storage.get was NEVER called — ownership check short-
+      // circuited before any storage read. This is the constant-time
+      // ordering invariant from SC-8b.
+      expect(storageGetSpy).not.toHaveBeenCalled();
+    } finally {
+      storageGetSpy.mockRestore();
+    }
+  });
+
+  // VT-16 + VT-17 (#80): pull as owner returns full bundle bytes; admin
+  // (dev-token) can pull cross-namespace.
+  it("VT-16 + VT-17 (#80): pull — owner reads own bundle + admin reads cross-namespace", async () => {
+    const owner = await db.createUser({ github_id: "gh-owner-pull", username: "owner-z" });
+    const k = generateApiKey();
+    await db.createApiKey({
+      user_id: owner.id,
+      key_hash: k.keyHash,
+      key_prefix: k.keyPrefix,
+      name: "owner-key-pull",
+    });
+    await app.request("/api/agents/owner-z/their-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${k.key}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bundle,
+    });
+
+    // VT-16: owner pulls own bundle → 200 with bytes + headers
+    const ownerRes = await app.request("/api/agents/owner-z/their-agent/pull", {
+      headers: { Authorization: `Bearer ${k.key}` },
+    });
+    expect(ownerRes.status).toBe(200);
+    expect(ownerRes.headers.get("X-Agent-Version")).toBe("1.0.0");
+    expect(ownerRes.headers.get("Content-Disposition")).toContain("their-agent-1.0.0.agent");
+    const ownerBytes = Buffer.from(await ownerRes.arrayBuffer());
+    expect(ownerBytes).toEqual(bundle);
+
+    // VT-17: admin (dev-token) pulls cross-namespace → 200 with bytes
+    const adminRes = await app.request("/api/agents/owner-z/their-agent/pull", {
+      headers: authHeader,
+    });
+    expect(adminRes.status).toBe(200);
+    expect(adminRes.headers.get("X-Agent-Version")).toBe("1.0.0");
+    const adminBytes = Buffer.from(await adminRes.arrayBuffer());
+    expect(adminBytes).toEqual(bundle);
+  });
+
+  it("PATCH /versions/:v/verify sets verified=true on that version", async () => {
     await pushAgent();
-    const res = await app.request("/api/agents/dev/test-agent/verify", {
+    const res = await app.request("/api/agents/dev/test-agent/versions/1.0.0/verify", {
       method: "PATCH",
       headers: { ...authHeader, "Content-Type": "application/json" },
       body: JSON.stringify({ verified: true }),
@@ -150,18 +598,17 @@ describe("Registry Routes", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.verified).toBe(true);
+    expect(body.version).toBe("1.0.0");
   });
 
-  it("PATCH /verify sets verified=false (revoke)", async () => {
+  it("PATCH /versions/:v/verify sets verified=false (revoke)", async () => {
     await pushAgent();
-    // First verify
-    await app.request("/api/agents/dev/test-agent/verify", {
+    await app.request("/api/agents/dev/test-agent/versions/1.0.0/verify", {
       method: "PATCH",
       headers: { ...authHeader, "Content-Type": "application/json" },
       body: JSON.stringify({ verified: true }),
     });
-    // Then revoke
-    const res = await app.request("/api/agents/dev/test-agent/verify", {
+    const res = await app.request("/api/agents/dev/test-agent/versions/1.0.0/verify", {
       method: "PATCH",
       headers: { ...authHeader, "Content-Type": "application/json" },
       body: JSON.stringify({ verified: false }),
@@ -171,8 +618,8 @@ describe("Registry Routes", () => {
     expect(body.verified).toBe(false);
   });
 
-  it("PATCH /verify returns 404 for non-existent agent", async () => {
-    const res = await app.request("/api/agents/dev/nonexistent/verify", {
+  it("PATCH /versions/:v/verify returns 404 for non-existent agent", async () => {
+    const res = await app.request("/api/agents/dev/nonexistent/versions/1.0.0/verify", {
       method: "PATCH",
       headers: { ...authHeader, "Content-Type": "application/json" },
       body: JSON.stringify({ verified: true }),
@@ -180,8 +627,19 @@ describe("Registry Routes", () => {
     expect(res.status).toBe(404);
   });
 
-  it("PATCH /verify returns 401 without auth", async () => {
-    const res = await app.request("/api/agents/dev/test-agent/verify", {
+  it("PATCH /versions/:v/verify returns 404 for non-existent version", async () => {
+    await pushAgent();
+    const res = await app.request("/api/agents/dev/test-agent/versions/9.9.9/verify", {
+      method: "PATCH",
+      headers: { ...authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("PATCH /versions/:v/verify returns 401 without auth", async () => {
+    await pushAgent();
+    const res = await app.request("/api/agents/dev/test-agent/versions/1.0.0/verify", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ verified: true }),
@@ -189,20 +647,251 @@ describe("Registry Routes", () => {
     expect(res.status).toBe(401);
   });
 
-  it("Re-push preserves verified flag", async () => {
-    await pushAgent();
-    // Verify the agent
-    await app.request("/api/agents/dev/test-agent/verify", {
+  // VT-6: non-admin caller is refused even when calling on their own
+  // namespace. The audit's headline finding — pre-fix, any namespace owner
+  // could mint verified=true on their own agent. Per-version endpoint
+  // preserves the admin gate.
+  it("VT-6: PATCH /versions/:v/verify returns 403 for non-admin caller (api-key role='user')", async () => {
+    const user = await db.createUser({ github_id: "gh-vt6", username: "regular" });
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: user.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "vt6-key",
+    });
+    await app.request("/api/agents/regular/owned-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bundle,
+    });
+
+    const res = await app.request("/api/agents/regular/owned-agent/versions/1.0.0/verify", {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    });
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error.code).toBe("FORBIDDEN");
+    expect(body.error.message).toMatch(/admin/i);
+  });
+
+  // VT-7: admin caller can verify any agent's version, including across
+  // namespaces. dev-token grants admin per Q-11; this test exercises the
+  // cross-namespace flow on the per-version endpoint.
+  it("VT-7: PATCH /versions/:v/verify succeeds for admin caller across namespaces", async () => {
+    const owner = await db.createUser({ github_id: "gh-other", username: "owner-x" });
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: owner.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "owner-key",
+    });
+    await app.request("/api/agents/owner-x/their-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: bundle,
+    });
+
+    const res = await app.request("/api/agents/owner-x/their-agent/versions/1.0.0/verify", {
       method: "PATCH",
       headers: { ...authHeader, "Content-Type": "application/json" },
       body: JSON.stringify({ verified: true }),
     });
-    // Re-push with new version
-    await pushAgent("dev", "test-agent", "2.0.0");
-    // Check verified is still true
-    const res = await app.request("/api/agents/dev/test-agent");
+    expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.verified).toBe(true);
+  });
+
+  // ── Structured log emission on verify/unverify (AC-9) ────────────────
+  // The deferred audit-log UI on agent-detail will surface these events; until
+  // then, operators grep pino logs for `event:agent_version_verify`. These
+  // tests pin the shape so two devs can't independently produce slightly
+  // different field names (actor.userId vs actor.user_id, etc.) per
+  // peer-review #9.
+
+  it("emits structured log on successful verify with the expected shape", async () => {
+    await pushAgent();
+    const res = await app.request("/api/agents/dev/test-agent/versions/1.0.0/verify", {
+      method: "PATCH",
+      headers: { ...authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    });
+    expect(res.status).toBe(200);
+
+    const verifyCall = logInfoSpy.mock.calls.find(
+      ([obj]) => (obj as { event?: string })?.event === "agent_version_verify",
+    );
+    expect(verifyCall).toBeDefined();
+    const [logObj] = verifyCall as [Record<string, unknown>, string];
+    expect(logObj.event).toBe("agent_version_verify");
+    expect(logObj.action).toBe("verify");
+    expect(logObj.target).toEqual({ namespace: "dev", name: "test-agent", version: "1.0.0" });
+    expect(logObj.actor).toMatchObject({
+      role: "admin",
+      namespace: "dev",
+    });
+    expect(typeof logObj.timestamp).toBe("string");
+    // ISO-8601 sanity check
+    expect(new Date(logObj.timestamp as string).toString()).not.toBe("Invalid Date");
+  });
+
+  it("emits structured log with action:'unverify' on revoke", async () => {
+    await pushAgent();
+    // Verify first
+    await app.request("/api/agents/dev/test-agent/versions/1.0.0/verify", {
+      method: "PATCH",
+      headers: { ...authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    });
+    logInfoSpy.mockClear();
+    // Then revoke
+    await app.request("/api/agents/dev/test-agent/versions/1.0.0/verify", {
+      method: "PATCH",
+      headers: { ...authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: false }),
+    });
+    const unverifyCall = logInfoSpy.mock.calls.find(
+      ([obj]) => (obj as { event?: string })?.event === "agent_version_verify",
+    );
+    expect(unverifyCall).toBeDefined();
+    const [logObj] = unverifyCall as [Record<string, unknown>, string];
+    expect(logObj.action).toBe("unverify");
+  });
+
+  it("does NOT emit the structured log on 403 (non-admin)", async () => {
+    const user = await db.createUser({ github_id: "gh-nolog", username: "regular" });
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: user.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "nolog-key",
+    });
+    await app.request("/api/agents/regular/x/push?version=1.0.0", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/octet-stream" },
+      body: bundle,
+    });
+    logInfoSpy.mockClear();
+    const res = await app.request("/api/agents/regular/x/versions/1.0.0/verify", {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    });
+    expect(res.status).toBe(403);
+    const verifyCall = logInfoSpy.mock.calls.find(
+      ([obj]) => (obj as { event?: string })?.event === "agent_version_verify",
+    );
+    expect(verifyCall).toBeUndefined();
+  });
+
+  // ── DELETE admin override (Phase 8.5) ────────────────────────────────
+
+  it("DELETE /agents/:ns/:name allows admin across namespaces", async () => {
+    // Push agent in "other" namespace using an api-key user, then admin
+    // (dev-token) deletes it from a foreign namespace.
+    const owner = await db.createUser({ github_id: "gh-del", username: "other" });
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: owner.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "owner-del-key",
+    });
+    await app.request("/api/agents/other/squatter/push?version=1.0.0", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/octet-stream" },
+      body: bundle,
+    });
+
+    const res = await app.request("/api/agents/other/squatter", {
+      method: "DELETE",
+      headers: authHeader,
+    });
+    expect(res.status).toBe(204);
+  });
+
+  it("DELETE /agents/:ns/:name 403s non-admin from foreign namespace", async () => {
+    // Push as dev (auto-admin), but attempt the delete as a regular user from
+    // a different namespace.
+    await pushAgent("dev", "owned", "1.0.0");
+    const user = await db.createUser({ github_id: "gh-foreign", username: "regular" });
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: user.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "foreign-key",
+    });
+
+    const res = await app.request("/api/agents/dev/owned", {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error.code).toBe("FORBIDDEN");
+  });
+
+  it("DELETE /agents/:ns/:name/versions/:v allows admin across namespaces", async () => {
+    const owner = await db.createUser({ github_id: "gh-del-v", username: "other" });
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: owner.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "owner-del-v-key",
+    });
+    await app.request("/api/agents/other/multi/push?version=1.0.0", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/octet-stream" },
+      body: bundle,
+    });
+    await app.request("/api/agents/other/multi/push?version=2.0.0", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/octet-stream" },
+      body: bundle,
+    });
+
+    // Admin deletes the older version across namespaces
+    const res = await app.request("/api/agents/other/multi/versions/1.0.0", {
+      method: "DELETE",
+      headers: authHeader,
+    });
+    expect(res.status).toBe(204);
+  });
+
+  it("Push of new version preserves verified flag on prior versions", async () => {
+    // Push v1.0.0 and verify it
+    await pushAgent();
+    await app.request("/api/agents/dev/test-agent/versions/1.0.0/verify", {
+      method: "PATCH",
+      headers: { ...authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    });
+    // Push a newer version
+    await pushAgent("dev", "test-agent", "2.0.0");
+    // v1.0.0's verified flag must remain true (pinned callers are protected)
+    const versionsRes = await app.request("/api/agents/dev/test-agent/versions", {
+      headers: authHeader,
+    });
+    const versions = (await versionsRes.json()).versions as Array<{
+      version: string;
+      verified: boolean;
+    }>;
+    const v1 = versions.find((v) => v.version === "1.0.0");
+    const v2 = versions.find((v) => v.version === "2.0.0");
+    expect(v1?.verified).toBe(true);
+    expect(v2?.verified).toBe(false);
   });
 
   it("GET /agents/:ns/:name/versions returns versions (public)", async () => {
@@ -213,7 +902,7 @@ describe("Registry Routes", () => {
       body: Buffer.from("v2"),
     });
 
-    const res = await app.request("/api/agents/dev/agent/versions");
+    const res = await app.request("/api/agents/dev/agent/versions", { headers: authHeader });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.versions).toHaveLength(2);
@@ -233,14 +922,18 @@ describe("Registry Routes", () => {
     });
     expect(res.status).toBe(200);
 
-    const versionsRes = await app.request("/api/agents/dev/agent/versions");
+    const versionsRes = await app.request("/api/agents/dev/agent/versions", {
+      headers: authHeader,
+    });
     const { versions } = await versionsRes.json();
     expect(versions[0].notes).toBe("Initial release");
   });
 
   it("POST /push without notes header stores null", async () => {
     await pushAgent();
-    const versionsRes = await app.request("/api/agents/dev/test-agent/versions");
+    const versionsRes = await app.request("/api/agents/dev/test-agent/versions", {
+      headers: authHeader,
+    });
     const { versions } = await versionsRes.json();
     expect(versions[0].notes).toBeNull();
   });
@@ -257,7 +950,9 @@ describe("Registry Routes", () => {
       body: bundle,
     });
     expect(res.status).toBe(200);
-    const versionsRes = await app.request("/api/agents/dev/agent/versions");
+    const versionsRes = await app.request("/api/agents/dev/agent/versions", {
+      headers: authHeader,
+    });
     const { versions } = await versionsRes.json();
     expect(versions[0].notes).toBe(note);
   });
@@ -320,7 +1015,9 @@ describe("Registry Routes", () => {
       body: bundle,
     });
     expect(res.status).toBe(200);
-    const versionsRes = await app.request("/api/agents/dev/agent/versions");
+    const versionsRes = await app.request("/api/agents/dev/agent/versions", {
+      headers: authHeader,
+    });
     const { versions } = await versionsRes.json();
     expect(versions[0].notes).toBeNull();
   });
@@ -341,7 +1038,7 @@ describe("Registry Routes", () => {
       body: bundle,
     });
 
-    const res = await app.request("/api/agents/dev/agent/versions");
+    const res = await app.request("/api/agents/dev/agent/versions", { headers: authHeader });
     const { versions } = await res.json();
     expect(versions).toHaveLength(2);
     // Versions sorted by pushed_at ascending
@@ -352,14 +1049,25 @@ describe("Registry Routes", () => {
   // ── DELETE /api/agents/:ns/:name/versions/:version (#77) ───────────────
 
   describe("DELETE /versions/:version (#77)", () => {
-    // VT-4 403 wrong namespace
-    it("returns 403 FORBIDDEN when caller's namespace differs from path namespace", async () => {
+    // VT-4 403 wrong namespace. dev-token is admin (Q-11) and now bypasses the
+    // namespace gate via the admin override (task 4.4), so the test uses a
+    // regular role=user api-key caller instead — the gate must still block
+    // non-admin cross-namespace deletes.
+    it("returns 403 FORBIDDEN when caller's namespace differs from path namespace (non-admin)", async () => {
+      const user = await db.createUser({ github_id: "gh-vt4", username: "regular" });
+      const { key, keyHash, keyPrefix } = generateApiKey();
+      await db.createApiKey({
+        user_id: user.id,
+        key_hash: keyHash,
+        key_prefix: keyPrefix,
+        name: "vt4-key",
+      });
       await pushAgent("dev", "owned", "1.0.0");
       await pushAgent("dev", "owned", "2.0.0");
 
-      const res = await app.request("/api/agents/other/owned/versions/1.0.0", {
+      const res = await app.request("/api/agents/dev/owned/versions/1.0.0", {
         method: "DELETE",
-        headers: authHeader,
+        headers: { Authorization: `Bearer ${key}` },
       });
       expect(res.status).toBe(403);
       const body = await res.json();
@@ -391,7 +1099,9 @@ describe("Registry Routes", () => {
       expect(body.error.code).toBe("VERSION_NOT_FOUND");
 
       // Both existing versions still present
-      const versionsRes = await app.request("/api/agents/dev/foo/versions");
+      const versionsRes = await app.request("/api/agents/dev/foo/versions", {
+        headers: authHeader,
+      });
       const { versions } = await versionsRes.json();
       expect(versions).toHaveLength(2);
     });
@@ -429,7 +1139,9 @@ describe("Registry Routes", () => {
       expect(otherPull.status).toBe(200);
 
       // Versions list reflects the delete
-      const versionsRes = await app.request("/api/agents/dev/foo/versions");
+      const versionsRes = await app.request("/api/agents/dev/foo/versions", {
+        headers: authHeader,
+      });
       const { versions } = await versionsRes.json();
       expect(versions).toHaveLength(1);
       expect(versions[0].version).toBe("2.0.0");
@@ -471,6 +1183,66 @@ describe("Registry Routes", () => {
       expect(wholeAgentDeleteIdx).toBeGreaterThan(-1);
       // Specific path must be registered first to guarantee Hono first-match-wins safety
       expect(versionDeleteIdx).toBeLessThan(wholeAgentDeleteIdx);
+    });
+  });
+
+  // SEC-013: route-level namespace/name regex.
+  describe("agent name validation (SEC-013)", () => {
+    it("VT-20a: rejects namespace containing `..`", async () => {
+      // Percent-encoded `..` keeps it as a literal path segment value rather
+      // than a URL traversal; without the route-level regex it would reach
+      // the storage layer.
+      const res = await app.request("/api/agents/..%2F/legit", {
+        method: "GET",
+        headers: authHeader,
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("INVALID_AGENT_NAME");
+    });
+
+    it("VT-20b: rejects name with uppercase letters", async () => {
+      const res = await app.request("/api/agents/dev/My-Agent", {
+        method: "GET",
+        headers: authHeader,
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("INVALID_AGENT_NAME");
+    });
+
+    it("VT-20c: accepts kebab-case lowercase namespace/name (404, not 400)", async () => {
+      // Agent doesn't exist → 404 NOT_FOUND from the service, but NOT
+      // 400 INVALID_AGENT_NAME from the route gate.
+      const res = await app.request("/api/agents/dev/my-agent", { headers: authHeader });
+      if (res.status === 400) {
+        const body = await res.json();
+        expect(body.error.code).not.toBe("INVALID_AGENT_NAME");
+      }
+    });
+  });
+
+  // VT-23 (CODE-118): mechanical grep — every inline `err.status as ...` cast
+  // in routes/* should have been replaced by `dispatchRegistryError`. This
+  // test guards against the refactor regressing later.
+  describe("CODE-118 dispatchRegistryError helper", () => {
+    it("VT-23: no `err.status as` casts remain in routes/*", async () => {
+      const { readFileSync, readdirSync } = await import("node:fs");
+      const { join, resolve } = await import("node:path");
+      const routesDir = resolve(import.meta.dirname);
+      const files = readdirSync(routesDir).filter(
+        (f) => f.endsWith(".ts") && !f.endsWith(".test.ts") && !f.startsWith("_helpers"),
+      );
+      const offending: Array<{ file: string; line: number; content: string }> = [];
+      for (const f of files) {
+        const src = readFileSync(join(routesDir, f), "utf-8");
+        src.split("\n").forEach((line, idx) => {
+          if (line.includes("err.status as")) {
+            offending.push({ file: f, line: idx + 1, content: line.trim() });
+          }
+        });
+      }
+      expect(offending).toEqual([]);
     });
   });
 });

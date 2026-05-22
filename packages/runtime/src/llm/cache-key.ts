@@ -9,18 +9,17 @@ import { createHash } from "node:crypto";
  * - **xAI Grok** (Chat Completions): passed as the `x-grok-conv-id` HTTP header.
  * - **xAI Grok** (Responses): passed as `prompt_cache_key` body field.
  *
- * The raw concatenation `${agent.name}@${agent.version}+${env_id}` can contain
- * slashes (e.g. `dev/my-agent`), dots (e.g. `1.0.0-beta+build.42`), and other
- * characters that some providers may treat specially in a header context. We
- * SHA-256-hash the raw key and use the hex digest (64 alphanumeric chars) so
- * the same input always produces the same key while remaining safe across all
- * 3 transport surfaces (header + 2 body fields).
+ * The raw concatenation `${agent.name}@${agent.version}+${env_id}` is composed
+ * of slug-only agent identifiers (e.g. `my-agent@1.0.0+env_a`). Versions can
+ * still contain dots/dashes/plus (semver: `1.0.0-beta+build.42`) and env ids may
+ * contain arbitrary characters — both of which some providers treat specially
+ * in a header context. We SHA-256-hash the raw key and use the hex digest (64
+ * alphanumeric chars) so the same input always produces the same key while
+ * remaining safe across all 3 transport surfaces (header + 2 body fields).
  *
  * Trade-off: slightly less debuggable (raw agent identifier not visible in
  * provider logs), but safe and deterministic. Hash collisions are not a concern
  * at this scale — cache pools are isolated per-tenant via the LLM API key.
- *
- * Resolution per spec.md Q-2.B + peer-review C1 fix.
  */
 export function hashCacheKey(
   agentName: string,

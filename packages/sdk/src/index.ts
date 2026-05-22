@@ -1,7 +1,7 @@
 // @skrun-dev/sdk — Official TypeScript SDK for Skrun
 
 export { SkrunClient } from "./client.js";
-export { SkrunApiError, SkrunFileUploadError } from "./errors.js";
+export { SkrunApiError, SkrunFileUploadError, SkrunNotVerifiedError } from "./errors.js";
 export type {
   AgentIdentifier,
   AgentMetadata,
@@ -9,6 +9,7 @@ export type {
   AsyncRunResult,
   ListOptions,
   LlmCompleteEvent,
+  OutputValidationWarningEvent,
   PaginatedList,
   PushOptions,
   PushResult,
@@ -23,6 +24,7 @@ export type {
   SdkRunResult,
   SdkUploadedFileInfo,
   SkrunClientOptions,
+  ToolCallErrorEvent,
   ToolCallEvent,
   ToolResultEvent,
 } from "./types.js";

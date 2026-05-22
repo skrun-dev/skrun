@@ -1,4 +1,4 @@
-name: dev/knowledge-base-from-vault
+name: knowledge-base-from-vault
 version: 0.2.0
 # v0.2.0: deps now auto-resolved by Skrun runtime via package.json (#57).
 # v0.1.0 hand-rolled a 95-line STORE-method ZIP writer because the runtime

@@ -63,6 +63,15 @@ export function getOutputFileById(fileId: string): { dir: string; filename: stri
   return { dir, filename: entry.filename };
 }
 
+/**
+ * id of the run that produced this output file_id. Routes use it to look
+ * up `runs.user_id` and refuse cross-tenant reads. Returns undefined when
+ * the file_id has no output entry (input file_ids return undefined too).
+ */
+export function getOutputRunId(fileId: string): string | undefined {
+  return outputFileIdIndex.get(fileId)?.run_id;
+}
+
 /** For tests only — clear all output state. */
 export function _clearOutputCacheForTests(): void {
   outputCache.clear();

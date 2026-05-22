@@ -5,7 +5,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { generateApiKey } from "../../packages/api/src/auth/api-key.js";
 import { clearSessions, createSession } from "../../packages/api/src/auth/session.js";
-import { createTestApp, DEV_TOKEN, pushAgent } from "./setup.js";
+import { createTestApp, DEV_TOKEN, pushAgent, verifyVersion } from "./setup.js";
 
 describe("E2E: Auth", () => {
   let app: ReturnType<typeof createTestApp>["app"];
@@ -20,9 +20,12 @@ describe("E2E: Auth", () => {
 
   // --- Dev-token flow (RT-1) ---
 
-  it("dev-token push → run → works as before", async () => {
+  it("dev-token push → verify → run → works (post-#83 per-version gate)", async () => {
     const pushRes = await pushAgent(app, { ns: "dev", name: "test-agent", version: "1.0.0" });
     expect(pushRes.status).toBe(200);
+
+    // Verify the version (dev-token = admin) so the runtime gate passes
+    await verifyVersion(app, { ns: "dev", name: "test-agent", version: "1.0.0" });
 
     // Run (will fail because fake bundle, but should not be 401 or 403)
     const runRes = await app.request("/api/agents/dev/test-agent/run", {
@@ -77,6 +80,9 @@ describe("E2E: Auth", () => {
     });
     expect(pushRes.status).toBe(200);
 
+    // Verify the version (dev-token = admin) so the runtime gate passes
+    await verifyVersion(app, { ns: "e2euser", name: "my-agent", version: "1.0.0" });
+
     // Run with same API key (will fail at bundle extract, but auth passes)
     const runRes = await app.request("/api/agents/e2euser/my-agent/run", {
       method: "POST",
@@ -108,9 +114,11 @@ describe("E2E: Auth", () => {
     expect(res.status).toBe(403);
   });
 
-  it("user A can run user B's agent (marketplace model)", async () => {
+  it("user A can run user B's verified agent (marketplace model — post-#83)", async () => {
     // Push as dev (user B equivalent)
     await pushAgent(app, { ns: "dev", name: "public-agent", version: "1.0.0" });
+    // Verify the version (dev-token = admin) so the runtime gate passes
+    await verifyVersion(app, { ns: "dev", name: "public-agent", version: "1.0.0" });
 
     // Run as a different user via API key
     const userA = await db.createUser({ github_id: "gh-runner", username: "runner" });
@@ -127,7 +135,8 @@ describe("E2E: Auth", () => {
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({ input: {} }),
     });
-    // Not 401 or 403 — auth passed, namespace check not applied to run
+    // Not 401 or 403 — auth passed, namespace check not applied to run,
+    // version is verified.
     expect(res.status).not.toBe(401);
     expect(res.status).not.toBe(403);
   });
@@ -176,11 +185,11 @@ describe("E2E: Auth", () => {
 
   // --- Verify namespace enforcement ---
 
-  it("verify endpoint enforces namespace ownership", async () => {
+  it("per-version verify endpoint enforces admin-only (alice has role=user → 403)", async () => {
     // Push agent as dev
     await pushAgent(app, { ns: "dev", name: "secure-agent" });
 
-    // Create user alice
+    // Create user alice (defaults to role='user')
     const alice = await db.createUser({ github_id: "gh-alice", username: "alice" });
     const { key, keyHash, keyPrefix } = generateApiKey();
     await db.createApiKey({
@@ -190,8 +199,8 @@ describe("E2E: Auth", () => {
       name: "alice-key",
     });
 
-    // Alice tries to verify dev's agent → 403
-    const res = await app.request("/api/agents/dev/secure-agent/verify", {
+    // Alice tries to verify dev's agent's v1.0.0 → 403 (admin-gated, post-#83)
+    const res = await app.request("/api/agents/dev/secure-agent/versions/1.0.0/verify", {
       method: "PATCH",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({ verified: true }),
@@ -224,7 +233,9 @@ describe("E2E: Auth", () => {
     expect(res2.status).toBe(204);
 
     // Confirm it's gone
-    const res3 = await app.request("/api/agents/dev/to-delete");
+    const res3 = await app.request("/api/agents/dev/to-delete", {
+      headers: { Authorization: `Bearer ${DEV_TOKEN}` },
+    });
     expect(res3.status).toBe(404);
   });
 });

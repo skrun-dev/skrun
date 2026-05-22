@@ -6,8 +6,11 @@ The `agent.yaml` file is Skrun's extension to the Agent Skills standard. It decl
 
 ### `name` (required)
 - **Type**: string
-- **Format**: `namespace/slug` (e.g., `acme/seo-audit`)
-- **Constraints**: lowercase, hyphens, alphanumeric
+- **Format**: slug — lowercase letters, digits, and hyphens. Same shape as `SKILL.md`'s `name`. Examples: `email-drafter`, `seo-audit`.
+- **Regex**: `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` (no leading or trailing hyphen, no consecutive hyphens, length ≥ 1).
+- **No namespace prefix.** The namespace under which the agent is published is determined by the registry at push time from your auth context (your GitHub username on cloud, `dev` for the dev-token in self-host). The bundle's yaml only carries the slug.
+
+> **Migrating from `<namespace>/<slug>` format:** earlier Skrun versions required the form `name: dev/email-drafter`. The slash-prefixed form is no longer accepted — edit your `agent.yaml` to drop the prefix (`name: dev/email-drafter` → `name: email-drafter`) and re-run `skrun push`. The registry derives the namespace from your auth at push, so the bundle stays portable across namespaces (fork, transfer, white-label) without re-editing the yaml.
 
 ### `version` (required)
 - **Type**: string
@@ -464,6 +467,10 @@ inputs:
 | `name` | string | Yes | Output field name |
 | `type` | enum | Yes | `string`, `number`, `boolean`, `object`, `array` |
 | `description` | string | No | Human-readable description |
+
+**Runtime validation.** At the end of every run, Skrun validates the agent's final JSON output against the declared `outputs`. All declared top-level fields must be present with the declared type; extra top-level keys are allowed. Nested arrays/objects accept any internal shape.
+
+If validation fails, Skrun emits an `output_validation_warning` event and issues a single isolated repair call to the LLM with the validation errors. The retry's token usage is summed into the final `usage` regardless of outcome. If the repair output still fails validation (or is not valid JSON), the run terminates with `run_error` and `error.code: OUTPUT_SCHEMA_INVALID` — no `run_complete` is emitted.
 
 ### `environment` (optional)
 

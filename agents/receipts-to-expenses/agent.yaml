@@ -1,4 +1,4 @@
-name: dev/receipts-to-expenses
+name: receipts-to-expenses
 version: 0.4.0
 
 # v0.4.0: tool_choice: build_workbook (#58) so Gemini Flash always invokes the

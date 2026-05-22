@@ -3,6 +3,8 @@ import { Hono } from "hono";
 import type { DbAdapter } from "../db/adapter.js";
 import type { RunStatus } from "../db/schema.js";
 import { getUser } from "../middleware/auth.js";
+import { assertAgentVisibleOrThrow } from "../services/access.js";
+import { dispatchRegistryError } from "./_helpers.js";
 
 export function createStatsRoutes(db: DbAdapter, authMiddleware: MiddlewareHandler): Hono {
   const router = new Hono();
@@ -21,27 +23,30 @@ export function createStatsRoutes(db: DbAdapter, authMiddleware: MiddlewareHandl
     const agentId = c.req.query("agent_id");
     const status = c.req.query("status") as RunStatus | undefined;
     const limit = Number(c.req.query("limit") ?? "50");
+    const user = getUser(c);
 
     const runs = await db.listRuns({
       agent_id: agentId || undefined,
+      user_id: user.id,
       status: status || undefined,
       limit: Math.min(limit, 100),
     });
     return c.json(runs);
   });
 
+  // Per-agent stats — auth required, 404 opaque for non-owner non-admin.
+  // Same multi-tenant gate as the registry GET routes.
   router.get("/agents/:namespace/:name/stats", authMiddleware, async (c) => {
     const { namespace, name } = c.req.param();
-    const agent = await db.getAgent(namespace, name);
-    if (!agent) {
-      return c.json(
-        { error: { code: "NOT_FOUND", message: `Agent ${namespace}/${name} not found` } },
-        404,
-      );
+    try {
+      const agent = await db.getAgent(namespace, name);
+      assertAgentVisibleOrThrow(agent, getUser(c), namespace, name);
+      const days = Number(c.req.query("days") ?? "7");
+      const stats = await db.getAgentStats(agent.id, Math.min(Math.max(days, 1), 30));
+      return c.json(stats);
+    } catch (err) {
+      return dispatchRegistryError(c, err);
     }
-    const days = Number(c.req.query("days") ?? "7");
-    const stats = await db.getAgentStats(agent.id, Math.min(Math.max(days, 1), 30));
-    return c.json(stats);
   });
 
   router.get("/runs/:id", authMiddleware, async (c) => {
@@ -49,6 +54,13 @@ export function createStatsRoutes(db: DbAdapter, authMiddleware: MiddlewareHandl
     const run = await db.getRun(id);
     if (!run) {
       return c.json({ error: { code: "NOT_FOUND", message: `Run ${id} not found` } }, 404);
+    }
+    const user = getUser(c);
+    if (run.user_id !== user.id) {
+      return c.json(
+        { error: { code: "FORBIDDEN", message: "You do not have access to this run" } },
+        403,
+      );
     }
     return c.json(run);
   });

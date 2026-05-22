@@ -162,6 +162,8 @@ Click an agent to see its **Agent detail** page. Key sections:
 
 The **Playground** lets you call the agent interactively. JSON editor (or generated form), LLM key input, version pin, and a Run button that opens an SSE stream. You see the events in real-time and the final result below.
 
+For agents that accept file inputs (audio, PDF, images), switch to **Form** mode at the top of the Input panel — each file input gets its own attach button that uploads to the unified files namespace and substitutes the right `file_id` reference into the request. JSON mode is also available, but it expects you to wire the `file_id` references by hand; the playground will show a hint in JSON mode reminding you to use Form mode for file agents. The bundled demo agents under `agents/<name>/fixtures/` ship sample files (`sample-receipts/`, `sample-vault/`, `sample.wav`, …) that the Form-mode auto-fill can attach in one click.
+
 ### Runs + run detail
 
 ![Runs list](./assets/dashboard/runs.png)
@@ -182,9 +184,23 @@ Click a run to see its **Run detail** — tokens, cost, model, duration, full in
 
 ## 7. Call your agent from code
 
+### CLI (recommended for quick checks)
+
+```bash
+# Verify the pushed version first — every push lands at verified=false
+# (admin gate). In local dev with dev-token, you're auto-admin.
+skrun verify dev/my-agent@1.0.0
+
+# Then invoke
+skrun run dev/my-agent -i '{"query": "hello from code"}'
+```
+
+The CLI handles auth from your `skrun login` session and prints the response JSON to stdout (pipe to `jq`, save to a file, whatever).
+
 ### curl
 
 ```bash
+# Same call via raw HTTP — the verify step above is still required.
 curl -X POST http://localhost:4000/api/agents/dev/my-agent/run \
   -H "Authorization: Bearer dev-token" \
   -H "Content-Type: application/json" \
@@ -247,6 +263,7 @@ Agents can declare `file`-typed inputs (image / PDF / audio) that the LLM reads 
 ```bash
 cd agents/receipts-to-expenses
 skrun build && skrun push
+skrun verify dev/receipts-to-expenses@1.0.0   # admin step — auto-admin in dev-token mode
 ```
 
 (The agent declares `requirements.txt` at its bundle root — the runtime resolves `openpyxl` + `reportlab` + `pandas` automatically on first call and caches them at `~/.skrun/deps/<hash>/`. No manual `pip install` needed. See [Script dependencies](agent-yaml.md#script-dependencies).)
