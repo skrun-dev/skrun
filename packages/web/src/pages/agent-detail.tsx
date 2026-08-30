@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { LlmKeysSection } from "../components/agents/llm-keys-section";
 import { ConfirmDialog } from "../components/shared/confirm-dialog";
 import { EmptyState } from "../components/shared/empty-state";
 import {
@@ -58,16 +59,25 @@ export function AgentDetailPage() {
   const verifyVersion = useVerifyVersion();
   const deleteAgent = useDeleteAgent();
   const [deleteOpen, setDeleteOpen] = useState(false);
-  // PATCH /verify is admin-only (server-enforced). The dashboard hides the
-  // button entirely for non-admin viewers — server would return 403 anyway,
-  // but no point teasing a control they can't use. `role` is optional on
-  // AuthUser; treat missing as 'user' (least-privilege).
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
+  const isOwner = user?.namespace === namespace;
+  // The Verify control follows the operator verification policy (read from
+  // /api/me): `admin` → admins only; `owner` → the agent owner too; `disabled`
+  // → hidden (verification is off). Missing policy = legacy `'admin'`. The
+  // server enforces the same rule; the UI just hides a control the caller
+  // can't use.
+  const verificationPolicy = user?.verification_policy ?? "admin";
+  const canVerify =
+    verificationPolicy === "disabled"
+      ? false
+      : verificationPolicy === "owner"
+        ? isOwner || isAdmin
+        : isAdmin;
   // Delete button: namespace owner OR admin (admin override for moderation
   // of squatter/abusive agents in other namespaces). Server enforces the
   // same rule — the UI just hides the action when the caller can't use it.
-  const canDelete = user?.namespace === namespace || isAdmin;
+  const canDelete = isOwner || isAdmin;
 
   const agentPrefix = `${namespace}/${name}`;
   const runs = useMemo(() => {
@@ -238,6 +248,7 @@ export function AgentDetailPage() {
       <div className="grid grid-cols-3 gap-5">
         {/* Left 2/3 */}
         <div className="col-span-2 space-y-5">
+          {isOwner && <LlmKeysSection namespace={namespace} name={name} />}
           {/* Recent runs */}
           <Card
             title="Recent runs"
@@ -373,7 +384,7 @@ export function AgentDetailPage() {
                         <span className="text-[10.5px] text-gray-400 dark:text-gray-600">
                           {formatDate(v.pushed_at)}
                         </span>
-                        {isAdmin && (
+                        {canVerify && (
                           <Btn
                             variant="ghost"
                             size="sm"
@@ -411,6 +422,16 @@ export function AgentDetailPage() {
             <dl className="px-4 py-1">
               <KV label="Namespace" value={agent.namespace} />
               <KV label="Name" value={agent.name} />
+              <KV
+                label="Visibility"
+                value={
+                  <span className="flex items-center gap-2">
+                    <Pill tone={agent.visibility === "public" ? "violet" : "neutral"}>
+                      {agent.visibility ?? "private"}
+                    </Pill>
+                  </span>
+                }
+              />
               <KV label="Created" value={formatDate(agent.created_at)} />
               <KV label="Updated" value={formatDate(agent.updated_at)} />
               {(config?.model as

@@ -2,6 +2,36 @@
 
 // Adapter
 export type { RuntimeAdapter } from "./adapter/adapter.js";
+// FlyioAdapter — cloud-runtime adapter
+export type {
+  BuildMachineConfigInput,
+  CreateMachineRequest,
+  FlyioAdapterOptions,
+  FlyMachinesApiOptions,
+  Machine,
+  MachineConfig,
+  MachineState,
+  PooledMachine,
+  PooledMachineState,
+  PresignedStorageAdapter,
+  RpcToolProviderOptions,
+} from "./adapter/flyio/index.js";
+export {
+  authorizeRunnerRequest,
+  buildMachineConfig,
+  buildPoolMachineConfig,
+  FlyioAdapter,
+  FlyMachinesApi,
+  isRpcAuthorized,
+  ListMachinesResponseSchema,
+  MachineSchema,
+  machineNameForPool,
+  machineNameForRun,
+  POOL_MACHINE_NAME_PREFIX,
+  RpcMcpToolProvider,
+  RpcScriptToolProvider,
+  RunnerPool,
+} from "./adapter/flyio/index.js";
 // State callbacks
 export type { StateCallbacks } from "./adapter/local.js";
 export { LocalAdapter } from "./adapter/local.js";
@@ -16,9 +46,23 @@ export { computeDepsHash, DepsCache } from "./cache/deps-cache.js";
 export type { TTLCacheOptions } from "./cache/ttl-cache.js";
 // Cache
 export { TTLCache } from "./cache/ttl-cache.js";
-export type { McpConnectErrorDetails, ScriptDepsInstallErrorDetails } from "./errors.js";
+export type {
+  BundleFetchFailedErrorDetails,
+  MachineSpawnErrorDetails,
+  MachineSpawnPhase,
+  McpConnectErrorDetails,
+  ScriptDepsInstallErrorDetails,
+  ToolOomKilledErrorDetails,
+} from "./errors.js";
 // Runtime-level typed errors
-export { McpConnectError, ScriptDepsInstallError } from "./errors.js";
+export {
+  BundleFetchFailedError,
+  MachineSpawnError,
+  McpConnectError,
+  NotSupportedError,
+  ScriptDepsInstallError,
+  ToolOomKilledError,
+} from "./errors.js";
 export type { CollectOptions } from "./files/output-collector.js";
 // Files
 export { collectOutputFiles } from "./files/output-collector.js";
@@ -42,6 +86,7 @@ export type { Logger } from "./logger.js";
 export { createLogger } from "./logger.js";
 export { checkCost } from "./security/cost-checker.js";
 export { isHostAllowed } from "./security/network.js";
+export { SsrfBlockedError, safeFetch } from "./security/safe-fetch.js";
 // Security
 export { parseTimeout, TimeoutError, withTimeout } from "./security/timeout.js";
 export { McpToolProvider } from "./tools/mcp-provider.js";
@@ -71,14 +116,20 @@ export type { ToolDefinition, ToolProvider, ToolResult } from "./tools/types.js"
 // Types
 export type {
   FileInfo,
+  InitResult,
   LlmCompleteEvent,
+  OnRunnerSpawned,
   OutputValidationWarningEvent,
   RunCompleteEvent,
   RunErrorEvent,
   RunEvent,
+  RunHeartbeatEvent,
+  RunnerSpawnedEvent,
+  RunnerSpawnedInfo,
   RunRequest,
   RunResult,
   RunStartEvent,
+  SpawnPhases,
   ToolCallErrorEvent,
   ToolCallEvent,
   ToolResultEvent,

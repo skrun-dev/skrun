@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { formatPullErrorMessage } from "./pull.js";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { gzipSync } from "node:zlib";
+import { packAgentTar } from "@skrun-dev/schema";
+import { type Headers, pack as tarPack } from "tar-stream";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { extractBundle, formatPullErrorMessage } from "./pull.js";
 
 describe("formatPullErrorMessage", () => {
   // VT-19 (#80): on 404 the CLI prints the 3-cause SC-17 message and
@@ -50,5 +56,73 @@ describe("formatPullErrorMessage", () => {
   it("handles non-Error values gracefully", () => {
     expect(formatPullErrorMessage("plain string error", "acme/foo")).toBe("plain string error");
     expect(formatPullErrorMessage({ weird: true }, "acme/foo")).toBe("[object Object]");
+  });
+});
+
+// Build a gzipped tar with arbitrary entries (incl. a symlink) — packAgentTar only
+// emits regular files, so we drop to tar-stream for the security cases.
+function packRaw(
+  entries: Array<{ name: string; type?: Headers["type"]; linkname?: string; content?: Buffer }>,
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const pack = tarPack();
+    const chunks: Buffer[] = [];
+    pack.on("data", (c: Buffer) => chunks.push(c));
+    pack.on("end", () => resolve(gzipSync(Buffer.concat(chunks))));
+    pack.on("error", reject);
+    for (const e of entries) {
+      const content = e.content ?? Buffer.alloc(0);
+      pack.entry(
+        {
+          name: e.name,
+          type: e.type ?? "file",
+          linkname: e.linkname,
+          size: content.length,
+          mtime: new Date(0),
+        },
+        content,
+      );
+    }
+    pack.finalize();
+  });
+}
+
+describe("extractBundle (skrun pull)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "skrun-pull-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("extracts a normal bundle with POSIX paths + binary fidelity", async () => {
+    const bin = Buffer.from(Array.from({ length: 256 }, (_, i) => i));
+    const gz = await packAgentTar([
+      { name: "SKILL.md", content: Buffer.from("# hi") },
+      { name: "scripts/foo.py", content: Buffer.from("print(1)") },
+      { name: "assets/logo.bin", content: bin },
+    ]);
+    const count = await extractBundle(gz, dir);
+    expect(count).toBe(3);
+    expect(readFileSync(join(dir, "scripts", "foo.py")).toString()).toBe("print(1)");
+    expect(readFileSync(join(dir, "assets", "logo.bin")).equals(bin)).toBe(true);
+  });
+
+  it("throws on a path-traversal entry (VT-6)", async () => {
+    const gz = await packAgentTar([{ name: "../escape.txt", content: Buffer.from("leak") }]);
+    await expect(extractBundle(gz, dir)).rejects.toThrow(/traversal/i);
+  });
+
+  it("throws on a symlink entry (VT-8)", async () => {
+    const gz = await packRaw([{ name: "evil", type: "symlink", linkname: "../../etc/passwd" }]);
+    await expect(extractBundle(gz, dir)).rejects.toThrow(/link entry/i);
+  });
+
+  it("rejects a gzip bomb over the cap (VT-4b / SC-4)", async () => {
+    const bomb = gzipSync(Buffer.alloc(60 * 1024 * 1024)); // 60 MB > 50 MB cap
+    await expect(extractBundle(bomb, dir)).rejects.toThrow(/gzip-bomb/);
   });
 });

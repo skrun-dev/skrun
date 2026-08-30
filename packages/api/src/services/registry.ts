@@ -1,9 +1,13 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+import { createLogger } from "@skrun-dev/runtime";
 import { parseAgentYaml } from "@skrun-dev/schema";
 import { bundleCache } from "../cache/bundle-cache.js";
 import type { DbAdapter } from "../db/adapter.js";
 import type { Agent } from "../db/schema.js";
 import type { AgentMetadata, AgentVersionInfo } from "../types.js";
 import { extractFiles } from "../utils/bundle.js";
+
+const logger = createLogger("registry-service");
 
 /**
  * Status is encoded as the typed union of HTTP codes the service emits.
@@ -62,10 +66,15 @@ export class RegistryService {
     const bundleKey = `${namespace}/${name}/${version}.agent`;
     await this.storage.put(bundleKey, bundle);
 
+    // Checksum the bundle at push so pull() can verify integrity.
+    // Always set for new pushes (the nullable column is only a backfill valve
+    // for legacy rows).
+    const bundleSha256 = createHash("sha256").update(bundle).digest("hex");
+
     // Extract config from bundle for config_snapshot
     let configSnapshot: Record<string, unknown> | undefined;
     try {
-      const files = extractFiles(bundle);
+      const files = await extractFiles(bundle);
       const agentYamlContent = files["agent.yaml"];
       if (agentYamlContent) {
         const parsed = parseAgentYaml(agentYamlContent);
@@ -80,6 +89,7 @@ export class RegistryService {
       version,
       size: bundle.length,
       bundle_key: bundleKey,
+      bundle_sha256: bundleSha256,
       config_snapshot: configSnapshot,
       notes: notes ?? null,
     });
@@ -106,6 +116,9 @@ export class RegistryService {
 
     let resolvedVersion: string;
     let resolvedVerified: boolean;
+    // Keep the resolved version's checksum for the integrity check
+    // below (the row objects would otherwise be discarded here).
+    let resolvedSha256: string | null;
     if (version) {
       const v = await this.db.getVersionByNumber(agent.id, version);
       if (!v) {
@@ -117,6 +130,7 @@ export class RegistryService {
       }
       resolvedVersion = v.version;
       resolvedVerified = v.verified;
+      resolvedSha256 = v.bundle_sha256;
     } else {
       const latest = await this.db.getLatestVersion(agent.id);
       if (!latest) {
@@ -124,12 +138,48 @@ export class RegistryService {
       }
       resolvedVersion = latest.version;
       resolvedVerified = latest.verified;
+      resolvedSha256 = latest.bundle_sha256;
     }
 
     const bundleKey = `${namespace}/${name}/${resolvedVersion}.agent`;
     const buffer = await this.storage.get(bundleKey);
     if (!buffer) {
       throw new RegistryError("BUNDLE_NOT_FOUND", "Bundle file not found in storage", 500);
+    }
+
+    // Verify bundle integrity when a checksum is on record. This runs
+    // on EVERY pull() call site — run execution AND the GET /pull download — so
+    // a tampered storage object can never be served (universal verification).
+    // A null checksum = a legacy bundle predating hashing (the boot backfill
+    // populates these); log + serve rather than 500 a legitimate bundle.
+    // timingSafeEqual is only reached with two equal-length buffers.
+    if (resolvedSha256 != null) {
+      const actualBuf = createHash("sha256").update(buffer).digest();
+      const expectedBuf = Buffer.from(resolvedSha256, "hex");
+      if (actualBuf.length !== expectedBuf.length || !timingSafeEqual(actualBuf, expectedBuf)) {
+        logger.error(
+          {
+            event: "bundle_integrity_failed",
+            agent: `${namespace}/${name}`,
+            version: resolvedVersion,
+          },
+          "Bundle integrity check failed — refusing to serve a tampered bundle",
+        );
+        throw new RegistryError(
+          "BUNDLE_INTEGRITY_FAILED",
+          `Bundle integrity check failed for ${namespace}/${name}@${resolvedVersion}`,
+          500,
+        );
+      }
+    } else {
+      logger.warn(
+        {
+          event: "bundle_integrity_unknown",
+          agent: `${namespace}/${name}`,
+          version: resolvedVersion,
+        },
+        "Bundle has no stored checksum (legacy) — served unverified",
+      );
     }
 
     return { buffer, version: resolvedVersion, verified: resolvedVerified };
@@ -153,6 +203,7 @@ export class RegistryService {
         name: a.name,
         namespace: a.namespace,
         description: a.description,
+        visibility: a.visibility,
         latest_version_verified: latest?.verified ?? false,
         latest_version: latest?.version ?? "",
         versions: versions.map((v) => v.version),
@@ -195,7 +246,16 @@ export class RegistryService {
     const versions = await this.db.getVersions(agent.id);
     for (const v of versions) {
       bundleCache.delete(`${namespace}/${name}/${v.version}`);
-      await this.storage.delete(v.bundle_key).catch(() => {});
+      await this.storage.delete(v.bundle_key).catch((err) =>
+        logger.warn(
+          {
+            event: "bundle_delete_failed",
+            bundle_key: v.bundle_key,
+            error: err instanceof Error ? err.message : String(err),
+          },
+          "Best-effort bundle delete failed during agent delete — orphaned blob may remain",
+        ),
+      );
     }
 
     // Delete agent from DB (cascades to versions)
@@ -232,7 +292,16 @@ export class RegistryService {
 
     // Step 4: delete bundle from storage (best-effort, mirror deleteAgent pattern).
     // Order is mandatory: storage BEFORE db. Reverse order = silent storage leak forever.
-    await this.storage.delete(target.bundle_key).catch(() => {});
+    await this.storage.delete(target.bundle_key).catch((err) =>
+      logger.warn(
+        {
+          event: "bundle_delete_failed",
+          bundle_key: target.bundle_key,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        "Best-effort bundle delete failed during version delete — orphaned blob may remain",
+      ),
+    );
 
     // Step 5: delete DB row (final commit)
     await this.db.deleteVersion(agent.id, version);
@@ -283,6 +352,7 @@ export class RegistryService {
       name: agent.name,
       namespace: agent.namespace,
       description: agent.description,
+      visibility: agent.visibility,
       latest_version_verified: latest?.verified ?? false,
       latest_version: latest?.version ?? "",
       versions: versions.map((v) => v.version),

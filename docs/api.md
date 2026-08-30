@@ -113,9 +113,10 @@ Your namespace equals your GitHub username (lowercase). Permissions:
 
 | Action | Who can do it |
 |--------|---------------|
-| Push, verify, delete | Namespace owner only (`alice` can only push to `alice/*`) |
-| Run any agent | Anyone (marketplace model — `bob` can run `alice/my-agent`) |
-| List agents | Anyone (public listing) |
+| Push, delete | Namespace owner only (`alice` can only push to `alice/*`) |
+| Verify a version | Set by `SKRUN_VERIFICATION_POLICY`. Under the default `admin`, an instance admin only; under `owner`, the agent's owner or an admin — see [Verify a version](#verify-a-version-admin-only) |
+| Run an agent | The agent's **owner** (or an admin). Agents are **private by default** and setting one `public` is disabled until the marketplace ships, so `bob` cannot run `alice/my-agent` — he gets a `404` byte-identical to a missing agent. To let an outside caller run one agent, the owner mints an **agent-scoped `sk_live_` key** |
+| List / read agents | Filtered to the caller's own namespace; an admin bypasses the filter |
 
 ### API keys
 
@@ -181,6 +182,7 @@ Execute an agent and return the result. Supports three modes:
 | `Content-Type` | Yes | `application/json` |
 | `Accept` | No | Set to `text/event-stream` for SSE streaming mode |
 | `X-LLM-API-Key` | No | Caller-provided LLM API keys (see [Caller-provided API keys](#caller-provided-api-keys)) |
+| `X-LLM-Base-URL` | No | The endpoint your key belongs to. Needed only when you send `X-LLM-API-Key` to an agent you do not own (see [Where your key is sent](#where-your-key-is-sent)) |
 
 **Request body**
 
@@ -304,14 +306,54 @@ curl -N -X POST http://localhost:4000/api/agents/dev/my-agent/run \
 | `tool_result` | Tool returned a result | `run_id`, `tool`, `result`, `is_error`, `timestamp` |
 | `llm_complete` | LLM finished generating | `run_id`, `provider`, `model`, `tokens`, `timestamp` |
 | `output_validation_warning` | Final output failed schema validation — repair retry follows (see note below) | `run_id`, `errors`, `timestamp` |
+| `run_heartbeat` | Periodic keep-alive during long waits (see note below) | `run_id`, `stage`, `timestamp` |
+| `runner_spawned` | Cloud runtime only: per-phase cold-start breakdown, emitted once after `run_start` (see note below) | `run_id`, `phases`, `timestamp` |
 | `run_complete` | Execution finished successfully | `run_id`, `output`, `usage`, `cost`, `duration_ms`, `timestamp` |
 | `run_error` | Execution failed | `run_id`, `error.code`, `error.message`, `timestamp` |
 
 Events follow the W3C SSE spec (`event: <type>\ndata: <json>\n\n`). The stream closes after `run_complete` or `run_error`.
 
+**Forward compatibility**: clients MUST ignore unknown event types. Skrun adds new informational events over time (this happened with `tool_call_error` in v0.8.0 and `run_heartbeat` in v0.9.0); a SSE consumer that crashes on an unrecognised `event:` line will break on every release.
+
 **About `tool_call_error`** (added in v0.8.0): emitted **before** the matching `tool_result` whenever a tool returns `is_error: true`. It is **informational only** — the `tool_result` content still flows back to the LLM, which decides how to react (retry, fallback, graceful failure). Skrun does NOT abort the run on tool failure by default, aligning with the industry permissive contract (AWS Bedrock AgentCore, Claude Managed Agents, Google Vertex Agent Builder all behave the same way). Operators get failure visibility (e.g. red event in the dashboard timeline) without losing the LLM's recovery capability.
 
 **About `output_validation_warning` and `OUTPUT_SCHEMA_INVALID`** (added in v0.8.0): emitted when the LLM's final JSON output fails validation against the agent's declared `outputs` schema (declared top-level fields missing or of the wrong type). Skrun then issues a single isolated repair call to the LLM, asking it to re-emit a compliant output. The retry's token usage is summed into the final `usage` regardless of outcome. If the repair succeeds, the run terminates normally via `run_complete` with the corrected output. If the repair still fails (schema mismatch or non-JSON response), the run terminates via `run_error` with `error.code: OUTPUT_SCHEMA_INVALID` — same terminus pattern as `TIMEOUT`/`EXECUTION_FAILED`, no `run_complete` is emitted.
+
+**About `COST_EXCEEDED`**: emitted when a run's aggregate estimated cost crosses the agent's declared `environment.max_cost` ceiling. The harness tracks the running cost after each LLM call and aborts the moment it is exceeded — the run terminates via `run_error` with `error.code: COST_EXCEEDED` (same terminus pattern as `OUTPUT_SCHEMA_INVALID`/`TIMEOUT`, no `run_complete`), and the partial token usage accumulated up to the abort is still reported in the terminus event. Agents that declare no `max_cost` are never cost-gated.
+
+**About `run_heartbeat`** (added in v0.9.0): periodic keep-alive emitted every ~30 s while the harness is blocked on a slow upstream — LLM call, tool dispatch, or (in cloud mode) outputs upload. Without it, idle SSE connections risk being closed by reverse proxies / load balancers / browser timeouts long before the agent finishes. The `stage` field tells you what the harness is currently waiting on:
+
+| `stage` | Meaning |
+|---------|---------|
+| `waiting_llm` | An LLM provider call is in flight. |
+| `waiting_tool` | A tool's `callTool` is running (script or MCP). |
+| `uploading_outputs` | Cloud mode only — files produced by the run are being sync-uploaded to object storage. |
+
+Example payload:
+
+```json
+{ "type": "run_heartbeat", "run_id": "...", "stage": "waiting_llm", "timestamp": "2026-05-23T12:00:30Z" }
+```
+
+Heartbeats are purely informational — your client can ignore them entirely and still receive every `tool_*` / `llm_complete` / `run_complete` event as usual. They are NOT emitted when no long await is in flight (so a fast run sees zero heartbeats).
+
+**About `runner_spawned`** (cloud runtime only): emitted once, right after `run_start`, when a `SKRUN_RUNTIME=flyio` run's sandbox machine is ready. It carries a `phases` map of per-step startup durations (ms) so you can see where a slow first run spends its time:
+
+- `create_api_ms` — the Fly `create` machine API call. On a run served from the pre-warm pool (below) this is the wake call instead, since no machine is created
+- `host_schedule_pull_ms` — host-side scheduling + image pull (derived from the machine's boot clock; present only when the runner reports it)
+- `vm_boot_ms` — the machine's boot up to the runner listening
+- `entrypoint_egress_ms` — the in-machine egress-allowlist setup
+- `module_load_ms` — how much of `vm_boot_ms` was the runner loading its own code, as opposed to the kernel booting
+- `init_bundle_ms` / `init_extract_ms` / `init_mcp_ms` — the `/init` steps (bundle download, extract, MCP connect)
+
+When the server keeps a **pre-warm pool** (see the operator guide), a run may be served by a machine created in advance rather than one created for it. Those runs carry four more fields, and **omit `vm_boot_ms`, `host_schedule_pull_ms` and `module_load_ms`** — those describe when the machine was built, not this run, and reporting them here would produce a precise, meaningless number:
+
+- `pool_hit` — whether this run was served from the pool. Present only when a pool is configured, so its absence means "no pool", not "pool missed"
+- `pool_resume_ms` — waking the machine and seeing it answer
+- `pool_claim_ms` — handing it the run's credential and egress rules
+- `pool_resumed_from_snapshot` — whether the machine genuinely resumed, or silently cold-booted instead. The platform treats the resume as an attempt rather than a guarantee, and a pool whose machines all cold-boot still works while delivering a fraction of the benefit — so it is reported rather than averaged away. Absent when it cannot be determined
+
+Fields are omitted when an older runner image doesn't report them. Local runs (`SKRUN_RUNTIME=local`) don't spawn a machine and emit no `runner_spawned`. The runner's machine id + private IP are recorded operator-side (on the run record) but are **not** returned by `GET /api/runs/:id`.
 
 Validation errors (401, 400, etc.) return normal JSON responses, not SSE streams.
 
@@ -361,8 +403,8 @@ The receiver verifies the signature by computing `HMAC-SHA256(body, WEBHOOK_SIGN
 **Requirements**
 
 - `webhook_url` must be a valid URL
-- `webhook_url` must use HTTPS in production (HTTP allowed in dev mode)
-- `webhook_url` hostname must NOT resolve to a private/reserved address in production (blocks AWS IMDS, localhost services, link-local, IPv4-mapped IPv6); dev mode allows `http://localhost:NNNN/...` for local testing
+- `webhook_url` must use HTTPS and must not resolve to a private/reserved address (blocks AWS IMDS, localhost services, link-local, IPv4-mapped IPv6) — enforced **by default, fail-closed**, and re-checked against the resolved IP at delivery time (DNS-rebinding-safe)
+- To deliver to a local listener (`http://localhost:NNNN/...`) during development, set `SKRUN_ALLOW_LOCAL_WEBHOOKS=true` — this relaxes both the HTTPS and private-host checks for local testing only
 - Cannot be combined with `Accept: text/event-stream`
 - Server requires `WEBHOOK_SIGNING_KEY` env var (see above)
 
@@ -370,7 +412,7 @@ The receiver verifies the signature by computing `HMAC-SHA256(body, WEBHOOK_SIGN
 
 ### Caller-provided API keys
 
-By default, POST /run uses the server's LLM API keys (from `.env`). Callers can provide their own keys via the `X-LLM-API-Key` header:
+Every run needs a model key. Callers can supply their own via the `X-LLM-API-Key` header:
 
 ```
 X-LLM-API-Key: {"google": "AIza...", "anthropic": "sk-ant-..."}
@@ -381,9 +423,12 @@ The value is a JSON object mapping provider names to API keys.
 **Accepted providers**: `anthropic`, `openai`, `google`, `mistral`, `groq`, `xai`
 
 **Key priority** (per provider):
-1. Caller key (from header) — takes precedence
-2. Server key (from `.env`) — fallback
-3. Neither available — `401` error
+1. **Caller key** (`X-LLM-API-Key` header) — takes precedence
+2. **Creator key** attached to the agent by its owner, encrypted at rest — this is how a creator covers the inference so their own callers need no key at all
+3. **Server key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, … in the host environment) — fallback. Appropriate for a single-tenant self-host that is paying for itself; **deliberately not set on the Skrun cloud**, where open signup would otherwise let any account run inference on the operator's credit
+4. **None available** — the run fails at the first model call with a provider-resolution error naming the three ways to supply one
+
+Where a key is allowed to be *sent* is a separate question — see [Where your key is sent](#where-your-key-is-sent).
 
 If a caller-provided key fails (invalid, quota exceeded), the error is returned directly. There is no fallback to server keys when a caller key was explicitly provided.
 
@@ -397,6 +442,53 @@ curl -X POST http://localhost:4000/api/agents/dev/code-review/run \
   -H "Content-Type: application/json" \
   -H 'X-LLM-API-Key: {"google": "AIza..."}' \
   -d '{"input": {"code": "function add(a,b) { return a + b; }"}}'
+```
+
+### Where your key is sent
+
+An `agent.yaml` may declare its own `model.base_url` — an alternative
+OpenAI-compatible provider, or a local inference server. That endpoint is chosen
+by the agent's **author**. Your `X-LLM-API-Key` belongs to **you**. When those are
+two different people, the server will not send your key to their endpoint unless
+you say where your key belongs:
+
+```
+X-LLM-Base-URL: {"openai": "https://api.deepseek.com"}
+```
+
+Same shape as `X-LLM-API-Key` — a JSON object mapping provider to base URL —
+compared by **origin**, so the path need not match.
+
+You do not need to know the agent's endpoint in advance. Send your key; if the
+agent uses an endpoint you have not named, the run is refused and the error tells
+you which one:
+
+```json
+{
+  "error": {
+    "code": "CALLER_BASE_URL_NOT_CONSENTED",
+    "message": "This agent sends model requests to https://api.deepseek.com, which you did not choose. Your X-LLM-API-Key would be sent there. To proceed, declare that origin in the X-LLM-Base-URL header, e.g. {\"openai\": \"https://api.deepseek.com\"}."
+  }
+}
+```
+
+**When this does not apply**
+
+- You are running **your own** agent with an account-wide credential (a session,
+  a dev-token, or a full `sk_live` key) — you chose both sides, so nothing changes.
+- The agent declares no `base_url` — the overwhelmingly common case.
+
+It **does** apply when you hold a key someone else issued you for their agent
+(an agent-scoped `sk_live`), which is the case the check exists for: the agent's
+author picks the destination, you supply the credential.
+
+SDK equivalent:
+
+```ts
+await client.run("acme/summarizer", input, {
+  llmKeys: { openai: "sk-..." },
+  llmBaseUrls: { openai: "https://api.deepseek.com" },
+});
 ```
 
 ---
@@ -556,6 +648,45 @@ Get metadata for a specific agent. **Authentication required.** Non-owner non-ad
 **Response** `404`: agent does not exist OR caller is not the owner / admin (opaque body — identical in both cases).
 
 ---
+
+### Pre-warm pool status (admin only)
+
+```
+GET /api/admin/pool
+```
+
+Operator view of the pre-warm pool — the machines the server keeps ready in advance so a run does not pay for one to be built. Cloud runtime only.
+
+**Restricted to admin callers** (`user.role === 'admin'`). Anyone else gets a `404` indistinguishable from a route that does not exist, matching the opaque reads used elsewhere.
+
+The pool's state lives in the server's memory — there is no database row for it — so this endpoint is the only way to see it without reading platform logs. That matters more than it sounds: a pool that has quietly stopped working looks exactly like a healthy one from the outside, because runs keep succeeding by falling back to building their own machine. The counters are how you tell.
+
+**Response** `200` when a pool is configured:
+
+```json
+{
+  "enabled": true,
+  "size": 3,
+  "filling": 0,
+  "ready": 3,
+  "claimed": 0,
+  "draining": 0,
+  "fillErrors": 0,
+  "drains": 0,
+  "orphansDestroyed": 0,
+  "hits": 42,
+  "misses": 1
+}
+```
+
+**Response** `200` when the deployment runs no pool (the default): `{"enabled": false}`.
+
+Reading it:
+
+- **`hits` vs `misses`** is the one ratio that says whether the pool is doing its job. Runs still complete when it misses — they build their own machine — so a collapsing hit rate is invisible everywhere else.
+- **`ready: 0` with `fillErrors: 0`** and nothing else moving means the pool is not stocking at all, as opposed to failing to stock.
+- **`fillErrors` climbing** means machines cannot be prepared — a bad image reference is the usual cause.
+- **`drains` spiking** after a deploy is expected: machines built from the previous image are replaced.
 
 ### Verify a version (admin only)
 
@@ -965,6 +1096,7 @@ All errors follow the same format:
 | `CONFLICT` | 409 | Version already exists |
 | `RATE_LIMITED` | 429 | Too many requests |
 | `BUNDLE_CORRUPT` | 500 | Failed to extract agent bundle |
+| `BUNDLE_INTEGRITY_FAILED` | 500 | Bundle checksum (SHA-256) did not match — the stored bundle was modified; the registry refuses to serve it |
 | `MISSING_CONFIG` | 500 | agent.yaml not found in bundle |
 | `INVALID_CONFIG` | 500 | agent.yaml is invalid |
 | `INVALID_NOTES` | 400 | Version notes header is invalid (>500 chars, contains null bytes, or malformed percent-encoding) |
@@ -989,7 +1121,7 @@ Skrun uses a pluggable database backend via the `DbAdapter` interface. Three imp
 
 **Local dev (default)**: no configuration needed. Skrun uses SQLite (`SqliteDb`) — a file-based database (`skrun.db` in the working directory) that persists agents, runs, API keys, and users across restarts. Zero external dependencies.
 
-**Production (Supabase)**: set `DATABASE_URL` + `SUPABASE_KEY` env vars. Skrun auto-detects and uses `SupabaseDb` (PostgreSQL).
+**Production (Postgres)**: set `DATABASE_URL` to a standard `postgres://user:pass@host:port/db` URI. Skrun auto-detects and uses `PostgresDb`. Works with any Postgres ≥ 14 — Supabase, Fly Postgres, RDS, Neon, Render, etc.
 
 **Tests**: `MemoryDb` — in-memory, fast, isolated (used by the unit test suite, not in production paths).
 
@@ -997,26 +1129,45 @@ Skrun uses a pluggable database backend via the `DbAdapter` interface. Three imp
 # Default — SQLite (file-based, persistent)
 pnpm dev:registry
 
-# Production — Supabase
-DATABASE_URL=https://your-project.supabase.co SUPABASE_KEY=your-service-key pnpm dev:registry
+# Production — Postgres (e.g. Supabase Session Pooler URL, port 5432)
+DATABASE_URL=postgres://user:pass@host:5432/dbname pnpm dev:registry
 ```
 
-**Selection logic**: if `DATABASE_URL` is set, Skrun uses `SupabaseDb`. Otherwise, it uses `SqliteDb`.
+**Selection logic**: if `DATABASE_URL` is set, Skrun uses `PostgresDb`. Otherwise, it uses `SqliteDb`.
 
-**SQL schema (Supabase)**: migration files live in `packages/api/src/db/migrations/`. Run them in order against your Supabase project via the SQL editor or CLI:
-
-- `001_initial_schema.sql` — initial schema (7 tables: users, api_keys, agents, agent_versions, agent_state, environments, runs). Fresh installs: run this only.
-- `002_add_model_to_runs.sql` — backfills the `runs.model` column added in v0.5.0. Run if upgrading from pre-v0.5.0.
-- `003_add_version_notes.sql` — backfills `agent_versions.notes` added in v0.6.0. Run if upgrading from pre-v0.6.0.
+**Postgres migrations**: applied automatically on api-server boot. The runner tracks applied filenames in `_skrun_migrations`, takes a `pg_advisory_lock` (concurrent-boot safe), and applies any unseen `.sql` file in transaction. See `docs/self-hosting.md` § "Postgres (production)" for the full applicator contract.
 
 **SQLite migrations**: handled automatically at startup — the `SqliteDb` constructor detects missing columns via `PRAGMA table_info` and runs idempotent `ALTER TABLE` statements. Nothing to do manually.
 
 **Run tracking**: every `POST /run` call creates a record in the `runs` table with agent, version, model, status, input/output, token usage, cost, duration, and files. This data powers the dashboard and is available for your own billing or observability pipeline.
 
+---
+
+## Runtime selection (`SKRUN_RUNTIME`)
+
+Skrun supports two runtime modes for executing `POST /run`. The server reads `SKRUN_RUNTIME` at startup and picks one for the lifetime of the process; runs cannot mix modes within a single instance.
+
+| `SKRUN_RUNTIME` | Behaviour | Use case |
+|-----------------|-----------|----------|
+| `local` (default) | The agent loop runs in the same Node process that received the request. Tool calls (script + MCP) execute as in-process subprocesses. | Self-host single-tenant, local dev. |
+| `flyio` | Each run spawns a dedicated Fly.io machine from a hardened sandbox image. The harness drives the LLM loop; tool calls are forwarded to the machine over a private network. The machine is destroyed after the run completes (or the SSE connection closes — sandbox machines never outlive the request). | Multi-tenant cloud (`skrun.sh`). |
+
+In cloud mode the server requires **six** variables and refuses to start if any one of them is missing — the error names every absent variable at once:
+
+| Variable | What it is |
+|----------|------------|
+| `FLY_API_TOKEN` | Fly deploy token scoped to the runners app |
+| `SKRUN_RUNNERS_APP` | The app where per-run machines are spawned — deliberately **not** named `FLY_APP_NAME`, because Fly injects that name into every running machine as *its own* app, which would silently override a value pointing at the runners app |
+| `RUNTIME_IMAGE_TAG` | The sandbox image to spawn. No silent `:latest` default — an unpublished tag would otherwise fail at machine-create instead of at boot |
+| `S3_ACCESS_KEY_ID` · `S3_SECRET_ACCESS_KEY` · `S3_BUCKET` | S3-compatible storage for bundles + outputs (`S3_ENDPOINT` / `S3_REGION` / `S3_ACCOUNT_ID` are optional) |
+
+The hardened sandbox image hosts every agent run with zero credentials — only the bundle download URL, the outputs upload URL, the configured `allowed_hosts`, and the runner port are propagated to it. The LLM API keys live in the harness only. See [.env.example](../.env.example) for the cloud variable list.
+
+If you self-host with Docker Compose, the default `SKRUN_RUNTIME=local` is what you want — the included `docker-compose` stack (API + Postgres + MinIO + Redis + Caddy) gives you prod-parity without per-run machine cost. Cloud mode shines when you need strong per-run isolation between multiple tenants.
+
 | Env var | Default | Description |
 |---------|---------|-------------|
-| `DATABASE_URL` | — | Supabase project URL. If not set, SQLite is used. |
-| `SUPABASE_KEY` | — | Supabase service role key (for server-side access). Required when `DATABASE_URL` is set. |
+| `DATABASE_URL` | — | Standard Postgres connection string (`postgres://user:pass@host:port/db`) — any Postgres ≥ 14 (Supabase, Neon, RDS, Fly Postgres…). If not set, SQLite is used. |
 
 ---
 
@@ -1290,14 +1441,21 @@ Agents produce files by writing to the `$SKRUN_OUTPUT_DIR` directory during exec
 |-------|-------------|
 | `name` | Original filename as written to `$SKRUN_OUTPUT_DIR` |
 | `size` | File size in bytes |
-| `url` | Run-scoped download path (existing route — kept for backward compatibility) |
-| `file_id` | Unified-namespace identifier — use with `GET /api/files/:id/content` |
+| `url` | Download URL — **format depends on the active runtime** (see below). |
+| `file_id` | Unified-namespace identifier — use with `GET /api/files/:id/content`. Set in self-host mode; **undefined in cloud mode** (the file lives in object storage only — there's no `/api/files/:id` row hosting the bytes). |
 
-**Download — two equivalent paths**:
+**`url` format by runtime mode**
+
+- **Self-host (`SKRUN_RUNTIME=local`, default)**: relative path to a run-scoped API route — `/api/runs/<run_id>/files/<name>`. The API proxies the bytes from local disk + enforces auth + owner check on every fetch.
+- **Cloud (`SKRUN_RUNTIME=flyio`)**: absolute presigned GET URL pointing at the R2 / MinIO object — `https://<endpoint>/<bucket>/runs/<run_id>/outputs/<name>?<sig>`. Short TTL (~15 minutes); the bytes flow direct from object storage with no proxy hop through this API. After expiry, the URL stops working — re-issue the run or persist the file elsewhere.
+
+In both modes the URL is opaque to callers — treat it as a black box, don't construct it from parts. Clients that need durable references should download promptly (cloud mode) or hold onto `file_id` (self-host).
+
+**Download — two equivalent paths in self-host mode**:
 - `GET /api/files/:id/content` — unified namespace (recommended). Same path for input + output.
 - `GET /api/runs/:run_id/files/:filename` — run-scoped (existing route, backward-compatible).
 
-Both paths now **require authentication** and refuse cross-tenant reads with `403 FORBIDDEN`. The run-scoped path additionally returns `403` if the caller is not the run owner.
+Both paths require authentication. `GET /api/files/:id/content` returns `403 FORBIDDEN` for a file you don't own; the run-scoped `GET /api/runs/:run_id/files/:filename` returns an opaque `404` — identical to a missing run — when the caller is not the run owner, so it doesn't reveal whether another user's run exists. Cloud mode bypasses both — the presigned `url` itself is the auth token (signed for ~15 min, scoped to the exact object).
 
 **`DELETE /api/files/:id` on a `purpose: output` file** returns `403 DELETE_OUTPUT_FORBIDDEN` — output files are owned by the run, not by the caller.
 

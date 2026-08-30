@@ -68,6 +68,29 @@ describe("GET /api/stats", () => {
     expect(body.duration_ms).toBe(1500);
   });
 
+  it("omits operator-only machine_id/private_ip from GET /api/runs/:id (keeps phase_timings)", async () => {
+    await db.createRun({
+      id: "run-telemetry",
+      agent_id: null,
+      agent_version: "1.0.0",
+      user_id: "test-user",
+      status: "completed",
+    });
+    await db.updateRun("run-telemetry", {
+      machine_id: "9185707b71308e",
+      private_ip: "fdaa:0:1:a7b:1:2:3:4",
+      phase_timings: { create_api_ms: 12, host_schedule_pull_ms: 4800 },
+    });
+    const res = await app.request("/api/runs/run-telemetry");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // N2: the runner's machine id + private IP are operator-only, never surfaced
+    // to the run owner. The phase durations (public breakdown) stay.
+    expect(body.machine_id).toBeUndefined();
+    expect(body.private_ip).toBeUndefined();
+    expect(body.phase_timings).toEqual({ create_api_ms: 12, host_schedule_pull_ms: 4800 });
+  });
+
   it("GET /api/runs/:id returns 404 when not found", async () => {
     const res = await app.request("/api/runs/nonexistent");
     expect(res.status).toBe(404);
@@ -76,10 +99,16 @@ describe("GET /api/stats", () => {
   });
 
   it("counts agents and today runs correctly", async () => {
-    // Create 3 agents
-    await db.createAgent({ name: "a1", namespace: "dev", description: "", owner_id: "u1" });
-    await db.createAgent({ name: "a2", namespace: "dev", description: "", owner_id: "u1" });
-    await db.createAgent({ name: "a3", namespace: "alice", description: "", owner_id: "u2" });
+    // Create 3 agents owned by the authenticated user (test-user). agents_count
+    // is now per-owner (multi-tenant), matching the per-user run aggregates.
+    await db.createAgent({ name: "a1", namespace: "dev", description: "", owner_id: "test-user" });
+    await db.createAgent({ name: "a2", namespace: "dev", description: "", owner_id: "test-user" });
+    await db.createAgent({
+      name: "a3",
+      namespace: "alice",
+      description: "",
+      owner_id: "test-user",
+    });
 
     // Create 5 runs today (2 failed). Each run is owned by "test-user" so the
     // multi-tenancy filter (driven by fakeAuth) doesn't exclude them.
@@ -176,7 +205,7 @@ describe("GET /api/stats", () => {
       expect(bodyB.runs_today).toBe(3);
     });
 
-    it("VT-2 (SEC-002): GET /api/runs/:id returns 403 when caller is not the owner", async () => {
+    it("VT-5/VT-6: GET /api/runs/:id — owner 200, non-owner gets an opaque 404", async () => {
       const sharedDb = new MemoryDb();
       const buildApp = (userId: string) => {
         const fakeAuth = async (c: Context, next: () => Promise<void>) => {
@@ -202,11 +231,16 @@ describe("GET /api/stats", () => {
       const resA = await appA.request("/api/runs/run-of-A");
       expect(resA.status).toBe(200);
 
-      // Non-owner gets 403 (not 404 — we acknowledge existence to the rightful owner only)
+      // Non-owner gets an opaque 404 — identical to a non-existent run, so they
+      // cannot tell "exists but not yours" from "does not exist".
       const resB = await appB.request("/api/runs/run-of-A");
-      expect(resB.status).toBe(403);
+      expect(resB.status).toBe(404);
       const bodyB = await resB.json();
-      expect(bodyB.error.code).toBe("FORBIDDEN");
+      expect(bodyB.error.code).toBe("NOT_FOUND");
+      // Opaque: same status + code as a run that truly does not exist.
+      const resMissing = await appB.request("/api/runs/does-not-exist");
+      expect(resMissing.status).toBe(404);
+      expect((await resMissing.json()).error.code).toBe(bodyB.error.code);
     });
 
     // VT-14 (#80): per-agent stats — non-owner non-admin → 404 opaque.
@@ -296,5 +330,31 @@ describe("GET /api/stats", () => {
       const runsB: Array<{ id: string }> = await resB.json();
       expect(runsB.map((r) => r.id).sort()).toEqual(["run-B1"]);
     });
+  });
+});
+
+describe("stats/runs — API-key scope (#65)", () => {
+  function appWithDelegatedKey(): Hono {
+    const db = new MemoryDb();
+    const delegatedAuth = async (c: Context, next: () => Promise<void>) => {
+      c.set("user", {
+        id: "u1",
+        namespace: "test",
+        username: "test",
+        role: "user",
+        key: { id: "k1", scope_kind: "agents", operations: ["agent:run"], agent_ids: [] },
+      });
+      await next();
+    };
+    const app = new Hono();
+    app.route("/api", createStatsRoutes(db, delegatedAuth));
+    return app;
+  }
+
+  it("a delegated key cannot list runs, read stats, or read a run → 403", async () => {
+    const app = appWithDelegatedKey();
+    expect((await app.request("/api/runs")).status).toBe(403);
+    expect((await app.request("/api/stats")).status).toBe(403);
+    expect((await app.request("/api/runs/some-id")).status).toBe(403);
   });
 });

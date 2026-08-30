@@ -332,6 +332,25 @@ describe("Files Routes — GET /api/files/:id (metadata + content)", () => {
     expect(body.error.code).toBe("DELETE_OUTPUT_FORBIDDEN");
   });
 
+  // VT-4 (SEC-004) extended to the delete path: a different authenticated user
+  // must not be able to delete an input file they don't own (cross-user IDOR).
+  it("VT-4: DELETE /api/files/:id returns 403 when caller is not the input owner", async () => {
+    const { file_id } = await uploadFixture("image/jpeg");
+
+    // Different token → different dev user id (deterministic SHA-256 of token).
+    const res = await app.request(`/api/files/${file_id}`, {
+      method: "DELETE",
+      headers: { Authorization: "Bearer other-user" },
+    });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("FORBIDDEN");
+
+    // The file must still exist for its real owner (delete was rejected).
+    const after = await app.request(`/api/files/${file_id}`, { headers: authHeader });
+    expect(after.status).toBe(200);
+  });
+
   // VT-3 (SEC-004): file routes require authentication.
   it("VT-3: GET /api/files/:id returns 401 without Authorization header", async () => {
     const { file_id } = await uploadFixture("image/jpeg");
@@ -392,7 +411,7 @@ describe("Files Routes — GET /api/files/:id (metadata + content)", () => {
     expect(res.status).toBe(403);
   });
 
-  it("VT-4: GET /api/runs/:run_id/files/:filename returns 403 when caller is not the run owner", async () => {
+  it("VT-9: GET /api/runs/:run_id/files/:filename returns an opaque 404 when caller is not the run owner", async () => {
     await db.createUser({ github_id: "gh-other-2", username: "other-2" });
     const owner = await db.getUserByGithubId("gh-other-2");
     if (!owner) throw new Error("seed other-2 missing");
@@ -408,7 +427,8 @@ describe("Files Routes — GET /api/files/:id (metadata + content)", () => {
     const res = await app.request("/api/runs/run_vt4_runfile/files/anything.txt", {
       headers: authHeader,
     });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.code).toBe("RUN_NOT_FOUND");
   });
 
   it("VT-8: GET /api/files/:id returns 404 after the file has been evicted from cache", async () => {

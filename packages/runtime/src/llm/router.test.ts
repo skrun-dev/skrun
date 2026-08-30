@@ -1,6 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Logger } from "../logger.js";
+import { createGuardedFetch } from "../security/safe-fetch.js";
 import type { LLMCallResponse, LLMProvider } from "./providers/types.js";
 import { LLMRouter } from "./router.js";
+
+// SEC-001 (audit/006): spy on the real `createGuardedFetch` rather than replace
+// it, so behaviour is untouched but the WIRING is assertable — that the router
+// passes the guard at all, and passes `allowPrivateHosts` tracking the operator
+// opt-in. A bare `createGuardedFetch()` would block the documented
+// Ollama-on-localhost case at connect; that is the bug this spy exists to catch.
+vi.mock("../security/safe-fetch.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../security/safe-fetch.js")>();
+  return { ...actual, createGuardedFetch: vi.fn(actual.createGuardedFetch) };
+});
 
 function createMockProvider(name: string, response?: Partial<LLMCallResponse>): LLMProvider {
   return {
@@ -17,6 +29,26 @@ function createFailingProvider(name: string): LLMProvider {
   return {
     name,
     call: vi.fn().mockRejectedValue(new Error(`${name} failed`)),
+  };
+}
+
+function createHangingProvider(name: string): LLMProvider {
+  return {
+    name,
+    // Resolves only after a very long delay — with fake timers we never advance
+    // that far, so it stays pending like a real hang, without leaking a
+    // never-resolving promise.
+    call: vi.fn(
+      () =>
+        new Promise<LLMCallResponse>((resolve) => {
+          setTimeout(() => {
+            resolve({
+              content: `slow ${name}`,
+              usage: { promptTokens: 1, completionTokens: 1 },
+            });
+          }, 10 * 60_000);
+        }),
+    ),
   };
 }
 
@@ -58,6 +90,53 @@ describe("LLMRouter", () => {
 
     expect(result.content).toBe("Response from openai");
     expect(result.provider).toBe("openai");
+  });
+
+  it("VT-4: fails over to the fallback fast when the primary hangs, before its full timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      router.registerProvider("anthropic", createHangingProvider("anthropic"));
+      router.registerProvider("openai", createMockProvider("openai"));
+
+      const callPromise = router.call(
+        {
+          provider: "anthropic",
+          name: "claude-sonnet-4-20250514",
+          fallback: { provider: "openai", name: "gpt-4o" },
+        },
+        "system",
+        "user",
+      );
+
+      // Advance past the 45s failover timeout while the primary is still hanging
+      // (its own resolution is 10 min away) → the race rejects → fallback runs.
+      await vi.advanceTimersByTimeAsync(46_000);
+      const result = await callPromise;
+
+      expect(result.provider).toBe("openai");
+      expect(result.content).toBe("Response from openai");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("RT-2: an immediate primary rejection still falls over (no failover-timer wait)", async () => {
+    // Real timers: if the race wrongly waited for the 45s timer, this would time out.
+    router.registerProvider("anthropic", createFailingProvider("anthropic"));
+    router.registerProvider("openai", createMockProvider("openai"));
+
+    const result = await router.call(
+      {
+        provider: "anthropic",
+        name: "claude-sonnet-4-20250514",
+        fallback: { provider: "openai", name: "gpt-4o" },
+      },
+      "system",
+      "user",
+    );
+
+    expect(result.provider).toBe("openai");
+    expect(result.content).toBe("Response from openai");
   });
 
   it("should throw if primary fails and no fallback", async () => {
@@ -379,6 +458,132 @@ describe("LLMRouter", () => {
 
       expect(result.content).toBe("Response from anthropic");
     });
+
+    it("VT-13: uses the creator key over the server key (creator > server)", async () => {
+      const serverProvider = createMockProvider("anthropic");
+      router.registerProvider("anthropic", serverProvider);
+      try {
+        await router.call(
+          { provider: "anthropic", name: "claude-sonnet-4-20250514" },
+          "sys",
+          "user",
+          undefined,
+          undefined,
+          undefined,
+          undefined, // callerKeys
+          undefined,
+          undefined,
+          undefined, // toolChoice, parallelTools, agentContext
+          { anthropic: "sk-ant-creator-fake" }, // creatorKeys
+        );
+      } catch {
+        // The creator key resolves to an ephemeral real provider that fails on
+        // the fake key — expected. The point is the SERVER mock was bypassed.
+      }
+      expect(serverProvider.call).not.toHaveBeenCalled();
+    });
+
+    it("VT-13: uses the creator key for the primary and the server key for the fallback", async () => {
+      const serverFallback = createMockProvider("openai");
+      router.registerProvider("openai", serverFallback);
+
+      const result = await router.call(
+        {
+          provider: "anthropic",
+          name: "claude-sonnet-4-20250514",
+          fallback: { provider: "openai", name: "gpt-4o" },
+        },
+        "sys",
+        "user",
+        undefined,
+        undefined,
+        undefined,
+        undefined, // callerKeys
+        undefined,
+        undefined,
+        undefined,
+        { anthropic: "sk-ant-creator-fake" }, // creatorKeys → primary (ephemeral, fails)
+      );
+
+      // Primary used the creator key (ephemeral, failed) → fell back to the
+      // openai server mock. Proves creatorKeys is threaded into call().
+      expect(result.provider).toBe("openai");
+      expect(serverFallback.call).toHaveBeenCalledOnce();
+    });
+
+    it("VT-32: a creator key is used WITH a custom base_url (base_url orthogonal)", async () => {
+      // base_url + a creator key → the creator tier is picked and the key is used
+      // with the custom endpoint (an ephemeral OpenAI-compatible provider that
+      // fails against the fake endpoint). The server-registered mock is bypassed
+      // — base_url must NOT make the creator key fall through to the server tier.
+      const serverProvider = createMockProvider("anthropic");
+      router.registerProvider("anthropic", serverProvider);
+      try {
+        await router.call(
+          {
+            provider: "anthropic",
+            name: "claude-sonnet-4-20250514",
+            base_url: "https://llm.internal.example/v1",
+          },
+          "sys",
+          "user",
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { anthropic: "sk-ant-creator-fake" },
+        );
+      } catch {
+        // ephemeral provider call to the fake base_url fails — expected.
+      }
+      expect(serverProvider.call).not.toHaveBeenCalled();
+    });
+
+    it("VT-30: redacts an active key value from the fallback warn log (B-1)", async () => {
+      const logged: Array<Record<string, unknown>> = [];
+      const logger = {
+        warn: (obj: Record<string, unknown>) => logged.push(obj),
+        info: () => {},
+        error: () => {},
+        debug: () => {},
+        trace: () => {},
+        fatal: () => {},
+      } as unknown as Logger;
+      const r = new LLMRouter(logger);
+      // Primary (server mock) throws an error echoing the creator key; the
+      // openai fallback (server mock) succeeds, so the primary_failed warn fires.
+      r.registerProvider("anthropic", {
+        name: "anthropic",
+        call: vi.fn().mockRejectedValue(new Error("401 Incorrect API key: sk-creator-LEAK")),
+      });
+      r.registerProvider("openai", createMockProvider("openai"));
+
+      await r.call(
+        {
+          provider: "anthropic",
+          name: "claude-sonnet-4-20250514",
+          fallback: { provider: "openai", name: "gpt-4o" },
+        },
+        "sys",
+        "user",
+        undefined,
+        undefined,
+        undefined,
+        undefined, // callerKeys
+        undefined,
+        undefined,
+        undefined,
+        { google: "sk-creator-LEAK" }, // creatorKeys → the active secret
+      );
+
+      const warn = logged.find((l) => l.event === "primary_failed");
+      expect(warn).toBeDefined();
+      expect(JSON.stringify(warn)).not.toContain("sk-creator-LEAK");
+      expect(String(warn?.error)).toContain("[REDACTED]");
+    });
   });
 
   describe("xAI provider auto-registration (#58)", () => {
@@ -410,5 +615,229 @@ describe("LLMRouter", () => {
         expect(providers.has("xai")).toBe(false);
       });
     });
+  });
+});
+
+describe("model.base_url guard (SEC-001, audit/006)", () => {
+  const HOSTILE = "https://attacker.example/v1";
+  const ANTHROPIC = { provider: "anthropic" as const, name: "claude-sonnet-4-20250514" };
+
+  /** Async-capable env swap — the file's other `withEnv` is sync and scoped elsewhere. */
+  async function withEnvAsync(
+    vars: Record<string, string | undefined>,
+    fn: () => Promise<void>,
+  ): Promise<void> {
+    const originals = new Map(Object.keys(vars).map((k) => [k, process.env[k]]));
+    for (const [k, v] of Object.entries(vars)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      await fn();
+    } finally {
+      for (const [k, v] of originals) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  /** Drive a call through the router and return the error it surfaced, if any. */
+  async function callWith(
+    modelConfig: Record<string, unknown>,
+    opts: { callerKeys?: Record<string, string>; creatorKeys?: Record<string, string> } = {},
+  ): Promise<Error | null> {
+    const r = new LLMRouter();
+    try {
+      await r.call(
+        modelConfig as never,
+        "sys",
+        "user",
+        undefined,
+        undefined,
+        undefined,
+        opts.callerKeys,
+        undefined,
+        undefined,
+        undefined,
+        opts.creatorKeys,
+      );
+      return null;
+    } catch (e) {
+      return e as Error;
+    }
+  }
+
+  /**
+   * A transport that answers instantly — no DNS, no socket.
+   *
+   * The two tests marked below assert the WIRING (that the router built a
+   * guarded fetch, and with which flag) on a call that is allowed to proceed to
+   * HOSTILE. On the real transport they perform a live lookup of
+   * `attacker.example`: a reserved TLD, so it always fails — but how FAST it
+   * fails belongs to the runner's DNS, not to us. VT-6 timed out at 5003ms on CI
+   * Node 22 while passing locally and on the previous commit.
+   *
+   * The guard's own behaviour is NOT stubbed away: VT-4 keeps the real transport
+   * (localhost must not be blocked under the opt-in — the bug this spy exists to
+   * catch), and security/safe-fetch.test.ts covers the guard directly.
+   */
+  function instantTransport(): ReturnType<typeof createGuardedFetch> {
+    return (async () => new Response("{}", { status: 401 })) as unknown as ReturnType<
+      typeof createGuardedFetch
+    >;
+  }
+
+  beforeEach(() => {
+    vi.mocked(createGuardedFetch).mockClear();
+  });
+
+  it("VT-1: refuses a non-http(s) scheme before any provider is built", async () => {
+    await withEnvAsync({ ANTHROPIC_API_KEY: "sk-ant-server" }, async () => {
+      for (const url of ["file:///etc/passwd", "javascript:alert(1)", "ftp://evil.example/x"]) {
+        const e = await callWith({ ...ANTHROPIC, base_url: url });
+        expect(e?.message).toMatch(/must use http or https/);
+      }
+    });
+    // No provider was constructed for any of them.
+    expect(vi.mocked(createGuardedFetch)).not.toHaveBeenCalled();
+  });
+
+  it("VT-2: refuses a private/reserved LITERAL host by default, naming the opt-in", async () => {
+    await withEnvAsync(
+      { SKRUN_ALLOW_LOCAL_MODEL_HOSTS: undefined, ANTHROPIC_API_KEY: "sk-ant-server" },
+      async () => {
+        const e = await callWith({
+          ...ANTHROPIC,
+          base_url: "http://169.254.169.254/latest/meta-data",
+        });
+        expect(e?.message).toMatch(/private or reserved address/);
+        expect(e?.message).toMatch(/SKRUN_ALLOW_LOCAL_MODEL_HOSTS/);
+      },
+    );
+    // This is the case the connect-time guard CANNOT see: undici skips
+    // `connect.lookup` for an IP literal. Measured in the Q-6 spike.
+    expect(vi.mocked(createGuardedFetch)).not.toHaveBeenCalled();
+  });
+
+  it("VT-3: the same hostile base_url is refused on ALL THREE key tiers", async () => {
+    const hostile = { ...ANTHROPIC, base_url: "http://127.0.0.1:9/v1" };
+    await withEnvAsync(
+      { SKRUN_ALLOW_LOCAL_MODEL_HOSTS: undefined, ANTHROPIC_API_KEY: "sk-ant-server" },
+      async () => {
+        const caller = await callWith(hostile, { callerKeys: { anthropic: "sk-ant-caller" } });
+        const creator = await callWith(hostile, { creatorKeys: { anthropic: "sk-ant-creator" } });
+        const server = await callWith(hostile);
+        for (const e of [caller, creator, server]) {
+          expect(e?.message).toMatch(/private or reserved address/);
+        }
+      },
+    );
+    // Proves the guard runs BEFORE tier selection: no tier reached a provider.
+    expect(vi.mocked(createGuardedFetch)).not.toHaveBeenCalled();
+  });
+
+  it("VT-3b: the router passes the guard, with allowPrivateHosts tracking the opt-in", async () => {
+    // The guard's BEHAVIOUR (a public host resolving private is refused at
+    // connect) is already covered in security/safe-fetch.test.ts via its
+    // `resolver` seam. What only this file can assert is the WIRING.
+    vi.mocked(createGuardedFetch).mockReturnValueOnce(instantTransport());
+    await withEnvAsync({ SKRUN_ALLOW_LOCAL_MODEL_HOSTS: undefined }, async () => {
+      await callWith(
+        { ...ANTHROPIC, base_url: HOSTILE },
+        { callerKeys: { anthropic: "sk-ant-caller" } },
+      );
+    });
+    expect(vi.mocked(createGuardedFetch)).toHaveBeenCalledWith({ allowPrivateHosts: false });
+
+    vi.mocked(createGuardedFetch).mockClear();
+    await withEnvAsync({ SKRUN_ALLOW_LOCAL_MODEL_HOSTS: "true" }, async () => {
+      await callWith(
+        { ...ANTHROPIC, base_url: "http://localhost:9/v1" },
+        { callerKeys: { anthropic: "sk-ant-caller" } },
+      );
+    });
+    expect(vi.mocked(createGuardedFetch)).toHaveBeenCalledWith({ allowPrivateHosts: true });
+  });
+
+  it("VT-4: with the opt-in, the documented Ollama endpoint gets past validation", async () => {
+    await withEnvAsync({ SKRUN_ALLOW_LOCAL_MODEL_HOSTS: "true" }, async () => {
+      const e = await callWith(
+        { ...ANTHROPIC, base_url: "http://localhost:11434/v1" },
+        { callerKeys: { anthropic: "sk-ant-caller" } },
+      );
+      // Nothing is listening, so the CALL fails — but not on validation, which
+      // is the whole claim. docs/agent-yaml.md:39 stays runnable.
+      expect(e?.message ?? "").not.toMatch(/private or reserved address|must use http or https/);
+    });
+    expect(vi.mocked(createGuardedFetch)).toHaveBeenCalledWith({ allowPrivateHosts: true });
+  });
+
+  it("VT-5: the server tier refuses its own key to an agent-declared endpoint", async () => {
+    await withEnvAsync(
+      { SKRUN_ALLOW_SERVER_KEY_CUSTOM_BASE_URL: undefined, ANTHROPIC_API_KEY: "sk-ant-server" },
+      async () => {
+        const e = await callWith({ ...ANTHROPIC, base_url: HOSTILE });
+        expect(e?.message).toMatch(/does not send its own key to an agent-declared/);
+        // The refusal names all three ways forward, not just "no".
+        expect(e?.message).toMatch(/creator key/);
+        expect(e?.message).toMatch(/X-LLM-API-Key/);
+        expect(e?.message).toMatch(/SKRUN_ALLOW_SERVER_KEY_CUSTOM_BASE_URL/);
+      },
+    );
+  });
+
+  it("VT-6: with the operator opt-in, the server tier does pair its key with it", async () => {
+    vi.mocked(createGuardedFetch).mockReturnValueOnce(instantTransport());
+    await withEnvAsync(
+      { SKRUN_ALLOW_SERVER_KEY_CUSTOM_BASE_URL: "true", ANTHROPIC_API_KEY: "sk-ant-server" },
+      async () => {
+        const e = await callWith({ ...ANTHROPIC, base_url: HOSTILE });
+        expect(e?.message ?? "").not.toMatch(/does not send its own key/);
+      },
+    );
+    expect(vi.mocked(createGuardedFetch)).toHaveBeenCalledWith({ allowPrivateHosts: false });
+  });
+
+  it("RT-9: the fallback model carries no base_url (safe by omission, now pinned)", async () => {
+    // FallbackModelSchema has no base_url field and router.ts passes `undefined`
+    // at that position for the fallback call. Nothing enforced that, so a future
+    // "make it consistent" refactor could thread modelConfig.base_url into the
+    // fallback and silently reopen SEC-001 for the fallback's provider.
+    const fallbackProvider = createMockProvider("openai");
+    const r = new LLMRouter();
+    r.registerProvider("openai", fallbackProvider);
+    await withEnvAsync({ SKRUN_ALLOW_LOCAL_MODEL_HOSTS: undefined }, async () => {
+      try {
+        await r.call(
+          {
+            ...ANTHROPIC,
+            base_url: HOSTILE,
+            fallback: { provider: "openai", name: "gpt-5.2" },
+          } as never,
+          "sys",
+          "user",
+          undefined,
+          undefined,
+          undefined,
+          { anthropic: "sk-ant-caller" },
+        );
+      } catch {
+        // the primary fails against the fake endpoint — expected
+      }
+    });
+    // The fallback ran on the SERVER-REGISTERED provider, i.e. no base_url was
+    // threaded into it. Exactly one guarded fetch was built: the primary's.
+    expect(fallbackProvider.call).toHaveBeenCalledOnce();
+    expect(vi.mocked(createGuardedFetch)).toHaveBeenCalledOnce();
+  });
+
+  it("RT-10: providers without a base_url keep the SDK's own transport", async () => {
+    const r = new LLMRouter();
+    r.registerProvider("anthropic", createMockProvider("anthropic"));
+    await r.call(ANTHROPIC as never, "sys", "user");
+    // No agent-declared endpoint means no guarded transport, so OpenAI/Mistral/
+    // Grok/Groq at their fixed endpoints are untouched by this change.
+    expect(vi.mocked(createGuardedFetch)).not.toHaveBeenCalled();
   });
 });

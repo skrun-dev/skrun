@@ -142,7 +142,7 @@ export function HomePage() {
         ) : stats && metricValues ? (
           <>
             <MetricCard
-              label="Active agents"
+              label="Agents"
               value={stats.agents_count}
               icon={<IconAgents className="w-4 h-4" />}
               tone="sky"

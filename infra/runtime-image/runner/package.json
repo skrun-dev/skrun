@@ -1,0 +1,24 @@
+{
+  "name": "skrun-runner",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "In-machine RPC server bundled inside the skrun-runtime Docker image. Standalone (NOT a pnpm workspace member) — see infra/runtime-image/runner/README.md for rationale. The @skrun-dev/runtime dependency is injected as a tarball at Docker build time via the RUNTIME_TGZ build arg (produced by the GHCR workflow via `pnpm --filter @skrun-dev/runtime pack`).",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.0.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "hono": "^4.12.18",
+    "zod": "^4.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

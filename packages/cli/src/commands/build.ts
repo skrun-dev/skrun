@@ -1,10 +1,7 @@
-import { createWriteStream, readFileSync, statSync } from "node:fs";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-import { createGzip } from "node:zlib";
-import { validateAgent } from "@skrun-dev/schema";
+import { isExcludedEntry, packAgentTar, validateAgent } from "@skrun-dev/schema";
 import type { Command } from "commander";
 import * as format from "../utils/format.js";
 import { getValidatedConfig } from "../utils/validated-config.js";
@@ -12,37 +9,16 @@ import { getValidatedConfig } from "../utils/validated-config.js";
 const MAX_BUNDLE_SIZE = 50 * 1024 * 1024; // 50MB
 const WARN_BUNDLE_SIZE = 10 * 1024 * 1024; // 10MB
 
-// Directories and filenames excluded from the .agent bundle.
-//
-// `__pycache__` / `.pytest_cache` / `venv` / `.venv` were added in #57 so that
-// dev-machine venvs and Python build caches never leak into the tar — agents
-// declare `requirements.txt` / `pyproject.toml` and the runtime resolves deps
-// from the manifest at first run, not from a bundled venv.
-export const EXCLUDE_PATTERNS = new Set([
-  "node_modules",
-  ".git",
-  "dist",
-  ".env",
-  ".DS_Store",
-  "__pycache__",
-  ".pytest_cache",
-  "venv",
-  ".venv",
-]);
-
-function isExcluded(name: string): boolean {
-  if (EXCLUDE_PATTERNS.has(name)) return true;
-  if (name.startsWith(".") && name !== ".") return true;
-  if (name.endsWith(".secret")) return true;
-  return false;
-}
-
+// Collect the relative paths of every file to include in the `.agent` bundle,
+// applying the shared exclusion contract (`@skrun-dev/schema`). Directory/file
+// exclusions (node_modules, venvs, __pycache__, dotfiles, *.secret, …) live in
+// one place so the CLI writer and the server-side push writer never diverge.
 export async function collectFiles(dir: string, base: string = dir): Promise<string[]> {
   const files: string[] = [];
   const entries = await readdir(dir, { withFileTypes: true });
 
   for (const entry of entries) {
-    if (isExcluded(entry.name)) continue;
+    if (isExcludedEntry(entry.name)) continue;
 
     const fullPath = join(dir, entry.name);
     if (entry.isDirectory()) {
@@ -60,60 +36,6 @@ function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-// Simple tar archive creator (POSIX ustar format)
-function createTarEntry(filePath: string, content: Buffer): Buffer {
-  const header = Buffer.alloc(512);
-  const nameBytes = Buffer.from(filePath, "utf-8");
-  nameBytes.copy(header, 0, 0, Math.min(nameBytes.length, 100));
-
-  // Mode
-  Buffer.from("0000644\0").copy(header, 100);
-  // UID
-  Buffer.from("0001000\0").copy(header, 108);
-  // GID
-  Buffer.from("0001000\0").copy(header, 116);
-  // Size (octal)
-  Buffer.from(`${content.length.toString(8).padStart(11, "0")}\0`).copy(header, 124);
-  // Mtime (fixed for determinism)
-  Buffer.from("00000000000\0").copy(header, 136);
-  // Type flag: regular file
-  header[156] = 48; // '0'
-  // Magic
-  Buffer.from("ustar\0").copy(header, 257);
-  // Version
-  Buffer.from("00").copy(header, 263);
-
-  // Compute checksum
-  // Fill checksum field with spaces first
-  Buffer.from("        ").copy(header, 148);
-  let checksum = 0;
-  for (let i = 0; i < 512; i++) {
-    checksum += header[i];
-  }
-  Buffer.from(`${checksum.toString(8).padStart(6, "0")}\0 `).copy(header, 148);
-
-  // Pad content to 512-byte blocks
-  const paddingSize = (512 - (content.length % 512)) % 512;
-  const padding = Buffer.alloc(paddingSize);
-
-  return Buffer.concat([header, content, padding]);
-}
-
-function createTarBuffer(dir: string, files: string[]): Buffer {
-  const parts: Buffer[] = [];
-
-  for (const file of files) {
-    const fullPath = join(dir, file);
-    const content = readFileSync(fullPath);
-    parts.push(createTarEntry(file, content));
-  }
-
-  // End-of-archive: two 512-byte blocks of zeros
-  parts.push(Buffer.alloc(1024));
-
-  return Buffer.concat(parts);
 }
 
 export function registerBuildCommand(program: Command): void {
@@ -152,13 +74,11 @@ async function runBuild(outputDir?: string): Promise<void> {
     process.exit(1);
   }
 
-  // Create tar.gz
-  const tarBuffer = createTarBuffer(dir, files);
-  const tarStream = Readable.from(tarBuffer);
-  const gzip = createGzip();
-  const output = createWriteStream(outPath);
-
-  await pipeline(tarStream, gzip, output);
+  // Package into a deterministic gzipped tar (entry names normalised to POSIX by
+  // the codec, so a bundle built on Windows still extracts on a Linux runner).
+  const entries = files.map((file) => ({ name: file, content: readFileSync(join(dir, file)) }));
+  const bundle = await packAgentTar(entries);
+  writeFileSync(outPath, bundle);
 
   // Check size
   const stat = statSync(outPath);

@@ -13,13 +13,16 @@ DECLARE
   dup_count int;
 BEGIN
   -- Is the UNIQUE constraint on (agent_id, version) already present?
+  -- 2026-05-25 fix: cast attname (type `name`) to `text` so the array equality
+  -- doesn't fail with `operator does not exist: name[] = text[]` on stricter
+  -- Postgres versions (verified against live Supabase Postgres 17).
   SELECT count(*) INTO constraint_count
     FROM pg_constraint c
     JOIN pg_class t ON t.oid = c.conrelid
    WHERE c.contype = 'u'
      AND t.relname = 'agent_versions'
      AND (
-       SELECT array_agg(a.attname ORDER BY a.attname)
+       SELECT array_agg(a.attname::text ORDER BY a.attname)
          FROM pg_attribute a
         WHERE a.attrelid = t.oid
           AND a.attnum = ANY(c.conkey)

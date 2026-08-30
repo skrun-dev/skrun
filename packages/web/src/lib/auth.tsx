@@ -17,6 +17,13 @@ export interface AuthUser {
    * as `'user'` (least-privilege).
    */
   role?: "admin" | "user";
+  /**
+   * Operator verification policy (read-only, from `/api/me`). The dashboard
+   * reads it to render the Verify control: `admin` → admins only; `owner` → the
+   * agent owner too; `disabled` → hidden. Missing = treat as `'admin'` (legacy
+   * servers that pre-date the field).
+   */
+  verification_policy?: "admin" | "owner" | "disabled";
 }
 
 interface AuthContextValue {
@@ -51,30 +58,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             // OAuth-configured but no valid session → operator must log in.
             return;
           }
-          // 3. Local dev mode. Wire the dev-token for future API calls AND
-          // re-fetch /api/me with the Bearer header so `user` actually loads
-          // (including `role: "admin"` which gates admin-only UI like the
-          // Verify button). Without this 2nd fetch, `user` would stay null
-          // and `user?.role === "admin"` would be falsy in dev mode.
-          setAuthToken("dev-token");
-          usedDevToken = true;
+          // 3. No OAuth — try the dev-token admin shortcut. It only works when
+          // the server has SKRUN_DEV_AUTH enabled (localhost dev). Send the
+          // Bearer header on the retry directly and only wire the token globally
+          // if it actually authenticates — a hardened (dev-auth off) server
+          // returns 401, and we must NOT leave a dead `dev-token` wired for
+          // every later apiFetch call (that would be a phantom-auth state).
           res = await fetch("/api/me", {
             credentials: "same-origin",
             headers: { Authorization: "Bearer dev-token" },
           });
+          usedDevToken = res.ok;
         }
 
         if (res.ok && !cancelled) {
           const data = await res.json();
           setUser(data);
-          if (!usedDevToken) {
-            // Cookie-authed (OAuth) — no Bearer token needed for future calls.
-            setAuthToken("none");
-          }
+          // OAuth/cookie path needs no token; the dev-token path wires it for
+          // future calls. A rejected dev-token (above) leaves it unset → the
+          // dashboard renders an unauthenticated / auth-required state.
+          setAuthToken(usedDevToken ? "dev-token" : "none");
         }
       } catch {
-        // API unreachable — assume local dev mode
-        setAuthToken("dev-token");
+        // API unreachable or errored — unauthenticated state, never a phantom token.
+        setAuthToken("none");
       } finally {
         if (!cancelled) setIsLoading(false);
       }

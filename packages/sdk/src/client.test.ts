@@ -222,6 +222,28 @@ describe("SkrunClient", () => {
 
     const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(init.headers["X-LLM-API-Key"]).toBe(JSON.stringify({ google: "AIza..." }));
+    // Without llmBaseUrls the header is absent, not empty — the server treats
+    // "absent" and "declared" differently (SEC-001 audit/006).
+    expect(init.headers["X-LLM-Base-URL"]).toBeUndefined();
+  });
+
+  it("run() with llmBaseUrls option sends X-LLM-Base-URL header", async () => {
+    globalThis.fetch = mockFetchJson({ run_id: "abc", status: "completed" });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+
+    await client.run(
+      "dev/agent",
+      {},
+      {
+        llmKeys: { deepseek: "sk-..." },
+        llmBaseUrls: { deepseek: "https://api.deepseek.com/v1" },
+      },
+    );
+
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init.headers["X-LLM-Base-URL"]).toBe(
+      JSON.stringify({ deepseek: "https://api.deepseek.com/v1" }),
+    );
   });
 
   // --- stream() ---
@@ -469,6 +491,18 @@ describe("SkrunClient", () => {
     expect(url).toContain("/agents/dev/agent/versions/1.0.0/verify");
     expect(init.method).toBe("PATCH");
     expect(JSON.parse(init.body)).toEqual({ verified: true });
+  });
+
+  it("setVisibility() sends PATCH to the visibility endpoint with the new value", async () => {
+    globalThis.fetch = mockFetchJson({ name: "agent", namespace: "dev", visibility: "public" });
+    const client = new SkrunClient({ baseUrl: BASE_URL, token: TOKEN });
+
+    await client.setVisibility("dev/agent", "public");
+
+    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toContain("/agents/dev/agent/visibility");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body)).toEqual({ visibility: "public" });
   });
 
   // --- Error handling ---

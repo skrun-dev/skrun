@@ -73,6 +73,92 @@ export class RegistryClient {
     return (await res.json()) as Record<string, unknown>;
   }
 
+  async createKey(input: {
+    name: string;
+    scope_kind?: "account" | "agents";
+    agents?: string[];
+    scopes?: string[];
+  }): Promise<Record<string, unknown>> {
+    const res = await fetch(`${this.baseUrl}/api/keys`, {
+      method: "POST",
+      headers: { ...this.authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
+      const msg = (body as { error?: { message?: string } }).error?.message ?? res.statusText;
+      throw new Error(`Create key failed (${res.status}): ${msg}`);
+    }
+    return (await res.json()) as Record<string, unknown>;
+  }
+
+  async listKeys(): Promise<Array<Record<string, unknown>>> {
+    const res = await fetch(`${this.baseUrl}/api/keys`, { headers: this.authHeaders() });
+    if (!res.ok) throw new Error(`List keys failed (${res.status})`);
+    return (await res.json()) as Array<Record<string, unknown>>;
+  }
+
+  async revokeKey(id: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/api/keys/${id}`, {
+      method: "DELETE",
+      headers: this.authHeaders(),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
+      const msg = (body as { error?: { message?: string } }).error?.message ?? res.statusText;
+      throw new Error(`Revoke key failed (${res.status}): ${msg}`);
+    }
+  }
+
+  async setLlmKey(ns: string, name: string, provider: string, key: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/api/agents/${ns}/${name}/llm-keys/${provider}`, {
+      method: "PUT",
+      headers: { ...this.authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ key }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
+      const msg = (body as { error?: { message?: string } }).error?.message ?? res.statusText;
+      throw new Error(`Attach LLM key failed (${res.status}): ${msg}`);
+    }
+  }
+
+  async listLlmKeys(
+    ns: string,
+    name: string,
+  ): Promise<{ policy: string; keys: Array<Record<string, unknown>> }> {
+    const res = await fetch(`${this.baseUrl}/api/agents/${ns}/${name}/llm-keys`, {
+      headers: this.authHeaders(),
+    });
+    if (!res.ok) throw new Error(`List LLM keys failed (${res.status})`);
+    return (await res.json()) as { policy: string; keys: Array<Record<string, unknown>> };
+  }
+
+  async removeLlmKey(ns: string, name: string, provider: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/api/agents/${ns}/${name}/llm-keys/${provider}`, {
+      method: "DELETE",
+      headers: this.authHeaders(),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
+      const msg = (body as { error?: { message?: string } }).error?.message ?? res.statusText;
+      throw new Error(`Remove LLM key failed (${res.status}): ${msg}`);
+    }
+  }
+
+  async setLlmKeyPolicy(ns: string, name: string, policy: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/api/agents/${ns}/${name}/llm-key-policy`, {
+      method: "PUT",
+      headers: { ...this.authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ policy }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
+      const msg = (body as { error?: { message?: string } }).error?.message ?? res.statusText;
+      throw new Error(`Set LLM key policy failed (${res.status}): ${msg}`);
+    }
+  }
+
   /**
    * Invoke POST /run synchronously. Returns the full SdkRunResult-shaped JSON.
    * Errors carry `{ code, status }` on the thrown Error so callers can render
@@ -126,6 +212,27 @@ export class RegistryClient {
       const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
       const msg = (body as { error?: { message?: string } }).error?.message ?? res.statusText;
       throw new Error(`Verify failed (${res.status}): ${msg}`);
+    }
+
+    return (await res.json()) as Record<string, unknown>;
+  }
+
+  async setVisibility(
+    namespace: string,
+    name: string,
+    visibility: "private" | "public",
+  ): Promise<Record<string, unknown>> {
+    const url = `${this.baseUrl}/api/agents/${namespace}/${name}/visibility`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: { ...this.authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ visibility }),
+    });
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
+      const msg = (body as { error?: { message?: string } }).error?.message ?? res.statusText;
+      throw new Error(`Set visibility failed (${res.status}): ${msg}`);
     }
 
     return (await res.json()) as Record<string, unknown>;

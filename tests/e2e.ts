@@ -19,6 +19,7 @@
  */
 
 import {
+  cleanupDevNamespace,
   ROOT,
   registryLogPath,
   results,
@@ -44,6 +45,20 @@ import { run as runOutputValidation } from "./e2e/live/14-output-validation.js";
 import { run as runVerifyRequired } from "./e2e/live/15-verify-required.js";
 import { run as runSimplifyName } from "./e2e/live/16-simplify-agent-name.js";
 import { run as runMultiTenantReads } from "./e2e/live/17-multi-tenant-reads.js";
+import { run as runDashboardServed } from "./e2e/live/20-dashboard-served.js";
+import { run as runAgentVisibility } from "./e2e/live/21-agent-visibility.js";
+import { run as runVerificationPolicy } from "./e2e/live/22-verification-policy.js";
+import { run as runApiKeyScopes } from "./e2e/live/23-api-key-scopes.js";
+import { run as runCreatorLlmKey } from "./e2e/live/24-creator-llm-key.js";
+import { run as runDeviceLogin } from "./e2e/live/25-device-login.js";
+import { run as runBaseUrlGuard } from "./e2e/live/26-base-url-guard.js";
+
+// Phases 18 (Fly Machines API smoke) + 19 (deployed-cloud E2E) are NOT run
+// here. They exercise live external infra (Fly.io / a DEPLOYED api-server),
+// not the local registry this suite spins up, so a stray cloud-creds .env made
+// them false-RED whenever the cloud app was offline, rejected the dev-token
+// (OAuth deployments do), or pointed at a pruned image tag. They run on demand
+// via `pnpm fly:smoke` (phase 18) and `pnpm cloud:e2e:smoke` (phase 19).
 
 // --- Start registry ---
 console.log("Starting registry...");
@@ -52,6 +67,11 @@ console.log("Registry OK\n");
 
 // --- Login ---
 skrun(["login", "--token", TOKEN], ROOT);
+
+// --- Pre-flight cleanup: purge dev/* so a persistent cloud DB (DATABASE_URL)
+//     doesn't carry stale agent rows whose bundles were lost with the ephemeral
+//     MemoryStorage on the previous run (BUNDLE_NOT_FOUND). No-op on a fresh DB.
+await cleanupDevNamespace();
 
 // --- Phase 01: demo agents ---
 await runDemos();
@@ -103,6 +123,32 @@ await runSimplifyName();
 
 // --- Phase 17: multi-tenant reads — registry GET ownership gate ---
 await runMultiTenantReads();
+
+// (Phases 18 + 19 are cloud-only — see the import-block note above. Run them
+//  on demand via `pnpm fly:smoke` / `pnpm cloud:e2e:smoke`.)
+
+// --- Phase 20: operator dashboard served by the server (#93) ---
+await runDashboardServed();
+
+// --- Phase 21: agent visibility (#81) — field round-trips through registry + DB ---
+await runAgentVisibility();
+
+// --- Phase 22: verification policy (#103) — /api/me policy + admin verify round-trip ---
+await runVerificationPolicy();
+
+// --- Phase 23: API-key scopes (#65) — scoped key mint + run/pull/key-mgmt 403s ---
+await runApiKeyScopes();
+
+// --- Phase 24: creator-attached LLM keys (#102) — attach + keyless run + policy/delegated 403s ---
+await runCreatorLlmKey();
+
+// --- Phase 25: CLI device-login flow (#82) — device/code 404 fallback, consent page, poll states ---
+await runDeviceLogin();
+
+// --- Phase 26: model.base_url guard (SEC-001, audit/006) — a caller's key is not
+//     sent to an endpoint the agent's author chose. Driven with a REAL delegated
+//     sk_live key, because a dev-token is a master credential and would be exempt. ---
+await runBaseUrlGuard();
 
 // --- Summary ---
 console.log(`\n${"=".repeat(70)}`);

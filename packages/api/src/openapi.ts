@@ -7,7 +7,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
     openapi: "3.1.0",
     info: {
       title: "Skrun API",
-      version: "0.8.0",
+      version: "1.0.0",
       description:
         "Deploy any Agent Skill as an API. Multi-model, stateful, multimodal, open source.",
       license: { name: "MIT", url: "https://github.com/skrun-dev/skrun/blob/main/LICENSE" },
@@ -209,6 +209,12 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
           properties: {
             name: { type: "string" },
             namespace: { type: "string" },
+            visibility: {
+              type: "string",
+              enum: ["private", "public"],
+              description:
+                "Access control. 'private' (default) ⇒ only the owner/admin can POST /run; 'public' ⇒ any authenticated caller can. The set-path is private-only for now — PATCH /api/agents/{namespace}/{name}/visibility accepts 'private' and rejects 'public' (400 PUBLIC_VISIBILITY_DISABLED) until the marketplace.",
+            },
             latest_version_verified: { type: "boolean" },
             latest_version: { type: "string" },
             created_at: { type: "string", format: "date-time" },
@@ -289,15 +295,141 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
           },
         },
       },
+      "/auth/device/code": {
+        post: {
+          summary: "Request a device code (CLI device-login, RFC 8628)",
+          operationId: "deviceCode",
+          security: [],
+          description:
+            "Starts the CLI device-login flow. The CLI sends a PKCE code_challenge (S256) and receives a device_code, a short user_code, and the verification URIs. The token is delivered later via the poll body, never a URL.",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["code_challenge"],
+                  properties: {
+                    code_challenge: { type: "string", description: "PKCE S256 challenge" },
+                    code_challenge_method: { type: "string", enum: ["S256"] },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "Device + user codes issued",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      device_code: { type: "string" },
+                      user_code: { type: "string", example: "WXYZ-3456" },
+                      verification_uri: { type: "string" },
+                      verification_uri_complete: { type: "string" },
+                      expires_in: { type: "integer", description: "Seconds until expiry" },
+                      interval: { type: "integer", description: "Minimum poll interval (seconds)" },
+                    },
+                  },
+                },
+              },
+            },
+            "400": {
+              description: "invalid_request — missing PKCE code_challenge",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "404": {
+              description:
+                "OAUTH_NOT_CONFIGURED — instance has no OAuth (the CLI falls back to --token)",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+      },
+      "/auth/device/token": {
+        post: {
+          summary: "Poll for the device-login token (CLI device-login, RFC 8628)",
+          operationId: "deviceToken",
+          security: [],
+          description:
+            "The CLI polls with its device_code and PKCE code_verifier. While pending it returns 400 with error code authorization_pending or slow_down. Once authorized and the verifier matches, it returns 200 with the sk_live token in the body (minted at poll-success).",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["device_code", "code_verifier"],
+                  properties: {
+                    device_code: { type: "string" },
+                    code_verifier: { type: "string", description: "PKCE verifier" },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "Authorized — the token is in the body",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      token: { type: "string", description: "sk_live API key" },
+                      username: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
+            "400": {
+              description:
+                "Poll state or error: authorization_pending | slow_down | expired_token | invalid_grant | invalid_request",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "429": {
+              description: "Too many requests — back off (treat like slow_down)",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+      },
       "/api/agents/{namespace}/{name}/run": {
         post: {
           summary: "Run an agent",
           operationId: "runAgent",
           description:
-            "Execute an agent. Supports sync (default), SSE streaming (Accept: text/event-stream), and async webhook (webhook_url in body). Webhook mode requires the `WEBHOOK_SIGNING_KEY` env var on the server — without it the runtime refuses to deliver the callback.",
+            "Execute an agent. Run-authorized: a `private` agent (the default) runs only for its owner (or an admin) — a non-owner gets a 404 indistinguishable from a genuinely-absent agent; a `public` agent runs for any authenticated caller. Supports sync (default), SSE streaming (Accept: text/event-stream), and async webhook (webhook_url in body). Webhook mode requires the `WEBHOOK_SIGNING_KEY` env var on the server — without it the runtime refuses to deliver the callback.",
           parameters: [
             { name: "namespace", in: "path", required: true, schema: { type: "string" } },
             { name: "name", in: "path", required: true, schema: { type: "string" } },
+            {
+              name: "X-LLM-API-Key",
+              in: "header",
+              required: false,
+              schema: { type: "string" },
+              description:
+                'JSON map of provider → API key, e.g. {"google": "AIza...", "anthropic": "sk-ant-..."} — use your own LLM key for this run instead of the server\'s. Accepted providers: anthropic, openai, google, mistral, groq, xai. Whether callers may do this at all is set per agent by `llm_key_policy`. Pair with X-LLM-Base-URL when the agent is not yours and declares its own `model.base_url`.',
+            },
+            {
+              name: "X-LLM-Base-URL",
+              in: "header",
+              required: false,
+              schema: { type: "string" },
+              description:
+                'JSON map of provider → base URL, e.g. {"deepseek": "https://api.deepseek.com/v1"} — the endpoint YOUR key for that provider belongs to. Only needed when you send X-LLM-API-Key to an agent you do not own: such an agent may declare its own `model.base_url`, and the server refuses to send your key to an endpoint you did not choose (403 CALLER_BASE_URL_NOT_CONSENTED). Compared by origin, so the path need not match; the refusal names the agent\'s origin.',
+            },
           ],
           requestBody: {
             required: true,
@@ -327,7 +459,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                     environment: {
                       type: "object",
                       description:
-                        "Optional environment override. Fields are shallow-merged on top of the agent.yaml environment defaults. Omit to use agent defaults.",
+                        "Optional environment override. Fields are shallow-merged on top of the agent.yaml environment defaults. Omit to use agent defaults. Owner/admin-only: a non-owner supplying an override (e.g. on a public agent) gets 403 ENV_OVERRIDE_FORBIDDEN.",
                       properties: {
                         networking: {
                           type: "object",
@@ -400,9 +532,16 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                 "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
             },
+            "403": {
+              description:
+                "Run refused: the resolved version is not verified (AGENT_NOT_VERIFIED — applies under the `admin` verification policy; the `owner`/`disabled` policies do not gate on verification), a non-owner supplied an environment override (ENV_OVERRIDE_FORBIDDEN), the agent's caller-key policy is `creator_only` and the request carried an X-LLM-API-Key header (CALLER_KEY_NOT_ALLOWED), or the request carried an X-LLM-API-Key destined for an agent-declared `model.base_url` the caller did not name in X-LLM-Base-URL (CALLER_BASE_URL_NOT_CONSENTED — a key is only sent to an endpoint chosen by its owner; the agent's own owner, presenting a master credential, is exempt).",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
             "404": {
               description:
-                "Agent not found, or pinned version not found. If the agent exists but the requested `version` does not, the body conforms to VersionNotFoundResponse and includes `available: string[]` (up to 10 most recent, newest first).",
+                "Agent not found, the caller is not authorized to run a private agent (opaque — indistinguishable from not-found), or the pinned version was not found. If the agent exists but the requested `version` does not, the body conforms to VersionNotFoundResponse and includes `available: string[]` (up to 10 most recent, newest first).",
               content: {
                 "application/json": {
                   schema: {
@@ -710,7 +849,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                             verified: {
                               type: "boolean",
                               description:
-                                "Per-version verified flag. Gated by `PATCH /api/agents/:ns/:name/versions/:version/verify` (admin only). `POST /run` returns 403 AGENT_NOT_VERIFIED when this is false for the resolved version.",
+                                "Per-version verified flag. Set via `PATCH /api/agents/:ns/:name/versions/:version/verify` (authority governed by SKRUN_VERIFICATION_POLICY). Under the `admin` policy `POST /run` returns 403 AGENT_NOT_VERIFIED when this is false for the resolved version; `owner`/`disabled` do not gate runs on it.",
                             },
                           },
                           required: ["version", "size", "pushed_at", "notes", "verified"],
@@ -738,10 +877,10 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
       },
       "/api/agents/{namespace}/{name}/versions/{version}/verify": {
         patch: {
-          summary: "Verify or unverify a version (admin only)",
+          summary: "Verify or unverify a version (authority per verification policy)",
           operationId: "verifyVersion",
           description:
-            "Set or unset the verified flag on a specific version. Only verified versions can be invoked via POST /run — unverified runs return 403 AGENT_NOT_VERIFIED. Restricted to callers with `user.role === 'admin'`. Promotion to admin is a manual SQL UPDATE on the users table — no HTTP endpoint for role elevation by design. The legacy agent-level `PATCH /api/agents/:ns/:name/verify` route (v0.7.x) was removed in v0.8.0.",
+            "Set or unset the verified flag on a specific version. The attestation authority is governed by the operator verification policy (SKRUN_VERIFICATION_POLICY): `admin` (default) ⇒ instance admins only; `owner`/`disabled` ⇒ the agent owner may attest their own agents (or an admin). Under the `admin` policy an unverified version cannot run (403 AGENT_NOT_VERIFIED); `owner`/`disabled` do not gate runs on verification. The legacy agent-level `PATCH /api/agents/:ns/:name/verify` route (v0.7.x) was removed in v0.8.0.",
           parameters: [
             { name: "namespace", in: "path", required: true, schema: { type: "string" } },
             { name: "name", in: "path", required: true, schema: { type: "string" } },
@@ -798,6 +937,299 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
             },
             "404": {
               description: "Agent or version not found",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+      },
+      "/api/agents/{namespace}/{name}/visibility": {
+        patch: {
+          summary: "Set agent visibility (owner/admin)",
+          operationId: "setAgentVisibility",
+          description:
+            "Set an agent's visibility. Only 'private' is accepted — the hosting model is private-only, so 'public' is rejected with 400 PUBLIC_VISIBILITY_DISABLED until the marketplace. 'private' ⇒ only the owner/admin can POST /run. Namespace ownership required (admin override).",
+          parameters: [
+            { name: "namespace", in: "path", required: true, schema: { type: "string" } },
+            { name: "name", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: { visibility: { type: "string", enum: ["private", "public"] } },
+                  required: ["visibility"],
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "Updated agent row",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      id: { type: "string" },
+                      name: { type: "string" },
+                      namespace: { type: "string" },
+                      visibility: { type: "string", enum: ["private", "public"] },
+                      updated_at: { type: "string", format: "date-time" },
+                    },
+                    required: ["id", "name", "namespace", "visibility"],
+                  },
+                },
+              },
+            },
+            "400": {
+              description:
+                "Invalid body (visibility must be 'private' or 'public'), or 'public' was requested while the public set-path is disabled (PUBLIC_VISIBILITY_DISABLED — private-only hosting).",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description: "Caller does not own the namespace and is not an admin",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "404": {
+              description: "Agent not found in the caller's namespace",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+      },
+      "/api/agents/{namespace}/{name}/llm-keys": {
+        get: {
+          summary: "List creator LLM keys + caller-key policy (owner/admin)",
+          operationId: "listAgentLlmKeys",
+          description:
+            "Return the agent's caller-key policy and the presence of its creator-attached LLM keys (provider + last4 + updated_at). WRITE-ONLY — the key value is never returned. Requires a master credential (account-wide key, session, or dev-token) + namespace ownership.",
+          parameters: [
+            { name: "namespace", in: "path", required: true, schema: { type: "string" } },
+            { name: "name", in: "path", required: true, schema: { type: "string" } },
+          ],
+          responses: {
+            "200": {
+              description: "Caller-key policy + key presence",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      policy: { type: "string", enum: ["open", "creator_only"] },
+                      keys: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          properties: {
+                            provider: { type: "string" },
+                            last4: { type: "string" },
+                            updated_at: { type: "string", format: "date-time" },
+                          },
+                          required: ["provider", "last4"],
+                        },
+                      },
+                    },
+                    required: ["policy", "keys"],
+                  },
+                },
+              },
+            },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description:
+                "KEY_SCOPE_FORBIDDEN (a master credential is required) or FORBIDDEN (not your namespace)",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "404": {
+              description: "Agent not found in the caller's namespace",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+      },
+      "/api/agents/{namespace}/{name}/llm-keys/{provider}": {
+        put: {
+          summary: "Attach (or replace) a creator LLM key for a provider (owner/admin)",
+          operationId: "setAgentLlmKey",
+          description:
+            "Encrypt and store the creator's LLM key for one provider (anthropic, openai, google, mistral, groq, xai) so callers don't need to supply their own. The key travels in the body and is never returned. Requires a master credential + namespace ownership; the server must have SKRUN_SECRETS_ENCRYPTION_KEY set, else 500 ENCRYPTION_NOT_CONFIGURED.",
+          parameters: [
+            { name: "namespace", in: "path", required: true, schema: { type: "string" } },
+            { name: "name", in: "path", required: true, schema: { type: "string" } },
+            { name: "provider", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: { key: { type: "string" } },
+                  required: ["key"],
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "Stored — returns the provider + display last4 (never the key)",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: { provider: { type: "string" }, last4: { type: "string" } },
+                    required: ["provider", "last4"],
+                  },
+                },
+              },
+            },
+            "400": {
+              description:
+                "INVALID_LLM_PROVIDER (unsupported provider) or INVALID_LLM_KEY (too short) or invalid body",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description: "KEY_SCOPE_FORBIDDEN or FORBIDDEN",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "404": {
+              description: "Agent not found in the caller's namespace",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "500": {
+              description:
+                "ENCRYPTION_NOT_CONFIGURED — the server has no SKRUN_SECRETS_ENCRYPTION_KEY set",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+        delete: {
+          summary: "Remove a creator LLM key for a provider (owner/admin)",
+          operationId: "deleteAgentLlmKey",
+          description:
+            "Delete the creator's LLM key for one provider. Requires a master credential + namespace ownership.",
+          parameters: [
+            { name: "namespace", in: "path", required: true, schema: { type: "string" } },
+            { name: "name", in: "path", required: true, schema: { type: "string" } },
+            { name: "provider", in: "path", required: true, schema: { type: "string" } },
+          ],
+          responses: {
+            "204": { description: "Removed (no content)" },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description: "KEY_SCOPE_FORBIDDEN or FORBIDDEN",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "404": {
+              description: "Agent not found in the caller's namespace",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+          },
+        },
+      },
+      "/api/agents/{namespace}/{name}/llm-key-policy": {
+        put: {
+          summary: "Set the caller-key policy (owner/admin)",
+          operationId: "setAgentLlmKeyPolicy",
+          description:
+            "Set whether callers may bring their own LLM key. 'open' (default) ⇒ caller > creator > server resolution; 'creator_only' ⇒ a run carrying X-LLM-API-Key is rejected with 403 CALLER_KEY_NOT_ALLOWED. Requires a master credential + namespace ownership.",
+          parameters: [
+            { name: "namespace", in: "path", required: true, schema: { type: "string" } },
+            { name: "name", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: { policy: { type: "string", enum: ["open", "creator_only"] } },
+                  required: ["policy"],
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "Updated policy",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: { policy: { type: "string", enum: ["open", "creator_only"] } },
+                    required: ["policy"],
+                  },
+                },
+              },
+            },
+            "400": {
+              description: "Invalid body (policy must be 'open' or 'creator_only')",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description: "KEY_SCOPE_FORBIDDEN or FORBIDDEN",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "404": {
+              description: "Agent not found in the caller's namespace",
               content: {
                 "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
@@ -919,7 +1351,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
           summary: "Get current user info",
           operationId: "getMe",
           description:
-            "Returns the authenticated user's profile. Used by the dashboard to display user info.",
+            "Returns the authenticated user's profile. Used by the dashboard to display user info and to render policy-gated controls (`role`, `verification_policy` — both read-only).",
           responses: {
             "200": {
               description: "User profile",
@@ -934,8 +1366,15 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                       email: { type: "string", nullable: true },
                       avatar_url: { type: "string", nullable: true },
                       plan: { type: "string", example: "free" },
+                      role: { type: "string", enum: ["admin", "user"] },
+                      verification_policy: {
+                        type: "string",
+                        enum: ["admin", "owner", "disabled"],
+                        description:
+                          "Operator verification policy (read-only). Governs who may attest a version and whether runs are gated on verification.",
+                      },
                     },
-                    required: ["id", "username", "namespace", "plan"],
+                    required: ["id", "username", "namespace", "plan", "role"],
                   },
                 },
               },
@@ -970,8 +1409,22 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                     scopes: {
                       type: "array",
                       items: { type: "string" },
-                      description: "Key scopes (default: all)",
-                      example: ["agent:push", "agent:run", "agent:verify"],
+                      description:
+                        'Operation scopes (default: all). Allowed: agent:run, agent:push, agent:verify. A run-only key passes ["agent:run"].',
+                      example: ["agent:run", "agent:push", "agent:verify"],
+                    },
+                    scope_kind: {
+                      type: "string",
+                      enum: ["account", "agents"],
+                      description:
+                        "Resource binding. account (default) = the whole account; agents = restricted to the agents in `agents` (a delegated key).",
+                    },
+                    agents: {
+                      type: "array",
+                      items: { type: "string" },
+                      description:
+                        "When scope_kind=agents: the namespace/name agents (which you must own) the key may act on.",
+                      example: ["dev/my-agent"],
                     },
                   },
                   required: ["name"],
@@ -992,15 +1445,24 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                       name: { type: "string" },
                       key_prefix: { type: "string", example: "sk_live_a1b2c3d4" },
                       scopes: { type: "array", items: { type: "string" } },
+                      scope_kind: { type: "string", enum: ["account", "agents"] },
+                      agents: { type: "array", items: { type: "string" } },
                       created_at: { type: "string", format: "date-time" },
                     },
-                    required: ["id", "key", "name", "key_prefix", "scopes"],
+                    required: ["id", "key", "name", "key_prefix", "scopes", "scope_kind"],
                   },
                 },
               },
             },
             "401": {
               description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description:
+                "KEY_SCOPE_FORBIDDEN — key management requires an account-wide API key (a delegated or run-only key cannot mint keys), or a scoped agent is not owned by the caller.",
               content: {
                 "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
@@ -1026,6 +1488,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                         name: { type: "string" },
                         key_prefix: { type: "string" },
                         scopes: { type: "array", items: { type: "string" } },
+                        scope_kind: { type: "string", enum: ["account", "agents"] },
                         last_used_at: { type: "string", format: "date-time", nullable: true },
                         created_at: { type: "string", format: "date-time" },
                       },
@@ -1036,6 +1499,12 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
             },
             "401": {
               description: "Unauthorized",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description: "KEY_SCOPE_FORBIDDEN — requires an account-wide API key.",
               content: {
                 "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
@@ -1213,7 +1682,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
           summary: "Delete an uploaded input file",
           operationId: "deleteInputFile",
           description:
-            "Removes the file from storage. Returns 403 DELETE_OUTPUT_FORBIDDEN if the file_id refers to an agent-produced output (callers don't own outputs).",
+            "Removes the file from storage. Requires authentication AND that the caller owns the input file. Returns 403 DELETE_OUTPUT_FORBIDDEN if the file_id refers to an agent-produced output (callers don't own outputs), or 403 FORBIDDEN if the input file belongs to another user.",
           parameters: [
             {
               name: "id",
@@ -1231,7 +1700,8 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
               },
             },
             "403": {
-              description: "DELETE_OUTPUT_FORBIDDEN — cannot delete output files",
+              description:
+                "DELETE_OUTPUT_FORBIDDEN — cannot delete output files; or FORBIDDEN — caller does not own the input file",
               content: {
                 "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },

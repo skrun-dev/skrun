@@ -3,7 +3,13 @@ import { ConfirmDialog } from "../components/shared/confirm-dialog";
 import { EmptyState } from "../components/shared/empty-state";
 import { IconPlus } from "../components/shared/icons";
 import { Btn, Card, KV, PageHeader } from "../components/shared/ui";
-import { type ApiKey, useApiKeys, useCreateApiKey, useRevokeApiKey } from "../lib/api-client";
+import {
+  type ApiKey,
+  useAgents,
+  useApiKeys,
+  useCreateApiKey,
+  useRevokeApiKey,
+} from "../lib/api-client";
 import { useAuth } from "../lib/auth";
 
 export function SettingsPage() {
@@ -34,22 +40,19 @@ function ProfileSection() {
           ) : (
             <div className="w-14 h-14 rounded-full bg-linear-to-br from-sky-400 to-violet-500 flex items-center justify-center">
               <span className="text-xl font-semibold text-white">
-                {(user?.username ?? "D")[0]?.toUpperCase()}
+                {user?.username?.[0]?.toUpperCase()}
               </span>
             </div>
           )}
           <dl className="flex-1 space-y-0">
-            <KV
-              label="Username"
-              value={<span className="font-medium">{user?.username ?? "Local Dev"}</span>}
-            />
-            <KV label="Namespace" value={user?.namespace ?? "dev"} mono />
+            <KV label="Username" value={<span className="font-medium">{user?.username}</span>} />
+            <KV label="Namespace" value={user?.namespace} mono />
             <KV label="Email" value={user?.email || "—"} />
             <KV
               label="Plan"
               value={
                 <span className="px-2 py-0.5 text-[10.5px] font-medium rounded-sm bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300">
-                  {user?.plan ?? "free"}
+                  {user?.plan}
                 </span>
               }
             />
@@ -120,8 +123,13 @@ function ApiKeysSection() {
                 className="grid grid-cols-[1fr_120px_120px_80px] gap-3 items-center px-4 py-3"
               >
                 <div>
-                  <div className="text-[12.5px] font-medium text-gray-900 dark:text-gray-100">
+                  <div className="text-[12.5px] font-medium text-gray-900 dark:text-gray-100 flex items-center gap-2">
                     {key.name}
+                    {key.scope_kind === "agents" && (
+                      <span className="px-1.5 py-0.5 text-[10px] rounded-sm bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                        Scoped
+                      </span>
+                    )}
                   </div>
                   <div className="font-mono text-[11px] text-gray-500 dark:text-gray-500">
                     {key.key_prefix}...
@@ -176,15 +184,24 @@ function ApiKeysSection() {
 
 function CreateKeyDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [name, setName] = useState("");
+  const [access, setAccess] = useState<"full" | "run-only">("full");
+  const [scopeKind, setScopeKind] = useState<"account" | "agents">("account");
+  const [agentRef, setAgentRef] = useState("");
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const createKey = useCreateApiKey();
+  const { data: agentsData } = useAgents(1, 100);
 
   if (!open) return null;
 
   const handleCreate = async () => {
     try {
-      const result = await createKey.mutateAsync(name);
+      const result = await createKey.mutateAsync({
+        name,
+        scope_kind: scopeKind,
+        agents: scopeKind === "agents" && agentRef ? [agentRef] : [],
+        scopes: access === "run-only" ? ["agent:run"] : undefined,
+      });
       setCreatedKey(result.key);
     } catch {
       // handled by mutation
@@ -211,6 +228,9 @@ function CreateKeyDialog({ open, onClose }: { open: boolean; onClose: () => void
   const handleClose = () => {
     setCreatedKey(null);
     setName("");
+    setAccess("full");
+    setScopeKind("account");
+    setAgentRef("");
     setCopied(false);
     onClose();
   };
@@ -263,11 +283,83 @@ function CreateKeyDialog({ open, onClose }: { open: boolean; onClose: () => void
               placeholder="e.g. CI pipeline, local dev..."
               className="w-full px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 focus:outline-hidden focus:ring-2 focus:ring-sky-500 mb-4"
             />
+
+            <fieldset className="mb-4">
+              <legend className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                Access
+              </legend>
+              <div className="flex gap-4 text-sm text-gray-700 dark:text-gray-300">
+                <label className="flex items-center gap-1.5">
+                  <input
+                    type="radio"
+                    name="access"
+                    checked={access === "full"}
+                    onChange={() => setAccess("full")}
+                  />
+                  Full
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input
+                    type="radio"
+                    name="access"
+                    checked={access === "run-only"}
+                    onChange={() => setAccess("run-only")}
+                  />
+                  Run-only
+                </label>
+              </div>
+            </fieldset>
+
+            <fieldset className="mb-4">
+              <legend className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                Scope
+              </legend>
+              <div className="flex gap-4 text-sm text-gray-700 dark:text-gray-300 mb-2">
+                <label className="flex items-center gap-1.5">
+                  <input
+                    type="radio"
+                    name="scope"
+                    checked={scopeKind === "account"}
+                    onChange={() => setScopeKind("account")}
+                  />
+                  All agents
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input
+                    type="radio"
+                    name="scope"
+                    checked={scopeKind === "agents"}
+                    onChange={() => setScopeKind("agents")}
+                  />
+                  One agent
+                </label>
+              </div>
+              {scopeKind === "agents" && (
+                <select
+                  aria-label="Agent"
+                  value={agentRef}
+                  onChange={(e) => setAgentRef(e.target.value)}
+                  className="w-full px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100"
+                >
+                  <option value="">Select an agent…</option>
+                  {(agentsData?.agents ?? []).map((a) => (
+                    <option key={a.id} value={`${a.namespace}/${a.name}`}>
+                      {a.namespace}/{a.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </fieldset>
+
             <div className="flex gap-3 justify-end">
               <Btn variant="secondary" onClick={handleClose}>
                 Cancel
               </Btn>
-              <Btn variant="primary" onClick={handleCreate} disabled={createKey.isPending}>
+              <Btn
+                variant="primary"
+                onClick={handleCreate}
+                disabled={createKey.isPending || (scopeKind === "agents" && !agentRef)}
+              >
                 {createKey.isPending ? "Creating..." : "Create"}
               </Btn>
             </div>

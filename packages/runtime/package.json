@@ -1,11 +1,15 @@
 {
   "name": "@skrun-dev/runtime",
-  "version": "0.8.0",
+  "version": "1.0.0",
   "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./runner": {
+      "types": "./dist/runner.d.ts",
+      "import": "./dist/runner.js"
     }
   },
   "main": "./dist/index.js",
@@ -26,7 +30,9 @@
     "@skrun-dev/schema": "workspace:*",
     "ajv": "^8.20.0",
     "openai": "^6.35.0",
-    "pino": "^10.3.1"
+    "pino": "^10.3.1",
+    "undici": "^8.10.0",
+    "zod": "^4.4.1"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",

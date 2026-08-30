@@ -71,6 +71,15 @@ describe("isHostAllowed", () => {
     expect(isHostAllowed("169.254.169.254", ["*"])).toBe(false);
   });
 
+  // SEC-2026-003: CGNAT 100.64/10 (RFC 6598) blocked
+  it("blocks CGNAT 100.64.0.0-100.127.255.255", () => {
+    expect(isHostAllowed("100.64.0.1", ["*"])).toBe(false);
+    expect(isHostAllowed("100.127.255.254", ["*"])).toBe(false);
+    // boundaries: 100.63 and 100.128 are NOT CGNAT
+    expect(isHostAllowed("100.63.255.1", ["*"])).toBe(true);
+    expect(isHostAllowed("100.128.0.1", ["*"])).toBe(true);
+  });
+
   // Additional: IPv6 loopback blocked
   it("blocks IPv6 loopback ::1", () => {
     expect(isHostAllowed("::1", ["*"])).toBe(false);
@@ -94,6 +103,19 @@ describe("isHostAllowed", () => {
     expect(isHostAllowed("[fe80::1]", ["*"])).toBe(false);
     expect(isHostAllowed("fe80::abcd:1234", ["*"])).toBe(false);
     expect(isHostAllowed("FE80::1", ["*"])).toBe(false); // case-insensitive
+  });
+
+  // N-6 (SEC-2026-003): ULA fc00::/7 spans fc00:-fdff: — the full range must be
+  // blocked, not just the fc00: prefix (with and without URL brackets).
+  it("N-6: blocks ULA fc00::/7 across the full range", () => {
+    expect(isHostAllowed("fc00::1", ["*"])).toBe(false);
+    expect(isHostAllowed("fc01::1", ["*"])).toBe(false); // was uncaught by ^fc00:
+    expect(isHostAllowed("fcff::1", ["*"])).toBe(false);
+    expect(isHostAllowed("fd00::1", ["*"])).toBe(false);
+    expect(isHostAllowed("fdff::abcd", ["*"])).toBe(false);
+    expect(isHostAllowed("[fc01::1]", ["*"])).toBe(false); // bracketed URL host
+    expect(isHostAllowed("[fd00::1]", ["*"])).toBe(false);
+    expect(isHostAllowed("FC01::1", ["*"])).toBe(false); // case-insensitive
   });
 
   // Additional: case insensitive matching

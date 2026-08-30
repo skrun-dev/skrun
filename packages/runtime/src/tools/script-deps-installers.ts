@@ -150,10 +150,36 @@ function venvBinaryPath(depsPath: string, name: string): string {
     : join(depsPath, "venv", "bin", name);
 }
 
+/**
+ * Harness secrets that must NOT reach the (untrusted) dependency-installer
+ * subprocess (pip/npm run arbitrary postinstall scripts of untrusted deps).
+ * Installers need a wide OS env (PATH, HOME, proxies, CA bundles), so we
+ * DENYLIST secret-shaped names rather than allowlist. The `_KEY_ID$` /
+ * `ACCESS_KEY` arms catch S3 access-key IDs that a suffix-only `_KEY` check misses.
+ */
+const INSTALL_SECRET_DENYLIST = new Set([
+  "SKRUN_SECRETS_ENCRYPTION_KEY",
+  "WEBHOOK_SIGNING_KEY",
+  "DATABASE_URL",
+]);
+const INSTALL_SECRET_PATTERN =
+  /(SECRET|TOKEN|PASSWORD|PASSPHRASE|CREDENTIAL|ENCRYPTION|ACCESS_KEY|_KEY$|_KEY_ID$)/i;
+
+/** Clone `env` minus secret-shaped names — keeps the OS env pip/npm require. */
+export function stripHarnessSecrets(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const clean: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (value === undefined) continue;
+    if (INSTALL_SECRET_DENYLIST.has(name) || INSTALL_SECRET_PATTERN.test(name)) continue;
+    clean[name] = value;
+  }
+  return clean;
+}
+
 /** Env vars layered on top of `process.env` for every Python install spawn. */
 function pythonInstallEnv(): NodeJS.ProcessEnv {
   return {
-    ...process.env,
+    ...stripHarnessSecrets(process.env),
     // Confine network to PyPI's public mirror. NOT user-configurable in v1.
     PIP_INDEX_URL: PYPI_INDEX_URL,
     // Suppress `pip is out of date` chatter — purely cosmetic, fills logs.
@@ -312,7 +338,7 @@ const NODE_LOCKFILE_FILENAMES: Record<NonNullable<NodeManifest["lockfileKind"]>,
 /** Env vars layered on top of `process.env` for every Node install spawn. */
 function nodeInstallEnv(forYarn: boolean): NodeJS.ProcessEnv {
   return {
-    ...process.env,
+    ...stripHarnessSecrets(process.env),
     // Confine npm / pnpm to the public npm registry. NOT user-configurable in v1.
     npm_config_registry: NPM_REGISTRY_URL,
     // yarn (classic v1 + Berry) reads YARN_NPM_REGISTRY_SERVER for npm-protocol fetches.

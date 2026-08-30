@@ -41,15 +41,15 @@ export const bundleCache = createBundleCache();
  * Get a cached bundle extraction or extract and cache it.
  * Key format: "namespace/name/version"
  */
-export function getOrExtract(
+export async function getOrExtract(
   cache: TTLCache<string, BundleCacheEntry>,
   key: string,
   bundleBuffer: Buffer,
-): BundleCacheEntry {
+): Promise<BundleCacheEntry> {
   const cached = cache.get(key);
   if (cached) return cached;
 
-  const extracted = extractBundleToDisk(bundleBuffer);
+  const extracted = await extractBundleToDisk(bundleBuffer);
   const entry: BundleCacheEntry = { dir: extracted.dir, files: extracted.files };
   cache.set(key, entry);
   // Do NOT call extracted.cleanup — the cache owns the lifecycle now

@@ -1,39 +1,66 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
+import { packAgentTar } from "@skrun-dev/schema";
+import { type Headers, pack as tarPack } from "tar-stream";
 import { afterEach, describe, expect, it } from "vitest";
-import { extractFiles } from "./bundle.js";
+import { extractBundleToDisk, extractFiles } from "./bundle.js";
 
-// Minimal tar builder for the happy-path tests. Real bundles are produced by
-// the CLI; we just need enough structure here to round-trip an extractFiles().
-function tarOne(name: string, content: string): Buffer {
-  const header = Buffer.alloc(512);
-  header.write(name, 0, "utf-8");
-  const sizeOctal = content.length.toString(8).padStart(11, "0");
-  header.write(sizeOctal, 124, "utf-8");
-  const contentBuf = Buffer.from(content, "utf-8");
-  const padLen = (512 - (content.length % 512)) % 512;
-  return Buffer.concat([header, contentBuf, Buffer.alloc(padLen), Buffer.alloc(1024)]);
+// Build a gzipped tar with arbitrary entries (incl. a symlink) for the reader's
+// security tests — packAgentTar only emits regular files, so we drop to tar-stream.
+function packRaw(
+  entries: Array<{ name: string; type?: Headers["type"]; linkname?: string; content?: Buffer }>,
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const pack = tarPack();
+    const chunks: Buffer[] = [];
+    pack.on("data", (c: Buffer) => chunks.push(c));
+    pack.on("end", () => resolve(gzipSync(Buffer.concat(chunks))));
+    pack.on("error", reject);
+    for (const e of entries) {
+      const content = e.content ?? Buffer.alloc(0);
+      pack.entry(
+        {
+          name: e.name,
+          type: e.type ?? "file",
+          linkname: e.linkname,
+          size: content.length,
+          mtime: new Date(0),
+        },
+        content,
+      );
+    }
+    pack.finalize();
+  });
 }
 
 describe("extractFiles", () => {
-  it("decompresses + extracts a tiny single-file bundle", () => {
-    const tar = tarOne("hello.txt", "world");
-    const gz = gzipSync(tar);
-    const files = extractFiles(gz);
+  it("decompresses + extracts a tiny single-file bundle (VT-2)", async () => {
+    const gz = await packAgentTar([{ name: "hello.txt", content: Buffer.from("world") }]);
+    const files = await extractFiles(gz);
     expect(files["hello.txt"]).toBe("world");
   });
 
-  it("skips path-traversal entries (../escape.txt)", () => {
-    const tar = tarOne("../escape.txt", "leak");
-    const gz = gzipSync(tar);
-    const files = extractFiles(gz);
+  it("skips path-traversal entries (VT-5)", async () => {
+    const gz = await packAgentTar([{ name: "../escape.txt", content: Buffer.from("leak") }]);
+    const files = await extractFiles(gz);
     expect(files["../escape.txt"]).toBeUndefined();
+    expect(Object.keys(files)).toHaveLength(0);
   });
 
-  // VT-14 (SEC-010): the gzip-bomb fixture decompresses to ~60 MB, exceeding
-  // the 50 MB default cap. Must throw a clear "gzip-bomb defense" error
-  // instead of allocating 60 MB and (worst-case at a higher ratio) OOMing.
+  it("skips symlink entries even when the target escapes (VT-7)", async () => {
+    const gz = await packRaw([
+      { name: "SKILL.md", content: Buffer.from("# ok") },
+      { name: "evil", type: "symlink", linkname: "../../etc/passwd" },
+    ]);
+    const files = await extractFiles(gz);
+    expect(files["SKILL.md"]).toBe("# ok");
+    expect(files.evil).toBeUndefined();
+  });
+
+  // VT-14 (SEC-010): the gzip-bomb fixture decompresses to ~60 MB, exceeding the
+  // 50 MB default cap. Must reject with a clear "gzip-bomb defense" error instead
+  // of allocating 60 MB and (worst-case at a higher ratio) OOMing.
   describe("gzip-bomb defense (SEC-010)", () => {
     const previousCap = process.env.BUNDLE_MAX_DECOMPRESSED_MB;
     afterEach(() => {
@@ -41,41 +68,57 @@ describe("extractFiles", () => {
       else process.env.BUNDLE_MAX_DECOMPRESSED_MB = previousCap;
     });
 
-    it("VT-14: rejects a bundle whose decompressed size exceeds the cap", () => {
-      const bombPath = join(
-        import.meta.dirname,
-        "..",
-        "..",
-        "..",
-        "..",
-        "tests",
-        "fixtures",
-        "gzip-bomb-50mb.gz",
-      );
-      const bombGz = readFileSync(bombPath);
+    const bombPath = () =>
+      join(import.meta.dirname, "..", "..", "..", "..", "tests", "fixtures", "gzip-bomb-50mb.gz");
+
+    it("VT-14: rejects a bundle whose decompressed size exceeds the cap", async () => {
+      const bombGz = readFileSync(bombPath());
       // Sanity: the .gz on disk is tiny but decompresses huge.
       expect(bombGz.length).toBeLessThan(200 * 1024); // < 200 KB on disk
-      expect(() => extractFiles(bombGz)).toThrow(/gzip-bomb defense/);
+      await expect(extractFiles(bombGz)).rejects.toThrow(/gzip-bomb defense/);
     });
 
-    it("VT-14: BUNDLE_MAX_DECOMPRESSED_MB raises the cap when operators need bigger bundles", () => {
+    it("VT-14: BUNDLE_MAX_DECOMPRESSED_MB raises the cap when operators need bigger bundles", async () => {
       process.env.BUNDLE_MAX_DECOMPRESSED_MB = "100"; // 100 MB > 60 MB fixture
-      const bombPath = join(
-        import.meta.dirname,
-        "..",
-        "..",
-        "..",
-        "..",
-        "tests",
-        "fixtures",
-        "gzip-bomb-50mb.gz",
-      );
-      const bombGz = readFileSync(bombPath);
-      // The decompression succeeds (no throw); the result is a 60 MB buffer of
-      // zeros, which extractFiles parses as a tar — empty (no valid tar
-      // entries). Important: it does not throw the bomb defense error.
-      const files = extractFiles(bombGz);
+      const bombGz = readFileSync(bombPath());
+      // Decompresses to 60 MB of zeros → tar-stream reads it as an empty archive.
+      // Important: it does not throw the bomb defense error.
+      const files = await extractFiles(bombGz);
       expect(Object.keys(files)).toHaveLength(0);
     });
+  });
+});
+
+describe("extractBundleToDisk", () => {
+  it("writes binary assets byte-identically to disk (VT-9 / SC-6)", async () => {
+    const bin = Buffer.from(Array.from({ length: 256 }, (_, i) => i));
+    const gz = await packAgentTar([
+      { name: "SKILL.md", content: Buffer.from("# hi") },
+      { name: "assets/logo.bin", content: bin },
+    ]);
+    const { dir, files, cleanup } = await extractBundleToDisk(gz);
+    try {
+      const onDisk = readFileSync(join(dir, "assets", "logo.bin"));
+      expect(onDisk.equals(bin)).toBe(true); // raw bytes, not utf-8-mangled
+      expect(files["SKILL.md"]).toBe("# hi"); // text map still available for manifests
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("skips symlink + traversal entries on disk (VT-5 / VT-7)", async () => {
+    const gz = await packRaw([
+      { name: "SKILL.md", content: Buffer.from("# ok") },
+      { name: "evil", type: "symlink", linkname: "../../etc/passwd" },
+      { name: "../escape.txt", content: Buffer.from("leak") },
+    ]);
+    const { dir, files, cleanup } = await extractBundleToDisk(gz);
+    try {
+      expect(existsSync(join(dir, "SKILL.md"))).toBe(true);
+      expect(existsSync(join(dir, "evil"))).toBe(false);
+      expect(files["../escape.txt"]).toBeUndefined();
+    } finally {
+      cleanup();
+    }
   });
 });

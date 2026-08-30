@@ -2,6 +2,8 @@ import type { FileInfo, Logger } from "@skrun-dev/runtime";
 import { estimateCacheSavings } from "@skrun-dev/runtime";
 import type { Context } from "hono";
 import type { DbAdapter } from "../db/adapter.js";
+import { getUser } from "../middleware/auth.js";
+import { isMasterCredential } from "../services/key-scope.js";
 import { RegistryError } from "../services/registry.js";
 
 /**
@@ -19,6 +21,26 @@ export function dispatchRegistryError(c: Context, err: unknown): Response {
     return c.json({ error: { code: err.code, message: err.message } }, err.status);
   }
   throw err;
+}
+
+/**
+ * Account-management guard (R2). Returns a 403 `Response` to short-circuit when
+ * the caller is NOT a master credential (a session, a dev-token, or an
+ * account-wide full-operation key); `null` to proceed. Collapses the
+ * previously hand-rolled `KEY_SCOPE_FORBIDDEN` blocks (auth / registry /
+ * llm-key routes) into one canonical check + message.
+ */
+export function requireMasterCredential(c: Context): Response | null {
+  if (isMasterCredential(getUser(c))) return null;
+  return c.json(
+    {
+      error: {
+        code: "KEY_SCOPE_FORBIDDEN",
+        message: "This action requires an account-wide API key (or a session / dev-token).",
+      },
+    },
+    403,
+  );
 }
 
 /**

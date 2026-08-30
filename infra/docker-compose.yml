@@ -1,0 +1,217 @@
+# Skrun — prod-parity self-host stack.
+#
+# This file ships the FULL Postgres + MinIO + Redis stack so a self-host
+# deployment matches the cloud topology (skrun.sh) exactly. Operators
+# who want a smaller footprint (single-user, no shared cache, no S3
+# upload concerns) layer `docker-compose.minimal.yml` ON TOP — it drops
+# Postgres / MinIO / Redis in favor of the SQLite + LocalStorage defaults
+# the API already supports.
+#
+# Quickstart:
+#   cp ../.env.example .env
+#   # fill at least ANTHROPIC_API_KEY (or another LLM key)
+#   docker compose -f infra/docker-compose.yml up -d
+#   curl http://localhost/health
+#
+# Hardening (matches the cloud-runtime sandbox controls):
+#   - `read_only: true` rootfs (tmpfs over the writeable directories)
+#   - `cap_drop: [ALL]` zero capabilities
+#   - `user: '1000:1000'` non-root UID
+#   - `security_opt: ['no-new-privileges:true']` no privilege escalation
+#
+# NOTE (self-host unblock, 2026-05-28):
+#   Self-host docker-compose now boots end-to-end. The earlier blocker
+#   ("`DATABASE_URL=postgres://...` doesn't work because the api passes
+#   it to supabase-js which expects HTTPS") was since resolved —
+#   PostgresDb replaces the legacy SupabaseDb and accepts the standard
+#   connection string here. Migrations apply automatically on api boot.
+
+services:
+  api:
+    # Self-host runs the `api-server` target — the full image (API + dashboard +
+    # native-dep build tools). Default `:latest` = the latest STABLE release; for
+    # the dev/main line set RUNTIME_IMAGE_TAG=edge (the always-resolvable latest
+    # build).
+    #
+    # ⚠️ Here the variable holds the TAG ALONE (`edge`, `latest`, `v0.9.0`) — it is
+    # interpolated after the colon below. The api-server reads a variable of the SAME
+    # NAME as a FULL image reference (`ghcr.io/skrun-dev/skrun-runtime:edge`) when
+    # SKRUN_RUNTIME=flyio. Copying that form into this stack's .env produces
+    # `ghcr.io/skrun-dev/skrun-runtime:ghcr.io/...` and `docker compose up` fails on
+    # an invalid reference. The compose stack defaults to SKRUN_RUNTIME=local, where
+    # the api-server never reads the variable at all.
+    #
+    # The cloud's slim `runner` target is a separate, cloud-only artifact
+    # (served from a co-located registry) — self-host is unaffected. See the runner
+    # image tag policy in docs/self-hosting.md.
+    image: ghcr.io/skrun-dev/skrun-runtime:${RUNTIME_IMAGE_TAG:-latest}
+    container_name: skrun-api
+    environment:
+      SKRUN_CONTAINER_MODE: api-server
+      NODE_ENV: production
+      PORT: "4000"
+      # LLM keys — operator brings their own .env.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      # Webhook signing (REQUIRED for async-mode webhooks).
+      WEBHOOK_SIGNING_KEY: ${WEBHOOK_SIGNING_KEY:-}
+      # CORS allowed origins — REQUIRED in production. Set to your domain.
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+      # Operator dashboard — served at /dashboard by default. Uncomment for a
+      # headless, API-only server.
+      # SKRUN_DASHBOARD: "off"
+      # Postgres
+      DATABASE_URL: postgres://skrun:${POSTGRES_PASSWORD}@postgres:5432/skrun
+      # S3 / MinIO
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_BUCKET: ${S3_BUCKET:-skrun-bundles}
+      S3_REGION: us-east-1
+      # MCP TTL caches (Redis would back these in a future deployment).
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Sandbox hardening controls.
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /mnt/session/outputs
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # The api server listens on :4000 internally; Caddy fronts it on :80/:443.
+    expose:
+      - "4000"
+    restart: unless-stopped
+
+  # The credential interlock the stack cannot get from the
+  # images themselves.
+  #
+  # With the `:-` defaults removed, an unset variable interpolates to empty, and
+  # the two backing services disagree about what that means. Measured in CI, not
+  # assumed:
+  #
+  #   postgres → "Error: Database is uninitialized and superuser password is not
+  #              specified." — refuses, correctly.
+  #   minio    → "WARN: Detected default credentials 'minioadmin:minioadmin'" —
+  #              treats empty as UNSET and boots on the published default, which
+  #              is the finding itself.
+  #
+  # So the stack refuses on MinIO's behalf. Every service that needs a credential
+  # waits on this one; it exits non-zero before anything else starts, and says
+  # which variable is missing instead of failing somewhere downstream.
+  #
+  # The minimal overlay `!reset`s this along with the services it guards — that
+  # path runs on SQLite + local disk and legitimately has none of these.
+  preflight:
+    image: busybox:1.37.0
+    container_name: skrun-preflight
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+    command:
+      - sh
+      - -c
+      - |
+        missing=""
+        [ -n "$$POSTGRES_PASSWORD" ]   || missing="$$missing POSTGRES_PASSWORD"
+        [ -n "$$S3_ACCESS_KEY_ID" ]    || missing="$$missing S3_ACCESS_KEY_ID"
+        [ -n "$$S3_SECRET_ACCESS_KEY" ] || missing="$$missing S3_SECRET_ACCESS_KEY"
+        if [ -n "$$missing" ]; then
+          echo "FATAL: the Skrun stack has no default credentials. Missing:$$missing" >&2
+          echo "Set them in .env (see .env.example). Generate with: openssl rand -hex 16" >&2
+          echo "The minimal overlay (docker-compose.minimal.yml) needs none of them." >&2
+          exit 1
+        fi
+        echo "preflight: stack credentials present"
+    restart: "no"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: skrun-postgres
+    environment:
+      POSTGRES_USER: skrun
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: skrun
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    depends_on:
+      preflight:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skrun -d skrun"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: skrun-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY}
+    volumes:
+      - minio-data:/data
+    depends_on:
+      preflight:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    expose:
+      - "9000"
+      - "9001"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: skrun-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    expose:
+      - "6379"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: skrun-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile.example:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - api
+    environment:
+      DOMAIN: ${DOMAIN:-:80}
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  minio-data:
+  redis-data:
+  caddy-data:
+  caddy-config:

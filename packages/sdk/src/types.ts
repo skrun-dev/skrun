@@ -56,6 +56,18 @@ export interface EnvironmentOverride {
 export interface RunOptions {
   /** Caller-provided LLM API keys (provider → key). Maps to X-LLM-API-Key header. */
   llmKeys?: Record<string, string>;
+  /**
+   * The endpoint your key for each provider belongs to (provider → base URL).
+   * Maps to the X-LLM-Base-URL header.
+   *
+   * Only needed when you send `llmKeys` to an agent you do not own: such an
+   * agent may declare its own `model.base_url`, and the server refuses to send
+   * your key to an endpoint you did not choose (403
+   * `CALLER_BASE_URL_NOT_CONSENTED`). Declare the origin your key belongs to and
+   * the run proceeds; the refusal names the agent's origin so you can decide.
+   * Compared by origin — the path need not match.
+   */
+  llmBaseUrls?: Record<string, string>;
   /** Request timeout in milliseconds (overrides client default) */
   timeout?: number;
   /** Pin a specific agent version (strict semver, e.g. "1.2.0"). Omit to target latest. */
@@ -136,6 +148,12 @@ export interface AgentMetadata {
    */
   latest_version_verified: boolean;
   latest_version: string;
+  /**
+   * Access control. `private` (default) ⇒ only the owner/admin can run the
+   * agent; `public` ⇒ any authenticated caller can. Optional for forward
+   * compatibility with servers that predate the visibility field.
+   */
+  visibility?: "private" | "public";
   created_at: string;
   updated_at: string;
 }
@@ -268,11 +286,62 @@ export interface OutputValidationWarningEvent extends BaseRunEvent {
  * Known `error.code` values:
  *  - `OUTPUT_SCHEMA_INVALID` — final LLM output failed validation against the
  *    declared `outputs` schema and the auto-repair retry also failed.
+ *  - `COST_EXCEEDED` — the run's aggregate estimated cost exceeded the agent's
+ *    declared `environment.max_cost`; the run is aborted before completing.
  *  - any provider/runtime-specific code.
  */
 export interface RunErrorEvent extends BaseRunEvent {
   type: "run_error";
   error: { code: string; message: string };
+}
+
+/**
+ * Per-phase cold-start timing for a cloud runner spawn, in milliseconds.
+ * Mirrors `runtime.SpawnPhases`. Only `create_api_ms` is always present; the
+ * derived and in-VM fields are optional (an older runner image may not report
+ * them, so consumers must treat them as possibly-absent).
+ */
+export interface SpawnPhases {
+  /**
+   * The API round-trip that produced a runner. Normally the machine create; on a
+   * run served from a pre-warm pool it is the call that woke a pre-created
+   * machine instead.
+   */
+  create_api_ms: number;
+  /**
+   * Set when the run was served by a pre-created machine. Absent means no pool is
+   * configured; `false` means one is configured and this run missed it.
+   */
+  pool_hit?: boolean;
+  pool_resume_ms?: number;
+  pool_claim_ms?: number;
+  /**
+   * Whether the woken machine resumed from its snapshot or silently cold-booted —
+   * the platform treats the resume as an attempt, not a guarantee.
+   */
+  pool_resumed_from_snapshot?: boolean;
+  /**
+   * Fill-time phases. Absent on a pool-served run: there they would describe when
+   * the pool was filled rather than anything about this run.
+   */
+  host_schedule_pull_ms?: number;
+  vm_boot_ms?: number;
+  entrypoint_egress_ms?: number;
+  module_load_ms?: number;
+  init_bundle_ms?: number;
+  init_extract_ms?: number;
+  init_mcp_ms?: number;
+}
+
+/**
+ * Informational event carrying the cloud runner's per-phase cold-start
+ * breakdown, emitted once after the runner is ready (fills the gap between
+ * `run_start` and the first work event). Mirrors `runtime.RunnerSpawnedEvent`.
+ * Durations only — no machine id / private IP.
+ */
+export interface RunnerSpawnedEvent extends BaseRunEvent {
+  type: "runner_spawned";
+  phases: SpawnPhases;
 }
 
 export type RunEvent =
@@ -282,5 +351,6 @@ export type RunEvent =
   | ToolCallErrorEvent
   | LlmCompleteEvent
   | OutputValidationWarningEvent
+  | RunnerSpawnedEvent
   | RunCompleteEvent
   | RunErrorEvent;

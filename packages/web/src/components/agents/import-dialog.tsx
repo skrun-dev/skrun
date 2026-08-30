@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type ScannedAgent,
   useImportAgent,
@@ -108,6 +108,7 @@ function UploadTab({ onClose }: { onClose: () => void }) {
   const [version, setVersion] = useState("");
   const importAgent = useImportAgent();
   const me = useMe();
+  const fileInputRef = useRef<HTMLInputElement>(null);
   // Namespace mirrors the caller's auth context — the push endpoint refuses
   // cross-namespace pushes for non-admin callers (403) AND a cross-namespace
   // admin import would create an agent with `owner_id = admin.id` that the
@@ -211,12 +212,20 @@ function UploadTab({ onClose }: { onClose: () => void }) {
             bundle here
           </p>
         )}
-        <label>
-          <Btn variant="primary" className="cursor-pointer">
-            {file ? "Choose another file" : "Choose file"}
-          </Btn>
-          <input type="file" accept=".agent" onChange={handleFileInput} className="hidden" />
-        </label>
+        {/* The file input is triggered programmatically via the button's
+            onClick rather than wrapped in a <label>: a <button> nested in a
+            <label> swallows the click and never opens the native file picker
+            (the button is itself the label's interactive control). */}
+        <Btn variant="primary" onClick={() => fileInputRef.current?.click()}>
+          {file ? "Choose another file" : "Choose file"}
+        </Btn>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".agent"
+          onChange={handleFileInput}
+          className="hidden"
+        />
       </div>
 
       {/* Form fields — pre-filled from filename heuristic + auth context. */}

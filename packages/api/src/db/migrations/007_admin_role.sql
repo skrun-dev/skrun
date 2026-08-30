@@ -7,7 +7,10 @@
 -- admin (the sole role allowed to verify) can re-mint them after upgrade.
 -- See docs/self-hosting.md → Admin role for the rationale.
 
-BEGIN;
+-- Note: no `BEGIN;`/`COMMIT;` here — the migrations-runner wraps
+-- each file in a transaction at apply-time. Nested BEGIN inside an outer
+-- transaction would commit the inner half early. Lint check in
+-- migrations-runner.ts enforces this convention at boot.
 
 -- 1. Add the role column with a safe default. Existing rows acquire role='user'
 --    automatically. Promotion to 'admin' is a manual SQL UPDATE — there is no
@@ -21,5 +24,3 @@ ALTER TABLE users
 --    gate; reset them en masse so the dashboard "verified" badge means
 --    something consistent again.
 UPDATE agents SET verified = false WHERE verified = true;
-
-COMMIT;

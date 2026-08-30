@@ -1,5 +1,14 @@
 // @skrun-dev/schema — Parser & validator for Agent Skills format
 
+export type { AgentTarEntry, UnpackedAgentEntry } from "./bundle-tar.js";
+// Bundle tar codec (.agent wire format)
+export {
+  AGENT_BUNDLE_EXCLUDES,
+  isExcludedEntry,
+  isUnsafeName,
+  packAgentTar,
+  unpackAgentTar,
+} from "./bundle-tar.js";
 export type { CapabilityValidationOutcome, ModelCapabilities } from "./capability.js";
 // Capability matrix
 export {

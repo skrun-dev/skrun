@@ -1,3 +1,4 @@
+import { NotSupportedError } from "@skrun-dev/runtime";
 import type { StorageAdapter } from "./adapter.js";
 
 export class MemoryStorage implements StorageAdapter {
@@ -17,6 +18,20 @@ export class MemoryStorage implements StorageAdapter {
 
   async exists(key: string): Promise<boolean> {
     return this.store.has(key);
+  }
+
+  async getPresignedDownloadUrl(_key: string, _expiresIn: number): Promise<string> {
+    throw new NotSupportedError(
+      "MemoryStorage.getPresignedDownloadUrl",
+      "presigned URLs require an S3-compatible backend — use R2Storage",
+    );
+  }
+
+  async getPresignedUploadUrl(_key: string, _expiresIn: number): Promise<string> {
+    throw new NotSupportedError(
+      "MemoryStorage.getPresignedUploadUrl",
+      "presigned URLs require an S3-compatible backend — use R2Storage",
+    );
   }
 
   clear(): void {

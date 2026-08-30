@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { serve } from "@hono/node-server";
 import { isOAuthConfigured } from "./auth/github-oauth.js";
 import type { DbAdapter } from "./db/adapter.js";
@@ -6,14 +7,33 @@ import type { StorageAdapter } from "./storage/adapter.js";
 import { LocalStorage } from "./storage/local.js";
 import { MemoryStorage } from "./storage/memory.js";
 
+// Fail-secure dev-auth defaults for `pnpm dev:registry` (localhost). Set BEFORE
+// createApp: NODE_ENV=development keeps dev-auth inside the interlock's allowlist,
+// and SKRUN_DEV_AUTH=1 enables the `dev-token` admin shortcut. The published
+// image (server.ts) sets neither — fail-secure by default.
+process.env.NODE_ENV ??= "development";
+process.env.SKRUN_DEV_AUTH ??= "1";
+
 let db: DbAdapter;
 let storage: StorageAdapter;
 
 if (process.env.DATABASE_URL) {
-  const { SupabaseDb } = await import("./db/supabase.js");
-  db = new SupabaseDb(process.env.DATABASE_URL, process.env.SUPABASE_KEY ?? "");
+  // Postgres branch — auto-apply migrations on boot: a first-time dev with
+  // DATABASE_URL=postgres://... on an empty DB gets zero-friction migrate.
+  // Same auto-apply contract as server.ts (cloud + self-host).
+  const { PostgresDb } = await import("./db/postgres.js");
+  const { runMigrations } = await import("./db/migrations-runner.js");
+  const pgDb = new PostgresDb(process.env.DATABASE_URL);
+  const migResult = await runMigrations(pgDb.getPool(), join(import.meta.dirname, "db/migrations"));
+  db = pgDb;
   storage = new MemoryStorage();
-  console.log("  Storage: Supabase + memory bundles");
+  console.log(
+    `  Storage: Postgres + memory bundles (migrations applied=${migResult.applied} backfilled=${migResult.backfilled} skipped=${migResult.skipped})`,
+  );
+  // Bundle-hash backfill (Postgres path only — the SQLite branch
+  // already has the column via SCHEMA and never runs migrations).
+  const { backfillBundleHashes } = await import("./db/backfill-bundle-hashes.js");
+  await backfillBundleHashes(pgDb, storage);
 } else {
   const { SqliteDb } = await import("./db/sqlite.js");
   db = new SqliteDb();

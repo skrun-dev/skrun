@@ -1,8 +1,10 @@
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { McpServer } from "@skrun-dev/schema";
 import { McpConnectError } from "../errors.js";
 import type { Logger } from "../logger.js";
 import { createLogger } from "../logger.js";
 import { isHostAllowed } from "../security/network.js";
+import { createGuardedFetch } from "../security/safe-fetch.js";
 import type { ToolDefinition, ToolProvider, ToolResult } from "./types.js";
 
 // Bumped from 30s to 120s after empirical measurement: `npx -y @playwright/mcp`
@@ -36,8 +38,7 @@ export class McpToolProvider implements ToolProvider {
   private tools: ToolDefinition[] = [];
   private connected = false;
   private logger: Logger;
-  // biome-ignore lint/suspicious/noExplicitAny: MCP SDK Client type not easily importable at top level
-  private client: any = null;
+  private client: Client | null = null;
 
   private allowedHosts: string[];
   private connectTimeoutMs: number;
@@ -155,6 +156,7 @@ export class McpToolProvider implements ToolProvider {
     // falls back to DEFAULT_REQUEST_TIMEOUT_MSEC (60s) and any larger
     // skrun-side bound is unreachable (same constraint Anthropic
     // documents in claude-code #16837). Single source of truth.
+    if (!this.client) throw new Error("MCP client not initialized");
     await this.client.connect(transport, { timeout: this.connectTimeoutMs });
   }
 
@@ -169,7 +171,12 @@ export class McpToolProvider implements ToolProvider {
 
     const { SSEClientTransport } = await import("@modelcontextprotocol/sdk/client/sse.js");
     const url = this.config.url ?? "";
-    const transport = new SSEClientTransport(new URL(url));
+    // SSRF guard: validate the RESOLVED IP at connect time (the string host check
+    // above can't see DNS). The SDK routes every transport request through this fetch.
+    const transport = new SSEClientTransport(new URL(url), {
+      fetch: createGuardedFetch() as unknown as typeof fetch,
+    });
+    if (!this.client) throw new Error("MCP client not initialized");
     await this.client.connect(transport, { timeout: this.connectTimeoutMs });
   }
 
@@ -186,7 +193,11 @@ export class McpToolProvider implements ToolProvider {
       "@modelcontextprotocol/sdk/client/streamableHttp.js"
     );
     const url = this.config.url ?? "";
-    const transport = new StreamableHTTPClientTransport(new URL(url));
+    // SSRF guard: validate the RESOLVED IP at connect time (see connectSSE).
+    const transport = new StreamableHTTPClientTransport(new URL(url), {
+      fetch: createGuardedFetch() as unknown as typeof fetch,
+    });
+    if (!this.client) throw new Error("MCP client not initialized");
     await this.client.connect(transport, { timeout: this.connectTimeoutMs });
   }
 
@@ -228,11 +239,14 @@ export class McpToolProvider implements ToolProvider {
   }
 
   private async executeCallTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
-    const result = await this.client.callTool({ name, arguments: args });
+    if (!this.client) throw new Error("MCP client not initialized");
+    // The SDK types callTool's result loosely; narrow the content/isError shape.
+    const result = (await this.client.callTool({ name, arguments: args })) as {
+      content?: Array<{ type: string; text?: string }>;
+      isError?: boolean;
+    };
     const content =
-      result.content
-        ?.map((c: { type: string; text?: string }) => (c.type === "text" ? c.text : ""))
-        .join("") ?? "";
+      result.content?.map((c) => (c.type === "text" ? (c.text ?? "") : "")).join("") ?? "";
     return { content, isError: result.isError ?? false };
   }
 

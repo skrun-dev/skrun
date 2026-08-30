@@ -64,7 +64,7 @@ You shipped an AI capability. It works on your machine. But every user, every cu
 - ✅ Your skill stays in your repo, in the format you choose. Skrun is a deployment target — your repo stays the source of truth.
 - ✅ Compatible with the [Agent Skills open standard](https://agentskills.io) (`SKILL.md`) and [AGENTS.md](https://agents.md) (Linux Foundation). Your existing skill works.
 - ✅ Users bring their own LLM keys. You're never on the hook for their costs.
-- ✅ Self-host on your infrastructure (Node 20+, SQLite or Postgres). [Self-hosting guide](docs/self-hosting.md). Cloud (coming soon).
+- ✅ Self-host on your infrastructure (Node 22+, SQLite or Postgres). [Self-hosting guide](docs/self-hosting.md). Cloud (coming soon).
 - ✅ MIT. Multi-model: Claude, GPT, Gemini, Mistral, Groq, Grok, Ollama.
 - ✅ Wrap existing scripts gradually. No big-bang rewrite required.
 
@@ -134,7 +134,7 @@ curl -X POST http://localhost:4000/api/agents/dev/my-skill/run \
   -d '{"input": {"query": "analyze this"}}'
 ```
 
-> `dev-token` is for local development. In production, authenticate via [GitHub OAuth or API keys](docs/api.md#authentication) — your GitHub username becomes your namespace, and a separate admin role gates `skrun verify`.
+> `dev-token` is for local development. In production, authenticate via [GitHub OAuth or API keys](docs/api.md#authentication) — your GitHub username becomes your namespace, and `skrun verify` is governed by the operator [verification policy](docs/self-hosting.md#verification-policy) (admin-only by default; creators can self-attest under `owner`).
 
 → **[10-minute tutorial](docs/getting-started.md)** · **[Concepts](docs/concepts.md)** · **[API reference](docs/api.md)**
 
@@ -194,7 +194,7 @@ console.log(pinned.agent_version); // "1.2.0" — always echoed back
 await client.push("dev/code-review", bundle, "1.3.0", { message: "Added retry logic" });
 ```
 
-9 methods: `run`, `stream`, `runAsync`, `push`, `pull`, `list`, `getAgent`, `getVersions`, `verify`. **Zero runtime dependencies**, Node.js 20+.
+10 methods: `run`, `stream`, `runAsync`, `push`, `pull`, `list`, `getAgent`, `getVersions`, `verifyVersion`, `setVisibility`. **Zero runtime dependencies**, Node.js 20+.
 
 ---
 
@@ -206,13 +206,14 @@ await client.push("dev/code-review", bundle, "1.3.0", { message: "Added retry lo
 | 🔧 **Tool calling** | Local scripts (`scripts/`) + MCP servers (`npx`) — same ecosystem as Claude Desktop |
 | 💾 **Stateful** | Agents remember across runs via key-value state |
 | 📡 **Streaming** | SSE real-time events (`run_start` → `tool_call` → `run_complete`) + async webhooks |
-| 📦 **Typed SDK** | `npm install @skrun-dev/sdk` — `run()`, `stream()`, `runAsync()` + 6 more methods |
+| 📦 **Typed SDK** | `npm install @skrun-dev/sdk` — `run()`, `stream()`, `runAsync()` + 7 more methods |
 | 📊 **Operator Dashboard** | Web UI at `/dashboard` — agents, runs, stats, settings, integrated playground with SSE streaming |
 | 📖 **Interactive API docs** | OpenAPI 3.1 schema + Scalar explorer at `GET /docs` |
 | 🔐 **Production auth** | GitHub OAuth login + API keys (`sk_live_*`) + multi-tenant namespaces |
-| 🗄️ **Persistent storage** | Pluggable database — SQLite for local dev (zero-config, file-based), Supabase PostgreSQL for production |
-| 🔑 **Caller keys** | Users bring their own LLM keys via `X-LLM-API-Key` — zero cost for operators |
+| 🗄️ **Persistent storage** | Pluggable database — SQLite for local dev (zero-config, file-based), any standard Postgres for production (Supabase, Neon, RDS, Fly Postgres… — no vendor lock-in) |
+| 🔑 **Caller keys** | Users bring their own LLM keys via `X-LLM-API-Key` — zero cost for operators. A key only ever goes to an endpoint its **owner** chose: an agent may declare its own `model.base_url`, so running someone else's agent with your key means naming the origin you expect (`X-LLM-Base-URL`), and the server never pairs its own key with an agent-chosen endpoint unless the operator opts in |
 | ✅ **Agent verification** | Verified flag controls script execution — safe for third-party agents |
+| 🔒 **Private by default** | Every agent is `private` — only its owner/admin can `POST /run`; non-owners get an opaque 404 and can't override the agent's declared environment. Agents are private-only for now — `public` is a marketplace capability whose set-path ships later |
 | 📌 **Version pinning + notes** | Pin a specific agent version per call (`version: "1.2.0"`) or attach a note at push (`-m "..."`) — reproducible integrations, visible changelog |
 | 🌍 **Environment separation** | Agent behavior (model, tools) separated from runtime environment (networking, timeout, sandbox). Per-run overrides via POST /run body |
 | 📁 **Files API** | Unified `/api/files` namespace for both directions — upload binary inputs (image/PDF/audio) via `POST /api/files`, download agent-produced artifacts via `GET /api/files/:id/content` |
@@ -221,6 +222,7 @@ await client.push("dev/code-review", bundle, "1.3.0", { message: "Added retry lo
 | 🎯 **Tool choice** | Force the LLM to invoke a specific tool (top-level `tool_choice: <name>`), require any tool (`tool_choice: required`), block tool use (`none`), or mark per-tool invariants with `required: true`. Native cross-provider support (Anthropic / Gemini / OpenAI / xAI) with graceful soft-fallback when a directive isn't natively supported. |
 | 💸 **Native prompt caching** | Automatic across 5 providers (Anthropic / OpenAI / Gemini / xAI / Groq) — 30-90% input cost savings on repeated content (system prompts + tools + reference documents). Anthropic gets explicit `cache_control` injection on the system + tools prefixes; OpenAI / xAI / Groq / Gemini benefit from implicit caching. Cost-tracking accuracy improves to ±5% of provider invoice via the new `cache_read_tokens` / `cache_write_tokens` fields in `usage`. Track dollar savings live (`cost.saved`) and on the dashboard. |
 | 📊 **Structured logs** | JSON to stdout via pino — pipe to Axiom, Datadog, ELK. `LOG_LEVEL` env var controls verbosity |
+| ☁️ **Cloud deployment** | `SKRUN_RUNTIME=flyio` spawns a dedicated ephemeral sandbox machine per run. The harness drives the LLM loop and holds every credential; the sandbox runs agent code with zero LLM/DB/S3 keys, read-only rootfs, non-root UID, iptables egress allowlist, zero capabilities. Self-host `docker-compose` applies the same container-level hardening (read-only rootfs, non-root, cap-drop, no-new-privileges); the per-run micro-VM + zero-credential sandbox are cloud-only (self-host runs agents in-process). |
 
 ---
 
@@ -311,11 +313,13 @@ curl http://localhost:4000/api/runs/<run_id>/files/CHANGELOG.md \
 | `skrun test` | Run agent tests (real LLM) |
 | `skrun build` | Package `.agent` bundle |
 | `skrun push -m "note"` | Push with a version note |
-| `skrun verify <ns>/<name>@<v>` | Mint admin-verified trust on a version (admin only) |
-| `skrun unverify <ns>/<name>@<v>` | Revoke verification (admin only) |
+| `skrun verify <ns>/<name>@<v>` | Attest a version (authority per the verification policy — admin by default) |
+| `skrun unverify <ns>/<name>@<v>` | Revoke verification (authority per the verification policy) |
 | `skrun run <ns>/<name>[@<v>]` | Invoke an agent — `-i` inline, `-f` file, `--stdin` pipe |
 | `skrun deploy -m "note"` | Build + push + live URL |
 | `skrun pull <agent>` | Download agent bundle |
+| `skrun keys create --agent <ns>/<name> --run-only` | Mint a scoped/restricted API key (e.g. a run-only client key) |
+| `skrun llm-key set <provider> --agent <ns>/<name>` | Attach your LLM key so callers run the agent on your key (key from stdin / `--key-env`) |
 | `skrun login` / `logout` | Authentication (OAuth or token) |
 | `skrun logs <agent>` | Execution logs (planned) |
 
@@ -327,8 +331,17 @@ curl http://localhost:4000/api/runs/<run_id>/files/CHANGELOG.md \
 
 Skrun is MIT — deploy anywhere.
 
-- **SQLite (default)** — zero config, file-based, survives restarts. Good for local dev and single-node.
-- **Supabase** — production-grade PostgreSQL. Set `DATABASE_URL` + `SUPABASE_KEY`.
+```bash
+# Recommended: prod-parity docker compose stack (Postgres + MinIO + Redis + Caddy)
+git clone https://github.com/skrun-dev/skrun.git && cd skrun
+cp .env.example .env   # fill at least one LLM key
+docker compose -f infra/docker-compose.yml up -d
+curl http://localhost/health   # → {"status":"ok"}
+```
+
+- 🐳 **Docker Compose** — `docker compose up` brings the prod-parity stack (Postgres + MinIO + Redis + Caddy) live with every sandbox hardening control on by default. See **[self-hosting with Docker](docs/self-hosting-docker.md)**.
+- **SQLite (bare-metal)** — zero config, file-based, survives restarts. Good for local dev and single-node.
+- **Postgres** — production-grade. Any host works (Supabase, Neon, RDS, Fly Postgres…) via `DATABASE_URL=postgres://…`. No vendor lock-in.
 - **Any cloud** — Fly.io, AWS, GCP, Hetzner, bare metal. Caddy or nginx in front.
 - **GitHub OAuth** — users sign in with GitHub, their username becomes their namespace.
 

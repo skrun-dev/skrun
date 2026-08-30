@@ -1,6 +1,20 @@
 import { randomUUID } from "node:crypto";
 import type { DbAdapter } from "./adapter.js";
-import type { Agent, AgentVersion, ApiKey, Environment, Run, RunStatus, User } from "./schema.js";
+import {
+  type Agent,
+  type AgentLlmKeyInfo,
+  type AgentLlmKeyPolicy,
+  type AgentLlmKeyRecord,
+  type AgentVersion,
+  API_KEY_DEFAULT_SCOPES,
+  type ApiKey,
+  type ApiKeyScopeKind,
+  type DeviceCode,
+  type Environment,
+  type Run,
+  type RunStatus,
+  type User,
+} from "./schema.js";
 
 export class MemoryDb implements DbAdapter {
   private agents = new Map<string, Agent>();
@@ -10,6 +24,12 @@ export class MemoryDb implements DbAdapter {
   private usersByGithubId = new Map<string, string>();
   private apiKeys = new Map<string, ApiKey>();
   private apiKeysByHash = new Map<string, string>();
+  /** keyId -> granted agent ids (only for scope_kind === 'agents' keys). */
+  private apiKeyAgents = new Map<string, string[]>();
+  /** agentId -> creator-attached encrypted LLM keys (one row per provider). */
+  private agentLlmKeys = new Map<string, (AgentLlmKeyRecord & { updated_at: string })[]>();
+  /** device_code_hash -> in-flight CLI device-login code (RFC 8628). */
+  private deviceCodes = new Map<string, DeviceCode>();
   private runs = new Map<string, Run>();
   private environments = new Map<string, Environment>();
 
@@ -24,12 +44,15 @@ export class MemoryDb implements DbAdapter {
     namespace: string;
     description: string;
     owner_id: string;
+    visibility?: "private" | "public";
   }): Promise<Agent> {
     const key = this.agentKey(data.namespace, data.name);
     const now = new Date().toISOString();
     const agent: Agent = {
       id: randomUUID(),
       ...data,
+      visibility: data.visibility ?? "private",
+      llm_key_policy: "open",
       created_at: now,
       updated_at: now,
     };
@@ -91,12 +114,49 @@ export class MemoryDb implements DbAdapter {
     return target;
   }
 
+  async setVisibility(
+    namespace: string,
+    name: string,
+    visibility: "private" | "public",
+  ): Promise<Agent | null> {
+    const agent = this.agents.get(this.agentKey(namespace, name));
+    if (!agent) return null;
+    agent.visibility = visibility;
+    agent.updated_at = new Date().toISOString();
+    return agent;
+  }
+
+  async setLlmKeyPolicy(
+    namespace: string,
+    name: string,
+    policy: AgentLlmKeyPolicy,
+  ): Promise<Agent | null> {
+    const agent = this.agents.get(this.agentKey(namespace, name));
+    if (!agent) return null;
+    agent.llm_key_policy = policy;
+    agent.updated_at = new Date().toISOString();
+    return agent;
+  }
+
   async deleteAgent(namespace: string, name: string): Promise<boolean> {
     const key = this.agentKey(namespace, name);
     const agent = this.agents.get(key);
     if (!agent) return false;
     this.versions.delete(agent.id);
     this.agents.delete(key);
+    // Cascade: drop this agent from any scoped-key grants (mirrors the
+    // api_key_agents FK ON DELETE CASCADE — keeps a now-grantless 'agents'
+    // key fail-closed = deny-all rather than dangling).
+    for (const [keyId, ids] of this.apiKeyAgents) {
+      if (ids.includes(agent.id)) {
+        const next = ids.filter((aid) => aid !== agent.id);
+        if (next.length === 0) this.apiKeyAgents.delete(keyId);
+        else this.apiKeyAgents.set(keyId, next);
+      }
+    }
+    // Cascade: drop this agent's creator LLM keys (mirrors the agent_llm_keys
+    // FK ON DELETE CASCADE).
+    this.agentLlmKeys.delete(agent.id);
     return true;
   }
 
@@ -108,6 +168,7 @@ export class MemoryDb implements DbAdapter {
       version: string;
       size: number;
       bundle_key: string;
+      bundle_sha256?: string | null;
       config_snapshot?: Record<string, unknown>;
       notes?: string | null;
     },
@@ -118,6 +179,7 @@ export class MemoryDb implements DbAdapter {
       version: data.version,
       size: data.size,
       bundle_key: data.bundle_key,
+      bundle_sha256: data.bundle_sha256 ?? null,
       config_snapshot: data.config_snapshot,
       notes: data.notes ?? null,
       pushed_at: new Date().toISOString(),
@@ -156,6 +218,27 @@ export class MemoryDb implements DbAdapter {
     if (!versions) return;
     const filtered = versions.filter((v) => v.version !== version);
     this.versions.set(agentId, filtered);
+  }
+
+  async listVersionsMissingHash(): Promise<Array<{ id: string; bundle_key: string }>> {
+    const missing: Array<{ id: string; bundle_key: string }> = [];
+    for (const versions of this.versions.values()) {
+      for (const v of versions) {
+        if (v.bundle_sha256 == null) missing.push({ id: v.id, bundle_key: v.bundle_key });
+      }
+    }
+    return missing;
+  }
+
+  async setVersionBundleHash(versionId: string, bundleSha256: string): Promise<void> {
+    for (const versions of this.versions.values()) {
+      for (const v of versions) {
+        if (v.id === versionId) {
+          v.bundle_sha256 = bundleSha256;
+          return;
+        }
+      }
+    }
   }
 
   // --- Agent State ---
@@ -232,6 +315,8 @@ export class MemoryDb implements DbAdapter {
     key_prefix: string;
     name: string;
     scopes?: string[];
+    scope_kind?: ApiKeyScopeKind;
+    agents?: string[];
     expires_at?: string;
   }): Promise<ApiKey> {
     const apiKey: ApiKey = {
@@ -240,14 +325,25 @@ export class MemoryDb implements DbAdapter {
       key_hash: data.key_hash,
       key_prefix: data.key_prefix,
       name: data.name,
-      scopes: data.scopes ?? [],
+      scopes: data.scopes ?? [...API_KEY_DEFAULT_SCOPES],
+      scope_kind: data.scope_kind ?? "account",
       last_used_at: null,
       expires_at: data.expires_at ?? null,
       created_at: new Date().toISOString(),
     };
     this.apiKeys.set(apiKey.id, apiKey);
     this.apiKeysByHash.set(apiKey.key_hash, apiKey.id);
+    if (data.agents && data.agents.length > 0) {
+      this.apiKeyAgents.set(apiKey.id, [...data.agents]);
+    }
     return apiKey;
+  }
+
+  /** Mirror `runs.api_key_id` FK ON DELETE SET NULL when a key is revoked. */
+  private nullifyApiKeyOnRuns(keyId: string): void {
+    for (const run of this.runs.values()) {
+      if (run.api_key_id === keyId) run.api_key_id = null;
+    }
   }
 
   async deleteApiKey(id: string): Promise<boolean> {
@@ -255,6 +351,8 @@ export class MemoryDb implements DbAdapter {
     if (!key) return false;
     this.apiKeysByHash.delete(key.key_hash);
     this.apiKeys.delete(id);
+    this.apiKeyAgents.delete(id);
+    this.nullifyApiKeyOnRuns(id);
     return true;
   }
 
@@ -263,6 +361,8 @@ export class MemoryDb implements DbAdapter {
     if (!key || key.user_id !== userId) return false;
     this.apiKeysByHash.delete(key.key_hash);
     this.apiKeys.delete(id);
+    this.apiKeyAgents.delete(id);
+    this.nullifyApiKeyOnRuns(id);
     return true;
   }
 
@@ -277,6 +377,127 @@ export class MemoryDb implements DbAdapter {
     }
   }
 
+  async getApiKeyAgentIds(keyId: string): Promise<string[]> {
+    return [...(this.apiKeyAgents.get(keyId) ?? [])];
+  }
+
+  // --- Device codes (CLI device-login flow, RFC 8628) ---
+
+  async createDeviceCode(data: {
+    device_code_hash: string;
+    user_code_hash: string;
+    code_challenge: string;
+    expires_at: string;
+    current_interval?: number;
+  }): Promise<void> {
+    this.deviceCodes.set(data.device_code_hash, {
+      device_code_hash: data.device_code_hash,
+      user_code_hash: data.user_code_hash,
+      code_challenge: data.code_challenge,
+      status: "pending",
+      user_id: null,
+      current_interval: data.current_interval ?? 5,
+      attempt_count: 0,
+      created_at: new Date().toISOString(),
+      expires_at: data.expires_at,
+      last_polled_at: null,
+    });
+  }
+
+  async getDeviceCodeByDeviceHash(deviceCodeHash: string): Promise<DeviceCode | null> {
+    return this.deviceCodes.get(deviceCodeHash) ?? null;
+  }
+
+  async getDeviceCodeByUserHash(userCodeHash: string): Promise<DeviceCode | null> {
+    for (const dc of this.deviceCodes.values()) {
+      if (dc.user_code_hash === userCodeHash) return dc;
+    }
+    return null;
+  }
+
+  async authorizeDeviceCode(userCodeHash: string, userId: string): Promise<boolean> {
+    for (const dc of this.deviceCodes.values()) {
+      if (dc.user_code_hash === userCodeHash && dc.status === "pending") {
+        dc.status = "authorized";
+        dc.user_id = userId;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async recordDeviceCodePoll(deviceCodeHash: string, slowDown: boolean): Promise<void> {
+    const dc = this.deviceCodes.get(deviceCodeHash);
+    if (!dc) return;
+    dc.last_polled_at = new Date().toISOString();
+    if (slowDown) dc.current_interval += 5;
+  }
+
+  async incrementDeviceCodeAttempts(deviceCodeHash: string): Promise<number> {
+    const dc = this.deviceCodes.get(deviceCodeHash);
+    if (!dc) return 0;
+    dc.attempt_count += 1;
+    return dc.attempt_count;
+  }
+
+  async consumeDeviceCode(deviceCodeHash: string): Promise<void> {
+    this.deviceCodes.delete(deviceCodeHash);
+  }
+
+  async purgeExpiredDeviceCodes(): Promise<void> {
+    const now = Date.now();
+    for (const [hash, dc] of this.deviceCodes) {
+      if (new Date(dc.expires_at).getTime() < now) this.deviceCodes.delete(hash);
+    }
+  }
+
+  // --- Agent LLM keys (creator-attached, encrypted) ---
+
+  async setAgentLlmKey(
+    agentId: string,
+    provider: string,
+    ciphertext: string,
+    last4: string,
+    keyVersion: number,
+  ): Promise<void> {
+    const next = (this.agentLlmKeys.get(agentId) ?? []).filter((r) => r.provider !== provider);
+    next.push({
+      agent_id: agentId,
+      provider,
+      ciphertext,
+      last4,
+      key_version: keyVersion,
+      updated_at: new Date().toISOString(),
+    });
+    this.agentLlmKeys.set(agentId, next);
+  }
+
+  async deleteAgentLlmKey(agentId: string, provider: string): Promise<void> {
+    const rows = this.agentLlmKeys.get(agentId);
+    if (!rows) return;
+    const next = rows.filter((r) => r.provider !== provider);
+    if (next.length === 0) this.agentLlmKeys.delete(agentId);
+    else this.agentLlmKeys.set(agentId, next);
+  }
+
+  async listAgentLlmKeys(agentId: string): Promise<AgentLlmKeyInfo[]> {
+    return (this.agentLlmKeys.get(agentId) ?? []).map((r) => ({
+      provider: r.provider,
+      last4: r.last4,
+      updated_at: r.updated_at,
+    }));
+  }
+
+  async getAgentLlmKeySecrets(agentId: string): Promise<AgentLlmKeyRecord[]> {
+    return (this.agentLlmKeys.get(agentId) ?? []).map((r) => ({
+      agent_id: r.agent_id,
+      provider: r.provider,
+      ciphertext: r.ciphertext,
+      last4: r.last4,
+      key_version: r.key_version,
+    }));
+  }
+
   // --- Runs ---
 
   async createRun(data: {
@@ -286,8 +507,10 @@ export class MemoryDb implements DbAdapter {
     model?: string | null;
     environment_id?: string | null;
     user_id?: string | null;
+    api_key_id?: string | null;
     status: RunStatus;
     input?: Record<string, unknown>;
+    created_at?: string;
   }): Promise<Run> {
     const run: Run = {
       id: data.id,
@@ -296,6 +519,7 @@ export class MemoryDb implements DbAdapter {
       model: data.model ?? null,
       environment_id: data.environment_id ?? null,
       user_id: data.user_id ?? null,
+      api_key_id: data.api_key_id ?? null,
       status: data.status,
       input: data.input ?? null,
       output: null,
@@ -308,8 +532,11 @@ export class MemoryDb implements DbAdapter {
       usage_cache_write_tokens: 0,
       usage_cache_savings_usd: 0,
       duration_ms: null,
+      machine_id: null,
+      private_ip: null,
+      phase_timings: null,
       files: null,
-      created_at: new Date().toISOString(),
+      created_at: data.created_at ?? new Date().toISOString(),
       completed_at: null,
     };
     this.runs.set(run.id, run);
@@ -334,6 +561,9 @@ export class MemoryDb implements DbAdapter {
         | "duration_ms"
         | "files"
         | "completed_at"
+        | "machine_id"
+        | "private_ip"
+        | "phase_timings"
       >
     >,
   ): Promise<Run | null> {
@@ -373,16 +603,21 @@ export class MemoryDb implements DbAdapter {
   // --- Stats ---
 
   async getStats(opts?: { userId?: string }) {
-    const agents_count = this.agents.size;
+    // Per-user multi-tenancy: count only the caller's own agents (owner_id),
+    // matching the user_id filter applied to the run aggregates below.
+    const agents_count = opts?.userId
+      ? [...this.agents.values()].filter((a) => a.owner_id === opts.userId).length
+      : this.agents.size;
 
     const now = new Date();
+    // Calendar-day anchor — for the per-day sparkline buckets only.
     const todayStart = new Date(now);
     todayStart.setUTCHours(0, 0, 0, 0);
-    const todayISO = todayStart.toISOString();
 
-    const yesterdayStart = new Date(todayStart);
-    yesterdayStart.setUTCDate(yesterdayStart.getUTCDate() - 1);
-    const yesterdayISO = yesterdayStart.toISOString();
+    // Rolling windows — headline today/yesterday tiles are trailing 24h / prior
+    // 24h (not UTC calendar days). Field names kept for wire compatibility.
+    const last24hISO = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+    const prev24hISO = new Date(now.getTime() - 48 * 60 * 60 * 1000).toISOString();
 
     const dailyRuns = new Array<number>(7).fill(0);
     const dailyTokens = new Array<number>(7).fill(0);
@@ -411,13 +646,13 @@ export class MemoryDb implements DbAdapter {
       const isFailed = run.status === "failed";
       const cacheSavings = run.usage_cache_savings_usd ?? 0;
       const cost = run.usage_estimated_cost ?? 0;
-      if (run.created_at >= todayISO) {
+      if (run.created_at >= last24hISO) {
         runs_today++;
         tokens_today += run.usage_total_tokens;
         cache_savings_today += cacheSavings;
         cost_today += cost;
         if (isFailed) failed_today++;
-      } else if (run.created_at >= yesterdayISO) {
+      } else if (run.created_at >= prev24hISO) {
         runs_yesterday++;
         tokens_yesterday += run.usage_total_tokens;
         cache_savings_yesterday += cacheSavings;
@@ -618,6 +853,8 @@ export class MemoryDb implements DbAdapter {
     this.usersByGithubId.clear();
     this.apiKeys.clear();
     this.apiKeysByHash.clear();
+    this.agentLlmKeys.clear();
+    this.deviceCodes.clear();
     this.runs.clear();
     this.environments.clear();
   }

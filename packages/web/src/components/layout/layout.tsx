@@ -4,7 +4,7 @@ import { Header } from "./header";
 import { Sidebar } from "./sidebar";
 
 export function Layout() {
-  const { isLoading, isOAuthMode, user } = useAuth();
+  const { isLoading, user } = useAuth();
 
   if (isLoading) {
     return (
@@ -14,8 +14,10 @@ export function Layout() {
     );
   }
 
-  // OAuth mode but not logged in → redirect to login
-  if (isOAuthMode && !user) {
+  // Not logged in → redirect to login (server-rendered page, outside the SPA).
+  // Covers both OAuth-configured (no session) and no-OAuth/dev-auth-off (rejected
+  // dev-token) instances — neither must render the dashboard for an anonymous visitor.
+  if (!user) {
     window.location.href = "/login";
     return null;
   }

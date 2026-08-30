@@ -1,65 +1,46 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
-import { Readable } from "node:stream";
-import { createGunzip } from "node:zlib";
+import { dirname, join, resolve, sep } from "node:path";
+import { isUnsafeName, unpackAgentTar } from "@skrun-dev/schema";
 import type { Command } from "commander";
 import { getRegistryUrl, getToken } from "../utils/auth.js";
 import * as format from "../utils/format.js";
 import { RegistryClient } from "../utils/registry-client.js";
 
-// Simple tar extractor for POSIX ustar format
-function extractTar(tarBuffer: Buffer, outputDir: string): number {
-  let offset = 0;
+// Cap decompressed bundle size (gzip-bomb defense), matching the server default.
+const MAX_DECOMPRESSED_BYTES = 50 * 1024 * 1024;
+
+/**
+ * Extract a .agent bundle (tar.gz) into `outputDir`, writing raw bytes so binary
+ * assets survive. Unlike the API reader (which SKIPS bad entries for hot-path
+ * resilience), the CLI THROWS on any unsafe entry — a pulled bundle containing
+ * path-traversal names or symlinks is a hard error the user should see. Returns
+ * the number of files written.
+ */
+export async function extractBundle(gzBuffer: Buffer, outputDir: string): Promise<number> {
+  const entries = await unpackAgentTar(gzBuffer, { maxBytes: MAX_DECOMPRESSED_BYTES });
+  const root = resolve(outputDir);
   let fileCount = 0;
 
-  while (offset < tarBuffer.length - 512) {
-    // Read header
-    const header = tarBuffer.subarray(offset, offset + 512);
-    offset += 512;
-
-    // Check for end-of-archive (all zeros)
-    if (header.every((b) => b === 0)) break;
-
-    // Extract filename (first 100 bytes, null-terminated)
-    const nameEnd = header.indexOf(0);
-    const fileName = header.subarray(0, Math.min(nameEnd, 100)).toString("utf-8");
-
-    // Extract size (octal, bytes 124-135)
-    const sizeStr = header.subarray(124, 136).toString("utf-8").trim();
-    const size = Number.parseInt(sizeStr, 8) || 0;
-
-    // Read file content
-    const content = tarBuffer.subarray(offset, offset + size);
-
-    // Write file (with path traversal protection)
-    const filePath = resolve(outputDir, fileName);
-    if (!filePath.startsWith(resolve(outputDir) + sep) && filePath !== resolve(outputDir)) {
-      throw new Error(`Path traversal detected in bundle: ${fileName}`);
+  for (const entry of entries) {
+    if (entry.type === "symlink" || entry.type === "link") {
+      throw new Error(`Refusing to extract link entry from bundle: ${entry.name}`);
     }
-    const dir = join(filePath, "..");
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
+    if (isUnsafeName(entry.name, entry.linkname)) {
+      throw new Error(`Path traversal detected in bundle: ${entry.name}`);
     }
-    writeFileSync(filePath, content);
+    const filePath = resolve(outputDir, entry.name);
+    if (!filePath.startsWith(root + sep) && filePath !== root) {
+      throw new Error(`Path traversal detected in bundle: ${entry.name}`);
+    }
+    const fileDir = dirname(filePath);
+    if (!existsSync(fileDir)) {
+      mkdirSync(fileDir, { recursive: true });
+    }
+    writeFileSync(filePath, entry.content);
     fileCount++;
-
-    // Skip to next 512-byte boundary
-    const padding = (512 - (size % 512)) % 512;
-    offset += size + padding;
   }
 
   return fileCount;
-}
-
-async function decompressGzip(buffer: Buffer): Promise<Buffer> {
-  return new Promise((resolvePromise, reject) => {
-    const chunks: Buffer[] = [];
-    const gunzip = createGunzip();
-    gunzip.on("data", (chunk: Buffer) => chunks.push(chunk));
-    gunzip.on("end", () => resolvePromise(Buffer.concat(chunks)));
-    gunzip.on("error", reject);
-    Readable.from(buffer).pipe(gunzip);
-  });
 }
 
 /**
@@ -127,8 +108,7 @@ export function registerPullCommand(program: Command): void {
       mkdirSync(outputDir, { recursive: true });
 
       try {
-        const tarBuffer = await decompressGzip(bundle);
-        const fileCount = extractTar(tarBuffer, outputDir);
+        const fileCount = await extractBundle(bundle, outputDir);
         format.success(
           `Pulled ${namespace}/${name}${version ? `@${version}` : ""} → ./${name}/ (${fileCount} files)`,
         );

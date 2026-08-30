@@ -415,4 +415,99 @@ describe("AgentDetailPage", () => {
       expect(screen.queryByRole("button", { name: /^Unverify$/ })).not.toBeInTheDocument();
     });
   });
+
+  // ── Visibility badge (private-only hosting) ───────────────────────────
+  describe("visibility badge (private-only)", () => {
+    const privateAgent = {
+      name: "test-agent",
+      namespace: "dev",
+      description: "A test agent",
+      visibility: "private" as const,
+      latest_version_verified: true,
+      run_count: 0,
+      token_count: 0,
+      created_at: "2026-04-20T00:00:00Z",
+      updated_at: "2026-04-20T10:00:00Z",
+      latest_version: "1.0.0",
+      versions: ["1.0.0"],
+    };
+
+    it("VT-12: shows the visibility badge but no public toggle (owner included)", async () => {
+      server.use(
+        http.get("/api/agents/dev/test-agent", () => HttpResponse.json(privateAgent)),
+        http.get("/api/me", () =>
+          HttpResponse.json({ id: "u-dev", username: "dev", namespace: "dev", role: "user" }),
+        ),
+      );
+      renderDetailPage();
+      await waitFor(() => {
+        expect(screen.getAllByText("dev/test-agent").length).toBeGreaterThan(0);
+      });
+      // The private badge is present...
+      expect(screen.getAllByText("private").length).toBeGreaterThan(0);
+      // ...but the set-public affordance is gone for everyone (private-only).
+      expect(
+        screen.queryByRole("button", { name: /Make (public|private)/i }),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  // ── VT-10: verify control gated by the operator verification policy ───
+  describe("VT-10: verify control gated by verification policy", () => {
+    it("owner policy — the agent owner sees the Verify control", async () => {
+      server.use(
+        http.get("/api/me", () =>
+          HttpResponse.json({
+            id: "u-dev",
+            username: "dev",
+            namespace: "dev",
+            role: "user",
+            verification_policy: "owner",
+          }),
+        ),
+      );
+      renderDetailPage();
+      await waitFor(() => {
+        expect(screen.getAllByRole("button", { name: /^(un)?verify$/i }).length).toBeGreaterThan(0);
+      });
+    });
+
+    it("owner policy — a non-owner non-admin sees no Verify control", async () => {
+      server.use(
+        http.get("/api/me", () =>
+          HttpResponse.json({
+            id: "u-x",
+            username: "other",
+            namespace: "other",
+            role: "user",
+            verification_policy: "owner",
+          }),
+        ),
+      );
+      renderDetailPage();
+      await waitFor(() => {
+        expect(screen.getAllByText("dev/test-agent").length).toBeGreaterThan(0);
+      });
+      expect(screen.queryByRole("button", { name: /^(un)?verify$/i })).not.toBeInTheDocument();
+    });
+
+    it("disabled policy — the Verify control is hidden even for the owner", async () => {
+      server.use(
+        http.get("/api/me", () =>
+          HttpResponse.json({
+            id: "u-dev",
+            username: "dev",
+            namespace: "dev",
+            role: "user",
+            verification_policy: "disabled",
+          }),
+        ),
+      );
+      renderDetailPage();
+      await waitFor(() => {
+        expect(screen.getAllByText("dev/test-agent").length).toBeGreaterThan(0);
+      });
+      expect(screen.queryByRole("button", { name: /^(un)?verify$/i })).not.toBeInTheDocument();
+    });
+  });
 });

@@ -1,7 +1,7 @@
 name: meeting-transcript-to-action-items
 version: 0.2.0
 
-# v0.2.0: audio-native. Accepts a meeting recording directly via Skrun's multimodal-inputs (#56).
+# v0.2.0: audio-native. Accepts a meeting recording directly via Skrun's multimodal-inputs.
 # Gemini transcribes the audio internally then extracts decisions + action items in a single pass.
 # v0.1.0 (text transcript input) is removed — upstream Whisper / VTT extraction is no longer needed.
 

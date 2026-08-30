@@ -2,15 +2,22 @@
  * Shared E2E test setup — creates a fresh Hono app with in-memory storage for each test suite.
  * Tests use the Hono test client (no network, no real LLM, fast).
  */
+import { generateApiKey } from "../../packages/api/src/auth/api-key.js";
 import { MemoryDb } from "../../packages/api/src/db/memory.js";
 import { createApp } from "../../packages/api/src/index.js";
 import { RegistryService } from "../../packages/api/src/services/registry.js";
+import type { VerificationPolicy } from "../../packages/api/src/services/verification-policy.js";
 import { MemoryStorage } from "../../packages/api/src/storage/memory.js";
 
-export function createTestApp() {
+// The Level-2 e2e suite (vitest.config.e2e.ts) has no setupFiles, so enable the
+// dev-token admin shortcut here — every e2e file sends DEV_TOKEN via this helper.
+// Vitest sets NODE_ENV=test (allowlisted) so the createApp dev-auth interlock won't trip.
+process.env.SKRUN_DEV_AUTH ??= "1";
+
+export function createTestApp(opts: { verificationPolicy?: VerificationPolicy } = {}) {
   const storage = new MemoryStorage();
   const db = new MemoryDb();
-  const app = createApp(storage, db);
+  const app = createApp(storage, db, { verificationPolicy: opts.verificationPolicy });
   const service = new RegistryService(storage, db);
   return { app, storage, db, service };
 }
@@ -44,15 +51,27 @@ export async function runAgent(
     input?: Record<string, unknown>;
     token?: string;
     llmKeyHeader?: string;
+    /** Raw X-LLM-Base-URL value — the caller's declaration of where their key belongs. */
+    llmBaseUrlHeader?: string;
   } = {},
 ) {
-  const { ns = "dev", name = "test-agent", input = {}, token = DEV_TOKEN, llmKeyHeader } = opts;
+  const {
+    ns = "dev",
+    name = "test-agent",
+    input = {},
+    token = DEV_TOKEN,
+    llmKeyHeader,
+    llmBaseUrlHeader,
+  } = opts;
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
   };
   if (llmKeyHeader) {
     headers["X-LLM-API-Key"] = llmKeyHeader;
+  }
+  if (llmBaseUrlHeader) {
+    headers["X-LLM-Base-URL"] = llmBaseUrlHeader;
   }
   return app.request(`/api/agents/${ns}/${name}/run`, {
     method: "POST",
@@ -186,5 +205,39 @@ export async function verifyVersion(
     method: "PATCH",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ verified }),
+  });
+}
+
+/**
+ * Create a non-admin user + a usable sk_live key. The dev/prod test tokens all
+ * resolve to admin in dev-mode, so run-authorization tests that need a real
+ * non-owner caller mint a key this way (the sk_live path runs before the
+ * dev-token fallback).
+ */
+export async function seedUserKey(
+  db: MemoryDb,
+  username: string,
+): Promise<{ id: string; key: string }> {
+  const user = await db.createUser({ github_id: `gh-${username}`, username });
+  const k = generateApiKey();
+  await db.createApiKey({
+    user_id: user.id,
+    key_hash: k.keyHash,
+    key_prefix: k.keyPrefix,
+    name: "k",
+  });
+  return { id: user.id, key: k.key };
+}
+
+/** Toggle agent visibility via PATCH /api/agents/:ns/:name/visibility */
+export async function setVisibility(
+  app: ReturnType<typeof createApp>,
+  opts: { ns?: string; name?: string; visibility: "private" | "public"; token?: string },
+) {
+  const { ns = "dev", name = "test-agent", visibility, token = DEV_TOKEN } = opts;
+  return app.request(`/api/agents/${ns}/${name}/visibility`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ visibility }),
   });
 }

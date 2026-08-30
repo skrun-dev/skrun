@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -57,6 +58,52 @@ describe("RegistryService", () => {
   it("should throw 404 on pull for non-existent version", async () => {
     await service.push("acme", "agent", "1.0.0", Buffer.from("v1"), "user-1");
     await expect(service.pull("acme", "agent", "9.9.9")).rejects.toThrow("not found");
+  });
+
+  // ── Bundle integrity (SEC-020 / #17) ────────────────────────────────────
+
+  it("VT-8: push stores the bundle SHA-256", async () => {
+    const bundle = Buffer.from("integrity-fixture");
+    await service.push("acme", "hashed", "1.0.0", bundle, "user-1");
+    const agent = await db.getAgent("acme", "hashed");
+    const v = await db.getVersionByNumber(agent?.id ?? "", "1.0.0");
+    expect(v?.bundle_sha256).toBe(createHash("sha256").update(bundle).digest("hex"));
+    expect(v?.bundle_sha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("VT-9: pull verifies and serves an intact bundle", async () => {
+    const bundle = Buffer.from("intact-bundle");
+    await service.push("acme", "intact", "1.0.0", bundle, "user-1");
+    const result = await service.pull("acme", "intact");
+    expect(result.buffer).toEqual(bundle);
+  });
+
+  it("VT-10: pull throws BUNDLE_INTEGRITY_FAILED (500) on a tampered bundle", async () => {
+    await service.push("acme", "tampered", "1.0.0", Buffer.from("original-bundle"), "user-1");
+    // Corrupt the stored object behind the registry's back.
+    await storage.put("acme/tampered/1.0.0.agent", Buffer.from("evil-payload"));
+    await expect(service.pull("acme", "tampered")).rejects.toMatchObject({
+      code: "BUNDLE_INTEGRITY_FAILED",
+      status: 500,
+    });
+  });
+
+  it("VT-11: pull serves a legacy bundle with a null checksum (no 500)", async () => {
+    // A pre-#17 version: row exists with no bundle_sha256, bundle present.
+    const agent = await db.createAgent({
+      name: "legacy",
+      namespace: "acme",
+      description: "",
+      owner_id: "user-1",
+    });
+    await db.createVersion(agent.id, {
+      version: "1.0.0",
+      size: 3,
+      bundle_key: "acme/legacy/1.0.0.agent",
+    });
+    await storage.put("acme/legacy/1.0.0.agent", Buffer.from("xyz"));
+    const result = await service.pull("acme", "legacy");
+    expect(result.buffer.toString()).toBe("xyz");
   });
 
   it("should list agents with pagination", async () => {

@@ -33,7 +33,7 @@
     }
   },
   "files": {
-    "includes": ["**", "!**/dist", "!**/node_modules", "!**/*.md"]
+    "includes": ["**", "!**/dist", "!**/node_modules", "!**/*.md", "!.claude", "!.mcp.json"]
   },
   "css": {
     "parser": {

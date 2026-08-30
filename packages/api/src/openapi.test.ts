@@ -1,11 +1,36 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { getOpenAPISchema } from "./openapi.js";
+
+/**
+ * This package's own version. Resolves the same from `src/` and from `dist/`,
+ * since both sit one level under the package root.
+ */
+const PKG_VERSION: string = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
+).version;
 
 describe("OpenAPI Schema", () => {
   const schema = getOpenAPISchema();
 
   it("has openapi 3.1.0 version", () => {
     expect(schema.openapi).toBe("3.1.0");
+  });
+
+  it("VT-27 (#65): /api/keys documents scope_kind, agents, and KEY_SCOPE_FORBIDDEN", () => {
+    // biome-ignore lint/suspicious/noExplicitAny: deep schema traversal in a test
+    const keys = schema.paths["/api/keys"] as any;
+    const reqProps = keys.post.requestBody.content["application/json"].schema.properties;
+    expect(reqProps.scope_kind).toBeDefined();
+    expect(reqProps.agents).toBeDefined();
+    expect(keys.post.responses["403"]).toBeDefined();
+    expect(
+      keys.post.responses["201"].content["application/json"].schema.properties.scope_kind,
+    ).toBeDefined();
+    expect(
+      keys.get.responses["200"].content["application/json"].schema.items.properties.scope_kind,
+    ).toBeDefined();
+    expect(keys.get.responses["403"]).toBeDefined();
   });
 
   it("has all expected endpoint paths", () => {
@@ -19,6 +44,8 @@ describe("OpenAPI Schema", () => {
     expect(paths).toContain("/api/agents/{namespace}/{name}");
     expect(paths).toContain("/api/agents/{namespace}/{name}/versions");
     expect(paths).toContain("/api/agents/{namespace}/{name}/versions/{version}");
+    expect(paths).toContain("/auth/device/code");
+    expect(paths).toContain("/auth/device/token");
     // Per-version verify route replaces the legacy agent-level
     // `/agents/:ns/:name/verify`. Listed once below; the legacy path is
     // absent from the schema.
@@ -174,9 +201,15 @@ describe("OpenAPI Schema", () => {
   // VT-18 (#80): the 5 registry GET endpoints inherit the global bearerAuth
   // security (no `security: []` override), declare 401 + 404 responses, and
   // explicitly do NOT declare a 403 (opacity is intentional — non-owner reads
-  // get the 404 path, not a 403). OpenAPI version stays at 0.8.0 — #83 already
-  // moved 0.7.0 → 0.8.0 and #80 bundles into the still-unreleased v0.8.0.
-  it("VT-18 (#80): 5 GET endpoints — security + 401/404 + NO 403 + version 0.8.0", () => {
+  // get the 404 path, not a 403).
+  //
+  // The version assertion reads package.json instead of a literal. The release
+  // process requires `info.version` to TRACK the package version, and that is
+  // the property worth pinning — a hardcoded string asserted neither half of it:
+  // it broke on every single release, and it never once checked that the two
+  // actually agree. Pinned to a literal it would have passed at v1.0.0 with the
+  // document still announcing 0.8.0 to every generated client.
+  it("VT-18 (#80): 5 GET endpoints — security + 401/404 + NO 403 + version tracks the package", () => {
     // The 5 per-agent GET endpoints — all gated by `assertAgentVisibleOrThrow`,
     // all return 404 opaque on non-owner. The list endpoint at /api/agents
     // is checked separately below since it has no 404 (filters return [] for
@@ -189,8 +222,8 @@ describe("OpenAPI Schema", () => {
       { path: "/api/agents/{namespace}/{name}/stats", op: "getAgentStats" },
     ];
 
-    // OpenAPI version stays at 0.8.0 (Q-7)
-    expect(schema.info.version).toBe("0.8.0");
+    // The published document must announce the version we actually shipped.
+    expect(schema.info.version).toBe(PKG_VERSION);
 
     // Global security IS bearerAuth (so endpoints without an override inherit it)
     expect(schema.security).toEqual([{ bearerAuth: [] }]);
@@ -229,5 +262,32 @@ describe("OpenAPI Schema", () => {
       // explicit; reads (these 5) use 404 opaque.
       expect(route.responses["403"]).toBeUndefined();
     }
+  });
+
+  it("VT-28 (#102): creator LLM key endpoints + error codes documented", () => {
+    const paths = Object.keys(schema.paths);
+    expect(paths).toContain("/api/agents/{namespace}/{name}/llm-keys");
+    expect(paths).toContain("/api/agents/{namespace}/{name}/llm-keys/{provider}");
+    expect(paths).toContain("/api/agents/{namespace}/{name}/llm-key-policy");
+
+    // biome-ignore lint/suspicious/noExplicitAny: deep schema traversal in a test
+    const keys = schema.paths["/api/agents/{namespace}/{name}/llm-keys"] as any;
+    // GET surfaces { policy, keys: [{ provider, last4, updated_at }] } — never the key.
+    const getProps = keys.get.responses["200"].content["application/json"].schema.properties;
+    expect(getProps.policy.enum).toEqual(["open", "creator_only"]);
+    expect(getProps.keys.items.properties.last4).toBeDefined();
+    expect(getProps.keys.items.properties.key).toBeUndefined();
+    expect(keys.get.responses["403"]).toBeDefined();
+
+    // biome-ignore lint/suspicious/noExplicitAny: deep schema traversal in a test
+    const provider = schema.paths["/api/agents/{namespace}/{name}/llm-keys/{provider}"] as any;
+    expect(provider.put.responses["500"].description).toMatch(/ENCRYPTION_NOT_CONFIGURED/);
+    expect(provider.put.responses["400"].description).toMatch(/INVALID_LLM_PROVIDER/);
+    expect(provider.delete.responses["204"]).toBeDefined();
+
+    // The run endpoint's 403 documents CALLER_KEY_NOT_ALLOWED.
+    // biome-ignore lint/suspicious/noExplicitAny: deep schema traversal in a test
+    const run = schema.paths["/api/agents/{namespace}/{name}/run"] as any;
+    expect(run.post.responses["403"].description).toMatch(/CALLER_KEY_NOT_ALLOWED/);
   });
 });

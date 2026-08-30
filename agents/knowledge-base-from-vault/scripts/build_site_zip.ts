@@ -4,7 +4,7 @@
 // Output (stdout JSON): { path, bytes, file_count }
 //
 // v0.2.0: switched from a hand-rolled STORE-method ZIP writer to `jszip`. The
-// runtime resolves the dep via `package.json` automatically (#57). The output
+// runtime resolves the dep via `package.json` automatically. The output
 // is functionally identical (zip extracts to the same files); deflate-default
 // compression now produces slightly smaller archives than the prior STORE.
 

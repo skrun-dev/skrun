@@ -1,0 +1,19 @@
+# Pinned language runtimes for the skrun-runtime image.
+#
+# Updated 2026-05-23. Bump these in lockstep with the image tag in
+# CHANGELOG and the agent_toolset_20260401 alignment — a runner that
+# targets a Skill on a managed-agent platform should work on Skrun.
+#
+# NOTE on Ruby: 2026-05-25 — Ruby was removed from mise and moved to
+# apt (`ruby-full` package in Dockerfile) after mise's precompiled
+# binary registry stopped serving ruby 3.3.6 binaries for linux/amd64
+# between dev9 and dev10 builds, forcing source compile + openssl
+# fetch which then failed. Ubuntu 24.04's apt ships Ruby 3.2.3 LTS
+# (stable for 5+ years) which is good enough for CMA agent_toolset
+# alignment (Ruby is used by a minority of skills; 3.2 vs 3.3 minor
+# differences don't affect tool usage in skill scripts).
+
+[tools]
+node = "22.12.0"
+go = "1.22.10"
+rust = "1.77.2"

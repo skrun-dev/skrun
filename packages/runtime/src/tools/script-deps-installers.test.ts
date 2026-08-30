@@ -19,8 +19,46 @@ import {
   NPM_REGISTRY_URL,
   PYPI_INDEX_URL,
   pythonAlias,
+  stripHarnessSecrets,
   YARN_REGISTRY_URL,
 } from "./script-deps-installers.js";
+
+describe("stripHarnessSecrets (SEC — installer env hardening)", () => {
+  it("VT-12: strips harness secrets, keeps the OS + registry env installers need", () => {
+    const out = stripHarnessSecrets({
+      // OS env installers require (esp. behind a corporate proxy / custom CA):
+      PATH: "/usr/bin",
+      HOME: "/home/x",
+      HTTPS_PROXY: "http://proxy:8080",
+      NO_PROXY: "localhost",
+      NODE_EXTRA_CA_CERTS: "/etc/ca.pem",
+      // Harness secrets that MUST NOT reach the untrusted installer subprocess:
+      SKRUN_SECRETS_ENCRYPTION_KEY: "master-key",
+      WEBHOOK_SIGNING_KEY: "sig",
+      DATABASE_URL: "postgres://u:p@h/db",
+      ANTHROPIC_API_KEY: "sk-ant-x",
+      S3_ACCESS_KEY_ID: "AKIA-should-not-leak", // _KEY_ID — the suffix-only _KEY check misses this
+      S3_SECRET_ACCESS_KEY: "secret",
+      RUNNER_RPC_TOKEN: "tok",
+    });
+    expect(out.PATH).toBe("/usr/bin");
+    expect(out.HOME).toBe("/home/x");
+    expect(out.HTTPS_PROXY).toBe("http://proxy:8080");
+    expect(out.NO_PROXY).toBe("localhost");
+    expect(out.NODE_EXTRA_CA_CERTS).toBe("/etc/ca.pem");
+    for (const secret of [
+      "SKRUN_SECRETS_ENCRYPTION_KEY",
+      "WEBHOOK_SIGNING_KEY",
+      "DATABASE_URL",
+      "ANTHROPIC_API_KEY",
+      "S3_ACCESS_KEY_ID",
+      "S3_SECRET_ACCESS_KEY",
+      "RUNNER_RPC_TOKEN",
+    ]) {
+      expect(out[secret]).toBeUndefined();
+    }
+  });
+});
 
 let depsPath: string;
 

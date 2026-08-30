@@ -7,7 +7,7 @@ export function Header() {
   const { theme, toggleTheme } = useTheme();
   const { user } = useAuth();
 
-  const initials = (user?.username ?? "D")[0]?.toUpperCase() ?? "D";
+  const initials = user?.username?.[0]?.toUpperCase() ?? "";
 
   return (
     <header className="h-14 shrink-0 border-b border-gray-200 dark:border-gray-900 bg-white/70 dark:bg-gray-950/70 backdrop-blur-sm flex items-center px-5 gap-3">
@@ -42,7 +42,7 @@ export function Header() {
           </div>
         )}
         <span className="text-[12.5px] text-gray-700 dark:text-gray-300 hidden sm:inline">
-          {user?.username ?? "Local Dev"}
+          {user?.username}
         </span>
       </Link>
     </header>

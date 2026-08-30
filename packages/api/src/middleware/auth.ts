@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
+import { createLogger } from "@skrun-dev/runtime";
 import type { Context, MiddlewareHandler } from "hono";
 import { getCookie } from "hono/cookie";
 import { hashApiKey, isApiKeyFormat } from "../auth/api-key.js";
+import { isDevAuthEnabled } from "../auth/dev-auth.js";
 import { isOAuthConfigured } from "../auth/github-oauth.js";
 import { SESSION_COOKIE_NAME, validateSession } from "../auth/session.js";
 import type { DbAdapter } from "../db/adapter.js";
 import type { UserContext } from "../types.js";
 
+const logger = createLogger("auth-middleware");
 const USER_CONTEXT_KEY = "user";
 
 /**
@@ -35,6 +38,8 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
             avatar_url: user.avatar_url || undefined,
             plan: user.plan || undefined,
             role: user.role,
+            // Session cookie = master credential (no key restriction).
+            key: null,
           };
           c.set(USER_CONTEXT_KEY, ctx);
           return next();
@@ -74,7 +79,20 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
         }
 
         // Update last_used_at (non-blocking)
-        db.updateApiKeyLastUsed(apiKey.id).catch(() => {});
+        db.updateApiKeyLastUsed(apiKey.id).catch((err) =>
+          logger.warn(
+            {
+              event: "last_used_update_failed",
+              error: err instanceof Error ? err.message : String(err),
+            },
+            "Best-effort API-key last_used update failed (non-blocking)",
+          ),
+        );
+
+        // Load agent grants only for resource-scoped keys — account-wide keys
+        // (the common case) skip the extra query.
+        const agentIds =
+          apiKey.scope_kind === "agents" ? await db.getApiKeyAgentIds(apiKey.id) : [];
 
         const ctx: UserContext = {
           id: user.id,
@@ -84,13 +102,19 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
           avatar_url: user.avatar_url || undefined,
           plan: user.plan || undefined,
           role: user.role,
+          key: {
+            id: apiKey.id,
+            scope_kind: apiKey.scope_kind,
+            operations: apiKey.scopes,
+            agent_ids: agentIds,
+          },
         };
         c.set(USER_CONTEXT_KEY, ctx);
         return next();
       }
 
-      // --- 3. Dev-token fallback ---
-      if (!isOAuthConfigured()) {
+      // --- 3. Dev-token fallback (fail-secure: explicit opt-in via SKRUN_DEV_AUTH) ---
+      if (isDevAuthEnabled() && !isOAuthConfigured()) {
         // No OAuth configured → dev mode: derive namespace from token
         const namespace = token === "dev-token" ? "dev" : token.split("-")[0] || "user";
         const devId = createHash("sha256").update(token).digest("hex").slice(0, 16);
@@ -118,6 +142,8 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
           namespace,
           username: namespace,
           role: "admin",
+          // dev-token = master credential (self-host operator).
+          key: null,
         };
         c.set(USER_CONTEXT_KEY, ctx);
         return next();

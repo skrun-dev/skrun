@@ -44,16 +44,17 @@ describe("BundleCache", () => {
     expect(result?.files["SKILL.md"]).toBe("test");
   });
 
-  it("getOrExtract calls extractBundleToDisk on cache miss (VT-6)", () => {
-    // We can't easily create a real .agent bundle here,
-    // so we test that getOrExtract delegates to extractBundleToDisk
-    // by verifying it throws on invalid buffer (same as extractBundleToDisk would)
+  it("getOrExtract rejects on an invalid bundle buffer (VT-6)", async () => {
+    // getOrExtract delegates to the async extractBundleToDisk; an invalid buffer
+    // makes the extraction reject (gunzip fails on non-gzip input).
     const cache = new TTLCache<string, BundleCacheEntry>({
       ttlMs: 60_000,
       maxEntries: 10,
     });
 
-    expect(() => getOrExtract(cache, "dev/agent/1.0.0", Buffer.from("not-a-tarball"))).toThrow();
+    await expect(
+      getOrExtract(cache, "dev/agent/1.0.0", Buffer.from("not-a-tarball")),
+    ).rejects.toThrow();
   });
 
   it("eviction cleans up temp directory (VT-7)", () => {

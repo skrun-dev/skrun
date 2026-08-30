@@ -1,11 +1,20 @@
 import type { FileInputField } from "@skrun-dev/schema";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SsrfBlockedError, safeFetch } from "../security/safe-fetch.js";
 import {
   INLINE_BASE64_MAX_BYTES,
   type ResolveContext,
   ResolveError,
   resolveInput,
 } from "./parts.js";
+
+// safeFetch (the SSRF guard) is exercised in security/safe-fetch.test.ts; here we
+// mock it so the url-source path is testable without a real network call.
+vi.mock("../security/safe-fetch.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../security/safe-fetch.js")>();
+  return { ...actual, safeFetch: vi.fn() };
+});
+const safeFetchMock = vi.mocked(safeFetch);
 
 function makeFileSchema(overrides: Partial<FileInputField> = {}): FileInputField {
   return {
@@ -29,6 +38,7 @@ function makeCtx(overrides: Partial<ResolveContext> = {}): ResolveContext {
 describe("resolveInput", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    safeFetchMock.mockReset();
   });
 
   it("VT-12 micro: resolves a base64 inline data part", async () => {
@@ -94,13 +104,12 @@ describe("resolveInput", () => {
   });
 
   it("resolves source: 'url' when host is in allowed_hosts", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
+    safeFetchMock.mockResolvedValue(
       new Response(new Uint8Array([1, 2, 3]), {
         status: 200,
         headers: { "content-type": "image/jpeg" },
-      }),
+      }) as unknown as Awaited<ReturnType<typeof safeFetch>>,
     );
-    vi.stubGlobal("fetch", fetchMock);
 
     const schema = makeFileSchema();
     const ctx = makeCtx({ allowedHosts: ["example.com"] });
@@ -114,7 +123,11 @@ describe("resolveInput", () => {
     if (parts?.[0]?.kind === "image") {
       expect(Array.from(parts[0].bytes)).toEqual([1, 2, 3]);
     }
-    expect(fetchMock).toHaveBeenCalledWith("https://example.com/img.jpg");
+    expect(safeFetchMock).toHaveBeenCalledWith(
+      "https://example.com/img.jpg",
+      undefined,
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
   });
 
   it("VT-15 micro: throws URL_NOT_ALLOWED when host outside allowlist", async () => {
@@ -129,8 +142,10 @@ describe("resolveInput", () => {
     ).rejects.toMatchObject({ code: "URL_NOT_ALLOWED" });
   });
 
-  it("throws URL_FETCH_FAILED when fetch returns non-2xx", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 500 })));
+  it("throws URL_FETCH_FAILED when the fetch returns non-2xx", async () => {
+    safeFetchMock.mockResolvedValue(
+      new Response(null, { status: 500 }) as unknown as Awaited<ReturnType<typeof safeFetch>>,
+    );
     const schema = makeFileSchema();
     const ctx = makeCtx({ allowedHosts: ["example.com"] });
     await expect(
@@ -140,6 +155,23 @@ describe("resolveInput", () => {
         ctx,
       ),
     ).rejects.toMatchObject({ code: "URL_FETCH_FAILED" });
+  });
+
+  it("throws URL_NOT_ALLOWED when safeFetch blocks a host that resolves private", async () => {
+    // safeFetch rejects with SsrfBlockedError carried as the fetch error's cause.
+    const blocked = Object.assign(new TypeError("fetch failed"), {
+      cause: new SsrfBlockedError("Blocked 'x.example.com': resolves to 127.0.0.1"),
+    });
+    safeFetchMock.mockRejectedValue(blocked);
+    const schema = makeFileSchema();
+    const ctx = makeCtx({ allowedHosts: ["*"] });
+    await expect(
+      resolveInput(
+        { photo: [{ type: "file", source: "url", url: "https://x.example.com/x.jpg" }] },
+        [schema],
+        ctx,
+      ),
+    ).rejects.toMatchObject({ code: "URL_NOT_ALLOWED" });
   });
 
   it("RT-6 micro: returns empty map when no file inputs declared", async () => {

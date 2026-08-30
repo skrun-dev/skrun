@@ -5,7 +5,7 @@ import type { ToolConfig } from "@skrun-dev/schema";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ScriptDepsInstallError } from "../errors.js";
 import type { ResolvedDeps } from "./script-deps-resolver.js";
-import { ScriptToolProvider } from "./script-provider.js";
+import { buildInterpreterArgs, ScriptToolProvider } from "./script-provider.js";
 
 /**
  * Sub-class that overrides `getDepsResolved` to return canned values without
@@ -129,6 +129,37 @@ describe("ScriptToolProvider", () => {
     const result = await provider.callTool("unknown", {});
     expect(result.isError).toBe(true);
     expect(result.content).toMatch(/not declared in agent\.yaml/);
+  });
+
+  it("VT-2 (DT-6): runs a .ts tool script via native type-stripping, no ERR_UNKNOWN_FILE_EXTENSION", async () => {
+    // A .ts script with type annotations — `node script.ts` fails with
+    // ERR_UNKNOWN_FILE_EXTENSION unless the strip-types flag is passed, which
+    // buildInterpreterArgs adds for `.ts`. The script echoes its stdin args.
+    writeFileSync(
+      join(scriptsDir, "tsecho.ts"),
+      `let data = ""; process.stdin.on("data", (c: Buffer) => { data += c; }); process.stdin.on("end", () => { const out: string = data; process.stdout.write(out); });`,
+      "utf-8",
+    );
+    const provider = new ScriptToolProvider(scriptsDir, [{ ...echoTool, name: "tsecho" }]);
+    const result = await provider.callTool("tsecho", { message: "hi" });
+    expect(result.isError).toBe(false);
+    expect(result.content).toContain("hi");
+    expect(result.content).not.toContain("ERR_UNKNOWN_FILE_EXTENSION");
+  });
+
+  it("VT-1 (DT-6): buildInterpreterArgs adds --experimental-strip-types for .ts", () => {
+    expect(buildInterpreterArgs(".ts", "/x/s.ts")).toEqual([
+      "--experimental-strip-types",
+      "/x/s.ts",
+    ]);
+  });
+
+  it("VT-3 (DT-6): buildInterpreterArgs leaves .js unchanged (no flag)", () => {
+    expect(buildInterpreterArgs(".js", "/x/s.js")).toEqual(["/x/s.js"]);
+  });
+
+  it("RT-1 (DT-6): buildInterpreterArgs leaves .py unchanged (no flag)", () => {
+    expect(buildInterpreterArgs(".py", "/x/s.py")).toEqual(["/x/s.py"]);
   });
 
   it("passes SKRUN_ALLOWED_HOSTS env var to subprocess (VT-12)", async () => {
@@ -325,9 +356,11 @@ describe("ScriptToolProvider", () => {
       const previousAnthropic = process.env.ANTHROPIC_API_KEY;
       const previousOpenai = process.env.OPENAI_API_KEY;
       const previousWebhook = process.env.WEBHOOK_SIGNING_KEY;
+      const previousRpcToken = process.env.RUNNER_RPC_TOKEN;
       process.env.ANTHROPIC_API_KEY = "sk-ant-TEST-SHOULD-NOT-LEAK-12345";
       process.env.OPENAI_API_KEY = "sk-TEST-SHOULD-NOT-LEAK-67890";
       process.env.WEBHOOK_SIGNING_KEY = "TEST-WEBHOOK-KEY-SHOULD-NOT-LEAK";
+      process.env.RUNNER_RPC_TOKEN = "RUNNER-RPC-TOKEN-SHOULD-NOT-LEAK";
 
       try {
         writeFileSync(
@@ -337,6 +370,7 @@ describe("ScriptToolProvider", () => {
              anthropic: process.env.ANTHROPIC_API_KEY ?? "MISSING",
              openai: process.env.OPENAI_API_KEY ?? "MISSING",
              webhook: process.env.WEBHOOK_SIGNING_KEY ?? "MISSING",
+             rpcToken: process.env.RUNNER_RPC_TOKEN ?? "MISSING",
            }));`,
           "utf-8",
         );
@@ -352,6 +386,8 @@ describe("ScriptToolProvider", () => {
         expect(parsed.anthropic).toBe("MISSING");
         expect(parsed.openai).toBe("MISSING");
         expect(parsed.webhook).toBe("MISSING");
+        // SC-2c: the per-run RPC token must NOT reach the spawned script.
+        expect(parsed.rpcToken).toBe("MISSING");
       } finally {
         if (previousAnthropic === undefined) delete process.env.ANTHROPIC_API_KEY;
         else process.env.ANTHROPIC_API_KEY = previousAnthropic;
@@ -359,30 +395,37 @@ describe("ScriptToolProvider", () => {
         else process.env.OPENAI_API_KEY = previousOpenai;
         if (previousWebhook === undefined) delete process.env.WEBHOOK_SIGNING_KEY;
         else process.env.WEBHOOK_SIGNING_KEY = previousWebhook;
+        if (previousRpcToken === undefined) delete process.env.RUNNER_RPC_TOKEN;
+        else process.env.RUNNER_RPC_TOKEN = previousRpcToken;
       }
     });
 
-    it("VT-5: SKRUN_* vars still pass through (contract preserved)", async () => {
+    it("non-contract SKRUN_* vars do NOT pass through (blanket copy removed)", async () => {
       const previous = process.env.SKRUN_CUSTOM_VAR;
-      process.env.SKRUN_CUSTOM_VAR = "skrun-contract-value";
+      // A secret-shaped var that also starts with SKRUN_ must not leak either.
+      const previousKey = process.env.SKRUN_SECRETS_ENCRYPTION_KEY;
+      process.env.SKRUN_CUSTOM_VAR = "should-not-leak";
+      process.env.SKRUN_SECRETS_ENCRYPTION_KEY = "master-key-should-not-leak";
       try {
         writeFileSync(
           join(scriptsDir, "skrun-check.js"),
-          `process.stdout.write(process.env.SKRUN_CUSTOM_VAR ?? "MISSING");`,
+          `process.stdout.write((process.env.SKRUN_CUSTOM_VAR ?? "ABSENT") + "|" + (process.env.SKRUN_SECRETS_ENCRYPTION_KEY ?? "ABSENT"));`,
           "utf-8",
         );
         const tool: ToolConfig = {
           name: "skrun-check",
-          description: "Check SKRUN_* pass-through",
+          description: "Check non-contract SKRUN_* vars are absent",
           input_schema: { type: "object", properties: {}, additionalProperties: true },
         };
         const provider = new ScriptToolProvider(scriptsDir, [tool]);
         const result = await provider.callTool("skrun-check", {});
         expect(result.isError).toBe(false);
-        expect(result.content).toBe("skrun-contract-value");
+        expect(result.content).toBe("ABSENT|ABSENT");
       } finally {
         if (previous === undefined) delete process.env.SKRUN_CUSTOM_VAR;
         else process.env.SKRUN_CUSTOM_VAR = previous;
+        if (previousKey === undefined) delete process.env.SKRUN_SECRETS_ENCRYPTION_KEY;
+        else process.env.SKRUN_SECRETS_ENCRYPTION_KEY = previousKey;
       }
     });
 

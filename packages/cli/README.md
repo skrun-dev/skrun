@@ -42,6 +42,7 @@ your GitHub username after `skrun login`.
 | `skrun logout` | Clear stored credentials |
 | `skrun logs` | Stream execution logs |
 | `skrun cache list/clear` | Inspect / clear the local script-deps cache |
+| `skrun admin cleanup-machines` | Cloud-runtime operators: reap orphan Fly.io sandbox machines (`--dry-run`, `--older-than`, `--app`, `--token`). Machines a server keeps ready in advance are left alone unless `--include-pool` |
 
 ## `skrun run`
 

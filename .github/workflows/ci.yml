@@ -11,14 +11,172 @@ jobs:
     strategy:
       matrix:
         node-version: [22, 24]
+    services:
+      # Postgres for the PostgresDb adapter contract. db-contract.shared.ts runs
+      # its full contract against the pg backend when DATABASE_URL is set —
+      # exercising the pg backend in CI, which was previously never covered. The
+      # shared fixtures use real uuids so they work on Postgres's uuid columns.
+      # NOTE: MinIO is NOT a service — it needs the `server /data` command, which
+      # GitHub Actions service containers cannot pass (there is no `command`
+      # field), so a MinIO service never starts. It is launched via `docker run`
+      # in a step below instead. Postgres self-starts, so it stays a service.
+      postgres:
+        image: postgres:16
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: skrun_test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      S3_TEST_ENDPOINT: http://localhost:9000
+      S3_TEST_ACCESS_KEY_ID: minioadmin
+      S3_TEST_SECRET_ACCESS_KEY: minioadmin
+      S3_TEST_BUCKET: skrun-test
+      # Activates the PostgresDb contract leg in db-contract.shared.ts.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/skrun_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
           cache: pnpm
+      # MinIO for the R2Storage live tests (storage.test.ts r2Describe block).
+      # Launched via `docker run` (not a service) so we can pass `server /data`,
+      # and pinned to a fixed RELEASE tag so a moving upstream `:latest` cannot
+      # break CI.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data --console-address ":9001"
+          echo "Waiting for MinIO to become healthy..."
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO is up."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become healthy in time" >&2
+          docker logs minio || true
+          exit 1
+      - name: Create MinIO bucket
+        run: |
+          # The minio/mc image entrypoint IS `mc`, so define the alias via the
+          # MC_HOST_<alias> env var (no shell wrapper needed) and call `mc mb`.
+          docker run --rm --network host \
+            -e MC_HOST_local=http://minioadmin:minioadmin@localhost:9000 \
+            minio/mc:RELEASE.2025-08-13T08-35-41Z mb local/skrun-test --ignore-existing
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm build
       - run: pnpm test
+
+  # The self-host compose contract, enforced where Docker exists. Our test
+  # strategy already establishes the rule for the runtime
+  # image ("no local Docker → image build/smoke runs in CI"); this applies it to
+  # compose, which had no automated check at all.
+  #
+  # This job ALREADY earned its keep: the first form tried here was
+  # `${VAR:?message}`, and CI showed it broke the documented minimal self-host
+  # path — Compose interpolates each file BEFORE merging overlays, so the `:?` in
+  # the base file fired even though `docker-compose.minimal.yml` `!reset`s the
+  # services that need those credentials. Neither the dev machine nor any earlier
+  # CI had Docker, so that could only ever have been reasoned about.
+  #
+  # The form is now a bare `${VAR}`: an unset variable interpolates to empty and
+  # the SERVICE refuses to start, rather than Compose refusing to render. That
+  # keeps both documented invocations working, so the assertion moves from
+  # "refuses to render" to "refuses to start" — which is the property that
+  # actually matters.
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: The MINIMAL self-host stack renders with no credentials
+        run: |
+          # The documented single-operator path (docs/self-hosting-docker.md):
+          # SQLite + local disk, postgres/minio/redis `!reset` away. It has no
+          # such credentials by design and must not be made to invent them.
+          docker compose \
+            -f infra/docker-compose.yml \
+            -f infra/docker-compose.minimal.yml \
+            config >/dev/null
+          echo "OK — the minimal stack renders with no credentials."
+
+      - name: The full stack renders once credentials ARE set
+        env:
+          POSTGRES_PASSWORD: ci-not-a-real-password
+          S3_ACCESS_KEY_ID: ci-not-a-real-key
+          S3_SECRET_ACCESS_KEY: ci-not-a-real-secret
+        run: |
+          docker compose -f infra/docker-compose.yml config >/dev/null
+          echo "OK — the full stack renders with credentials supplied."
+
+      - name: The stack REFUSES to start on empty credentials, per service
+        run: |
+          # THE assertion, and it is deliberately PER SERVICE. An earlier version
+          # keyed on compose's aggregate exit code and passed while MinIO was
+          # booting on minioadmin:minioadmin — postgres failing masked it. The
+          # log said so in plain text and the check reported OK anyway.
+          set +e
+          docker compose -f infra/docker-compose.yml up -d --wait --wait-timeout 90 postgres minio
+          rc=$?
+          set -e
+          echo "--- preflight ---"; docker compose -f infra/docker-compose.yml logs preflight 2>&1 | tail -10
+          echo "--- postgres ---";  docker compose -f infra/docker-compose.yml logs postgres  2>&1 | tail -10
+          echo "--- minio ---";     docker compose -f infra/docker-compose.yml logs minio     2>&1 | tail -10
+          minio_logs=$(docker compose -f infra/docker-compose.yml logs minio 2>&1 || true)
+          running=$(docker compose -f infra/docker-compose.yml ps --services --filter status=running 2>/dev/null || true)
+          docker compose -f infra/docker-compose.yml down -v --remove-orphans || true
+
+          fail=0
+          if [ $rc -eq 0 ]; then
+            echo "::error file=infra/docker-compose.yml::the stack came up with an empty environment"; fail=1
+          fi
+          if echo "$minio_logs" | grep -q "Detected default credentials"; then
+            echo "::error file=infra/docker-compose.yml::MinIO booted on its published minioadmin default — an empty value is NOT refused by the image, the stack must refuse for it"; fail=1
+          fi
+          for svc in postgres minio; do
+            if echo "$running" | grep -qx "$svc"; then
+              echo "::error file=infra/docker-compose.yml::$svc is running on an empty credential"; fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || exit 1
+          echo "OK — preflight refused, and neither backing service came up."
+
+      - name: The backing services DO start once credentials are supplied
+        env:
+          POSTGRES_PASSWORD: ci-not-a-real-password
+          S3_ACCESS_KEY_ID: ci-not-a-real-key
+          S3_SECRET_ACCESS_KEY: ci-not-a-real-secret
+        run: |
+          # The other half. Refusing an empty credential is worth nothing
+          # if the stack also refuses a filled one — the preflight guard sits in
+          # front of both services, so a bug in it would break every self-host.
+          docker compose -f infra/docker-compose.yml up -d --wait --wait-timeout 120 postgres minio
+          docker compose -f infra/docker-compose.yml logs preflight 2>&1 | tail -5
+          docker compose -f infra/docker-compose.yml ps
+          docker compose -f infra/docker-compose.yml down -v --remove-orphans || true
+          echo "OK — postgres and minio came up healthy with credentials supplied."
+
+      - name: No default credential is reintroduced anywhere
+        run: |
+          # A `:-` fallback on any of the three is the finding itself. Catching it
+          # by grep as well means a future edit that adds a default to a NEW
+          # service is flagged too, not just these six sites.
+          if grep -nE '\$\{(POSTGRES_PASSWORD|S3_ACCESS_KEY_ID|S3_SECRET_ACCESS_KEY|MINIO_ROOT_[A-Z]+):-' infra/docker-compose*.yml; then
+            echo "::error::a ':-' fallback reintroduces a default credential"
+            exit 1
+          fi
+          echo "OK — no ':-' credential fallback in any compose file."

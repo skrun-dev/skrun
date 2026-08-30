@@ -1,7 +1,22 @@
 import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
 import type { DbAdapter } from "./adapter.js";
-import type { Agent, AgentVersion, ApiKey, Environment, Run, RunStatus, User } from "./schema.js";
+import {
+  type Agent,
+  type AgentLlmKeyInfo,
+  type AgentLlmKeyPolicy,
+  type AgentLlmKeyRecord,
+  type AgentVersion,
+  API_KEY_DEFAULT_SCOPES,
+  type ApiKey,
+  type ApiKeyScopeKind,
+  type DeviceCode,
+  type DeviceCodeStatus,
+  type Environment,
+  type Run,
+  type RunStatus,
+  type User,
+} from "./schema.js";
 
 // FK semantics mirror packages/api/src/db/migrations/001_initial_schema.sql
 //   - Ownership chains: ON DELETE CASCADE (api_keys, agents, agent_versions, agent_state, environments)
@@ -27,6 +42,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
   key_prefix TEXT NOT NULL,
   name TEXT NOT NULL,
   scopes TEXT NOT NULL DEFAULT '[]',
+  scope_kind TEXT NOT NULL DEFAULT 'account',
   last_used_at TEXT,
   expires_at TEXT,
   created_at TEXT NOT NULL
@@ -38,6 +54,7 @@ CREATE TABLE IF NOT EXISTS agents (
   namespace TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','public')),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(namespace, name)
@@ -49,6 +66,7 @@ CREATE TABLE IF NOT EXISTS agent_versions (
   version TEXT NOT NULL,
   size INTEGER NOT NULL,
   bundle_key TEXT NOT NULL,
+  bundle_sha256 TEXT,
   config_snapshot TEXT,
   notes TEXT,
   pushed_at TEXT NOT NULL,
@@ -78,6 +96,7 @@ CREATE TABLE IF NOT EXISTS runs (
   model TEXT,
   environment_id TEXT REFERENCES environments(id) ON DELETE SET NULL,
   user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  api_key_id TEXT REFERENCES api_keys(id) ON DELETE SET NULL,
   status TEXT NOT NULL,
   input TEXT,
   output TEXT,
@@ -90,9 +109,25 @@ CREATE TABLE IF NOT EXISTS runs (
   usage_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
   usage_cache_savings_usd REAL NOT NULL DEFAULT 0,
   duration_ms INTEGER,
+  machine_id TEXT,
+  private_ip TEXT,
+  phase_timings TEXT,
   files TEXT,
   created_at TEXT NOT NULL,
   completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS device_codes (
+  device_code_hash TEXT PRIMARY KEY,
+  user_code_hash TEXT UNIQUE NOT NULL,
+  code_challenge TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','authorized')),
+  user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+  current_interval INTEGER NOT NULL DEFAULT 5,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  last_polled_at TEXT
 );
 `;
 
@@ -117,10 +152,23 @@ export class SqliteDb implements DbAdapter {
       const cols = this.db.pragma(`table_info(${table})`) as Array<{ name: string }>;
       return cols.some((c) => c.name === column);
     };
+    const tableExists = (table: string): boolean => {
+      const rows = this.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .all(table) as Array<{ name: string }>;
+      return rows.length > 0;
+    };
 
     // Migration: add agent_versions.notes (from #14c)
     if (!hasColumn("agent_versions", "notes")) {
       this.db.exec("ALTER TABLE agent_versions ADD COLUMN notes TEXT");
+    }
+
+    // Migration 011: add agent_versions.bundle_sha256. Mirrors
+    // the .sql file targeting Postgres. The rebuildWithFks static schemas below
+    // also carry the column so an FK/UNIQUE rebuild on an upgraded DB preserves it.
+    if (!hasColumn("agent_versions", "bundle_sha256")) {
+      this.db.exec("ALTER TABLE agent_versions ADD COLUMN bundle_sha256 TEXT");
     }
 
     // Migration 004: add cache token + savings columns to runs (cache-cost-savings).
@@ -138,6 +186,18 @@ export class SqliteDb implements DbAdapter {
     }
     if (!hasColumn("runs", "usage_cache_savings_usd")) {
       this.db.exec("ALTER TABLE runs ADD COLUMN usage_cache_savings_usd REAL NOT NULL DEFAULT 0");
+    }
+
+    // Migration 016: runner cold-start telemetry columns (operator-only).
+    // phase_timings is a JSON object stored as TEXT (SQLite has no jsonb).
+    if (!hasColumn("runs", "machine_id")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN machine_id TEXT");
+    }
+    if (!hasColumn("runs", "private_ip")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN private_ip TEXT");
+    }
+    if (!hasColumn("runs", "phase_timings")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN phase_timings TEXT");
     }
 
     // Migration 007: users.role column + revoke pre-existing verified=true
@@ -183,6 +243,67 @@ export class SqliteDb implements DbAdapter {
     if (hasColumn("agents", "verified")) {
       this.db.exec("ALTER TABLE agents DROP COLUMN verified");
     }
+
+    // Migration 012: per-agent visibility. Mirrors the .sql file for
+    // Postgres. Added AFTER migrateForeignKeys so old DBs that get rebuilt
+    // (the rebuild copies only the old columns) still receive it here.
+    // CHECK is legal in SQLite ADD COLUMN.
+    if (!hasColumn("agents", "visibility")) {
+      this.db.exec(
+        "ALTER TABLE agents ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','public'))",
+      );
+    }
+
+    // Migration 013: API-key scope_kind + api_key_agents join. Mirrors the
+    // .sql file for Postgres. scope_kind via ALTER (like visibility, AFTER the
+    // FK rebuild). api_key_agents is created HERE (not in the SCHEMA constant)
+    // on purpose: SCHEMA runs before migrateForeignKeys(), which on a pre-005
+    // upgrade DROPs+rebuilds the api_keys parent table — a child table created
+    // in SCHEMA that references api_keys would collide with that rebuild.
+    // Creating it after the rebuild sidesteps the hazard entirely.
+    if (!hasColumn("api_keys", "scope_kind")) {
+      this.db.exec(
+        "ALTER TABLE api_keys ADD COLUMN scope_kind TEXT NOT NULL DEFAULT 'account' CHECK (scope_kind IN ('account','agents'))",
+      );
+    }
+    if (!tableExists("api_key_agents")) {
+      this.db.exec(
+        `CREATE TABLE api_key_agents (
+          api_key_id TEXT NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+          agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+          PRIMARY KEY (api_key_id, agent_id)
+        )`,
+      );
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_api_key_agents_agent ON api_key_agents(agent_id)",
+      );
+    }
+
+    // Migration 014: creator-attached LLM keys + caller-key policy. Mirrors the
+    // .sql file for Postgres. llm_key_policy via ALTER (like visibility, AFTER
+    // the FK rebuild). agent_llm_keys is created HERE (not in the SCHEMA
+    // constant) for the same reason as api_key_agents: SCHEMA runs before
+    // migrateForeignKeys(), which may DROP+rebuild the agents parent table; a
+    // child created in SCHEMA would collide with that rebuild.
+    if (!hasColumn("agents", "llm_key_policy")) {
+      this.db.exec(
+        "ALTER TABLE agents ADD COLUMN llm_key_policy TEXT NOT NULL DEFAULT 'open' CHECK (llm_key_policy IN ('open','creator_only'))",
+      );
+    }
+    if (!tableExists("agent_llm_keys")) {
+      this.db.exec(
+        `CREATE TABLE agent_llm_keys (
+          agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+          provider TEXT NOT NULL,
+          ciphertext TEXT NOT NULL,
+          last4 TEXT,
+          key_version INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (agent_id, provider)
+        )`,
+      );
+    }
   }
 
   /** Number of FK rows the table is expected to have post-migration. */
@@ -191,7 +312,7 @@ export class SqliteDb implements DbAdapter {
     agents: 1, // owner_id -> users
     agent_versions: 1, // agent_id -> agents
     environments: 1, // owner_id -> users
-    runs: 3, // agent_id -> agents, environment_id -> environments, user_id -> users
+    runs: 4, // agent_id, environment_id, user_id, api_key_id (all ON DELETE SET NULL)
   };
 
   private migrateForeignKeys(): void {
@@ -279,6 +400,7 @@ export class SqliteDb implements DbAdapter {
           version TEXT NOT NULL,
           size INTEGER NOT NULL,
           bundle_key TEXT NOT NULL,
+          bundle_sha256 TEXT,
           config_snapshot TEXT,
           notes TEXT,
           pushed_at TEXT NOT NULL,
@@ -322,6 +444,7 @@ export class SqliteDb implements DbAdapter {
           model TEXT,
           environment_id TEXT REFERENCES environments(id) ON DELETE SET NULL,
           user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+          api_key_id TEXT REFERENCES api_keys(id) ON DELETE SET NULL,
           status TEXT NOT NULL,
           input TEXT,
           output TEXT,
@@ -387,6 +510,7 @@ export class SqliteDb implements DbAdapter {
         version TEXT NOT NULL,
         size INTEGER NOT NULL,
         bundle_key TEXT NOT NULL,
+        bundle_sha256 TEXT,
         config_snapshot TEXT,
         notes TEXT,
         pushed_at TEXT NOT NULL,
@@ -448,13 +572,19 @@ export class SqliteDb implements DbAdapter {
   }
 
   private toAgent(row: Record<string, unknown>): Agent {
-    return row as unknown as Agent;
+    return {
+      ...row,
+      // Defensive fallback for legacy rows not yet migrated to 014.
+      llm_key_policy: (row.llm_key_policy as AgentLlmKeyPolicy) ?? "open",
+    } as unknown as Agent;
   }
 
   private toApiKey(row: Record<string, unknown>): ApiKey {
     return {
       ...row,
       scopes: (this.jsonParse(row.scopes as string) as string[]) ?? [],
+      // Defensive fallback for legacy rows not yet migrated to 013.
+      scope_kind: (row.scope_kind as ApiKeyScopeKind) ?? "account",
     } as ApiKey;
   }
 
@@ -464,12 +594,15 @@ export class SqliteDb implements DbAdapter {
       input: this.jsonParse(row.input as string) as Record<string, unknown> | null,
       output: this.jsonParse(row.output as string) as Record<string, unknown> | null,
       files: this.jsonParse(row.files as string) as Record<string, unknown>[] | null,
+      phase_timings: this.jsonParse(row.phase_timings as string) as Record<string, number> | null,
       // Defensive fallbacks for legacy DBs not yet migrated to 004 (cache columns).
       // Once SqliteDb.migrate() runs, these are populated from row.*; the ?? 0
       // handles the brief window where typecheck passes but values are absent.
       usage_cache_read_tokens: (row.usage_cache_read_tokens as number | undefined) ?? 0,
       usage_cache_write_tokens: (row.usage_cache_write_tokens as number | undefined) ?? 0,
       usage_cache_savings_usd: (row.usage_cache_savings_usd as number | undefined) ?? 0,
+      // Defensive fallback for legacy rows not yet migrated to 013.
+      api_key_id: (row.api_key_id as string | null) ?? null,
     } as Run;
   }
 
@@ -491,15 +624,18 @@ export class SqliteDb implements DbAdapter {
     namespace: string;
     description: string;
     owner_id: string;
+    visibility?: "private" | "public";
   }): Promise<Agent> {
     const id = randomUUID();
     const now = new Date().toISOString();
+    const visibility = data.visibility ?? "private";
     this.db
       .prepare(
-        "INSERT INTO agents (id, name, namespace, description, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO agents (id, name, namespace, description, owner_id, visibility, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(id, data.name, data.namespace, data.description, data.owner_id, now, now);
-    return { id, ...data, created_at: now, updated_at: now };
+      .run(id, data.name, data.namespace, data.description, data.owner_id, visibility, now, now);
+    // llm_key_policy relies on the column DEFAULT 'open' at the DB level.
+    return { id, ...data, visibility, llm_key_policy: "open", created_at: now, updated_at: now };
   }
 
   async getAgent(namespace: string, name: string): Promise<Agent | null> {
@@ -571,6 +707,34 @@ export class SqliteDb implements DbAdapter {
     return this.getVersionByNumber(agent.id, version);
   }
 
+  async setVisibility(
+    namespace: string,
+    name: string,
+    visibility: "private" | "public",
+  ): Promise<Agent | null> {
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare("UPDATE agents SET visibility = ?, updated_at = ? WHERE namespace = ? AND name = ?")
+      .run(visibility, now, namespace, name);
+    if (result.changes === 0) return null;
+    return this.getAgent(namespace, name);
+  }
+
+  async setLlmKeyPolicy(
+    namespace: string,
+    name: string,
+    policy: AgentLlmKeyPolicy,
+  ): Promise<Agent | null> {
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        "UPDATE agents SET llm_key_policy = ?, updated_at = ? WHERE namespace = ? AND name = ?",
+      )
+      .run(policy, now, namespace, name);
+    if (result.changes === 0) return null;
+    return this.getAgent(namespace, name);
+  }
+
   async deleteAgent(namespace: string, name: string): Promise<boolean> {
     const agent = await this.getAgent(namespace, name);
     if (!agent) return false;
@@ -587,6 +751,7 @@ export class SqliteDb implements DbAdapter {
       version: string;
       size: number;
       bundle_key: string;
+      bundle_sha256?: string | null;
       config_snapshot?: Record<string, unknown>;
       notes?: string | null;
     },
@@ -595,11 +760,22 @@ export class SqliteDb implements DbAdapter {
     const now = new Date().toISOString();
     const snapshot = data.config_snapshot ? JSON.stringify(data.config_snapshot) : null;
     const notes = data.notes ?? null;
+    const bundleSha256 = data.bundle_sha256 ?? null;
     this.db
       .prepare(
-        "INSERT INTO agent_versions (id, agent_id, version, size, bundle_key, config_snapshot, notes, pushed_at, verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        "INSERT INTO agent_versions (id, agent_id, version, size, bundle_key, bundle_sha256, config_snapshot, notes, pushed_at, verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
       )
-      .run(id, agentId, data.version, data.size, data.bundle_key, snapshot, notes, now);
+      .run(
+        id,
+        agentId,
+        data.version,
+        data.size,
+        data.bundle_key,
+        bundleSha256,
+        snapshot,
+        notes,
+        now,
+      );
     this.db.prepare("UPDATE agents SET updated_at = ? WHERE id = ?").run(now, agentId);
     return {
       id,
@@ -607,6 +783,7 @@ export class SqliteDb implements DbAdapter {
       version: data.version,
       size: data.size,
       bundle_key: data.bundle_key,
+      bundle_sha256: bundleSha256,
       config_snapshot: data.config_snapshot,
       notes,
       pushed_at: now,
@@ -641,6 +818,18 @@ export class SqliteDb implements DbAdapter {
     this.db
       .prepare("DELETE FROM agent_versions WHERE agent_id = ? AND version = ?")
       .run(agentId, version);
+  }
+
+  async listVersionsMissingHash(): Promise<Array<{ id: string; bundle_key: string }>> {
+    return this.db
+      .prepare("SELECT id, bundle_key FROM agent_versions WHERE bundle_sha256 IS NULL")
+      .all() as Array<{ id: string; bundle_key: string }>;
+  }
+
+  async setVersionBundleHash(versionId: string, bundleSha256: string): Promise<void> {
+    this.db
+      .prepare("UPDATE agent_versions SET bundle_sha256 = ? WHERE id = ?")
+      .run(bundleSha256, versionId);
   }
 
   // ── Agent State ───────────────────────────────────────────────────────
@@ -758,6 +947,8 @@ export class SqliteDb implements DbAdapter {
     key_prefix: string;
     name: string;
     scopes?: string[];
+    scope_kind?: ApiKeyScopeKind;
+    agents?: string[];
     expires_at?: string;
   }): Promise<ApiKey> {
     const id = randomUUID();
@@ -768,26 +959,37 @@ export class SqliteDb implements DbAdapter {
       key_hash: data.key_hash,
       key_prefix: data.key_prefix,
       name: data.name,
-      scopes: data.scopes ?? [],
+      scopes: data.scopes ?? [...API_KEY_DEFAULT_SCOPES],
+      scope_kind: data.scope_kind ?? "account",
       last_used_at: null,
       expires_at: data.expires_at ?? null,
       created_at: now,
     };
-    this.db
-      .prepare(
-        "INSERT INTO api_keys (id, user_id, key_hash, key_prefix, name, scopes, last_used_at, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      )
-      .run(
+    const insertKey = this.db.prepare(
+      "INSERT INTO api_keys (id, user_id, key_hash, key_prefix, name, scopes, scope_kind, last_used_at, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    const insertGrant = this.db.prepare(
+      "INSERT INTO api_key_agents (api_key_id, agent_id) VALUES (?, ?)",
+    );
+    // Key + grant rows atomically (a partial insert would leave a scoped key
+    // with the wrong grant set).
+    this.db.transaction(() => {
+      insertKey.run(
         id,
         data.user_id,
         data.key_hash,
         data.key_prefix,
         data.name,
         JSON.stringify(apiKey.scopes),
+        apiKey.scope_kind,
         null,
         apiKey.expires_at,
         now,
       );
+      for (const agentId of data.agents ?? []) {
+        insertGrant.run(id, agentId);
+      }
+    })();
     return apiKey;
   }
 
@@ -817,6 +1019,164 @@ export class SqliteDb implements DbAdapter {
       .run(new Date().toISOString(), id);
   }
 
+  async getApiKeyAgentIds(keyId: string): Promise<string[]> {
+    const rows = this.db
+      .prepare("SELECT agent_id FROM api_key_agents WHERE api_key_id = ?")
+      .all(keyId) as Array<{ agent_id: string }>;
+    return rows.map((r) => r.agent_id);
+  }
+
+  // ── Device codes (CLI device-login, RFC 8628) ─────────────────────────
+
+  private toDeviceCode(row: Record<string, unknown>): DeviceCode {
+    return {
+      device_code_hash: row.device_code_hash as string,
+      user_code_hash: row.user_code_hash as string,
+      code_challenge: row.code_challenge as string,
+      status: row.status as DeviceCodeStatus,
+      user_id: (row.user_id as string | null) ?? null,
+      current_interval: row.current_interval as number,
+      attempt_count: row.attempt_count as number,
+      created_at: row.created_at as string,
+      expires_at: row.expires_at as string,
+      last_polled_at: (row.last_polled_at as string | null) ?? null,
+    };
+  }
+
+  async createDeviceCode(data: {
+    device_code_hash: string;
+    user_code_hash: string;
+    code_challenge: string;
+    expires_at: string;
+    current_interval?: number;
+  }): Promise<void> {
+    this.db
+      .prepare(
+        "INSERT INTO device_codes (device_code_hash, user_code_hash, code_challenge, status, user_id, current_interval, attempt_count, created_at, expires_at, last_polled_at) VALUES (?, ?, ?, 'pending', NULL, ?, 0, ?, ?, NULL)",
+      )
+      .run(
+        data.device_code_hash,
+        data.user_code_hash,
+        data.code_challenge,
+        data.current_interval ?? 5,
+        new Date().toISOString(),
+        data.expires_at,
+      );
+  }
+
+  async getDeviceCodeByDeviceHash(deviceCodeHash: string): Promise<DeviceCode | null> {
+    const row = this.db
+      .prepare("SELECT * FROM device_codes WHERE device_code_hash = ?")
+      .get(deviceCodeHash) as Record<string, unknown> | undefined;
+    return row ? this.toDeviceCode(row) : null;
+  }
+
+  async getDeviceCodeByUserHash(userCodeHash: string): Promise<DeviceCode | null> {
+    const row = this.db
+      .prepare("SELECT * FROM device_codes WHERE user_code_hash = ?")
+      .get(userCodeHash) as Record<string, unknown> | undefined;
+    return row ? this.toDeviceCode(row) : null;
+  }
+
+  async authorizeDeviceCode(userCodeHash: string, userId: string): Promise<boolean> {
+    const result = this.db
+      .prepare(
+        "UPDATE device_codes SET status = 'authorized', user_id = ? WHERE user_code_hash = ? AND status = 'pending'",
+      )
+      .run(userId, userCodeHash);
+    return result.changes > 0;
+  }
+
+  async recordDeviceCodePoll(deviceCodeHash: string, slowDown: boolean): Promise<void> {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        slowDown
+          ? "UPDATE device_codes SET last_polled_at = ?, current_interval = current_interval + 5 WHERE device_code_hash = ?"
+          : "UPDATE device_codes SET last_polled_at = ? WHERE device_code_hash = ?",
+      )
+      .run(now, deviceCodeHash);
+  }
+
+  async incrementDeviceCodeAttempts(deviceCodeHash: string): Promise<number> {
+    this.db
+      .prepare(
+        "UPDATE device_codes SET attempt_count = attempt_count + 1 WHERE device_code_hash = ?",
+      )
+      .run(deviceCodeHash);
+    const row = this.db
+      .prepare("SELECT attempt_count FROM device_codes WHERE device_code_hash = ?")
+      .get(deviceCodeHash) as { attempt_count: number } | undefined;
+    return row?.attempt_count ?? 0;
+  }
+
+  async consumeDeviceCode(deviceCodeHash: string): Promise<void> {
+    this.db.prepare("DELETE FROM device_codes WHERE device_code_hash = ?").run(deviceCodeHash);
+  }
+
+  async purgeExpiredDeviceCodes(): Promise<void> {
+    this.db.prepare("DELETE FROM device_codes WHERE expires_at < ?").run(new Date().toISOString());
+  }
+
+  // ── Agent LLM keys (creator-attached, encrypted) ──────────────────────
+
+  async setAgentLlmKey(
+    agentId: string,
+    provider: string,
+    ciphertext: string,
+    last4: string,
+    keyVersion: number,
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO agent_llm_keys (agent_id, provider, ciphertext, last4, key_version, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (agent_id, provider) DO UPDATE SET
+           ciphertext = excluded.ciphertext,
+           last4 = excluded.last4,
+           key_version = excluded.key_version,
+           updated_at = excluded.updated_at`,
+      )
+      .run(agentId, provider, ciphertext, last4, keyVersion, now, now);
+  }
+
+  async deleteAgentLlmKey(agentId: string, provider: string): Promise<void> {
+    this.db
+      .prepare("DELETE FROM agent_llm_keys WHERE agent_id = ? AND provider = ?")
+      .run(agentId, provider);
+  }
+
+  async listAgentLlmKeys(agentId: string): Promise<AgentLlmKeyInfo[]> {
+    const rows = this.db
+      .prepare(
+        "SELECT provider, last4, updated_at FROM agent_llm_keys WHERE agent_id = ? ORDER BY provider",
+      )
+      .all(agentId) as Array<{ provider: string; last4: string; updated_at: string }>;
+    return rows.map((r) => ({ provider: r.provider, last4: r.last4, updated_at: r.updated_at }));
+  }
+
+  async getAgentLlmKeySecrets(agentId: string): Promise<AgentLlmKeyRecord[]> {
+    const rows = this.db
+      .prepare(
+        "SELECT agent_id, provider, ciphertext, last4, key_version FROM agent_llm_keys WHERE agent_id = ?",
+      )
+      .all(agentId) as Array<{
+      agent_id: string;
+      provider: string;
+      ciphertext: string;
+      last4: string;
+      key_version: number;
+    }>;
+    return rows.map((r) => ({
+      agent_id: r.agent_id,
+      provider: r.provider,
+      ciphertext: r.ciphertext,
+      last4: r.last4,
+      key_version: r.key_version,
+    }));
+  }
+
   // ── Runs ──────────────────────────────────────────────────────────────
 
   async createRun(data: {
@@ -826,8 +1186,10 @@ export class SqliteDb implements DbAdapter {
     model?: string | null;
     environment_id?: string | null;
     user_id?: string | null;
+    api_key_id?: string | null;
     status: RunStatus;
     input?: Record<string, unknown>;
+    created_at?: string;
   }): Promise<Run> {
     const now = new Date().toISOString();
     const run: Run = {
@@ -837,6 +1199,7 @@ export class SqliteDb implements DbAdapter {
       model: data.model ?? null,
       environment_id: data.environment_id ?? null,
       user_id: data.user_id ?? null,
+      api_key_id: data.api_key_id ?? null,
       status: data.status,
       input: data.input ?? null,
       output: null,
@@ -849,14 +1212,17 @@ export class SqliteDb implements DbAdapter {
       usage_cache_write_tokens: 0,
       usage_cache_savings_usd: 0,
       duration_ms: null,
+      machine_id: null,
+      private_ip: null,
+      phase_timings: null,
       files: null,
-      created_at: now,
+      created_at: data.created_at ?? now,
       completed_at: null,
     };
     this.db
       .prepare(
-        `INSERT INTO runs (id, agent_id, agent_version, model, environment_id, user_id, status, input, output, error, usage_prompt_tokens, usage_completion_tokens, usage_total_tokens, usage_estimated_cost, duration_ms, files, created_at, completed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, agent_id, agent_version, model, environment_id, user_id, api_key_id, status, input, output, error, usage_prompt_tokens, usage_completion_tokens, usage_total_tokens, usage_estimated_cost, duration_ms, files, created_at, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         run.id,
@@ -865,6 +1231,7 @@ export class SqliteDb implements DbAdapter {
         run.model,
         run.environment_id,
         run.user_id,
+        run.api_key_id,
         run.status,
         run.input ? JSON.stringify(run.input) : null,
         null,
@@ -875,7 +1242,7 @@ export class SqliteDb implements DbAdapter {
         0,
         null,
         null,
-        now,
+        run.created_at,
         null,
       );
     return run;
@@ -899,6 +1266,9 @@ export class SqliteDb implements DbAdapter {
         | "duration_ms"
         | "files"
         | "completed_at"
+        | "machine_id"
+        | "private_ip"
+        | "phase_timings"
       >
     >,
   ): Promise<Run | null> {
@@ -906,7 +1276,7 @@ export class SqliteDb implements DbAdapter {
     const vals: unknown[] = [];
     for (const [key, val] of Object.entries(data)) {
       sets.push(`${key} = ?`);
-      if (key === "output" || key === "files") {
+      if (key === "output" || key === "files" || key === "phase_timings") {
         vals.push(val != null ? JSON.stringify(val) : null);
       } else {
         vals.push(val ?? null);
@@ -957,22 +1327,26 @@ export class SqliteDb implements DbAdapter {
   // ── Stats ─────────────────────────────────────────────────────────────
 
   async getStats(opts?: { userId?: string }) {
+    // Per-user multi-tenancy: count only the caller's own agents (owner_id),
+    // matching the user_id filter on the run aggregates below.
     const agents_count = (
-      this.db.prepare("SELECT COUNT(*) as cnt FROM agents").get() as { cnt: number }
+      (opts?.userId
+        ? this.db.prepare("SELECT COUNT(*) as cnt FROM agents WHERE owner_id = ?").get(opts.userId)
+        : this.db.prepare("SELECT COUNT(*) as cnt FROM agents").get()) as { cnt: number }
     ).cnt;
 
     const now = new Date();
+    // Calendar-day anchors — for the per-day sparkline buckets only.
     const todayStart = new Date(now);
     todayStart.setUTCHours(0, 0, 0, 0);
-    const todayISO = todayStart.toISOString();
-
-    const yesterdayStart = new Date(todayStart);
-    yesterdayStart.setUTCDate(yesterdayStart.getUTCDate() - 1);
-    const yesterdayISO = yesterdayStart.toISOString();
-
     const sevenDaysAgo = new Date(todayStart);
     sevenDaysAgo.setUTCDate(sevenDaysAgo.getUTCDate() - 6);
     const sevenDaysAgoISO = sevenDaysAgo.toISOString();
+
+    // Rolling windows — headline today/yesterday tiles are trailing 24h / prior
+    // 24h (not UTC calendar days). Field names kept for wire compatibility.
+    const last24hISO = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+    const prev24hISO = new Date(now.getTime() - 48 * 60 * 60 * 1000).toISOString();
 
     // Multi-tenancy: when userId provided, every aggregate filters WHERE user_id = ?
     // Self-host single-tenant (dev-token mode) passes a deterministic userId so
@@ -988,7 +1362,7 @@ export class SqliteDb implements DbAdapter {
          COALESCE(SUM(usage_estimated_cost), 0) as cost
          FROM runs WHERE created_at >= ? ${userClause}`,
       )
-      .get(todayISO, ...userArg) as {
+      .get(last24hISO, ...userArg) as {
       runs: number;
       tokens: number;
       failed: number;
@@ -1004,7 +1378,7 @@ export class SqliteDb implements DbAdapter {
          COALESCE(SUM(usage_estimated_cost), 0) as cost
          FROM runs WHERE created_at >= ? AND created_at < ? ${userClause}`,
       )
-      .get(yesterdayISO, todayISO, ...userArg) as {
+      .get(prev24hISO, last24hISO, ...userArg) as {
       runs: number;
       tokens: number;
       failed: number;

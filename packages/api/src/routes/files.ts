@@ -14,6 +14,7 @@ import type { DbAdapter } from "../db/adapter.js";
 import { resolveFileId } from "../files/file-id-resolver.js";
 import { writeInputFile } from "../files/input-store.js";
 import { getUser } from "../middleware/auth.js";
+import { isDelegatedKey } from "../services/key-scope.js";
 
 const CONTENT_TYPES: Record<string, string> = {
   ".pdf": "application/pdf",
@@ -237,7 +238,7 @@ export function createFilesRoutes(db: DbAdapter, authMiddleware: MiddlewareHandl
     });
   });
 
-  router.delete("/files/:id", authMiddleware, (c) => {
+  router.delete("/files/:id", authMiddleware, async (c) => {
     const { id } = c.req.param();
     const resolved = resolveFileId(id);
     if (!resolved) {
@@ -262,6 +263,11 @@ export function createFilesRoutes(db: DbAdapter, authMiddleware: MiddlewareHandl
         403,
       );
     }
+    // Enforce ownership before deleting a caller-uploaded input file — mirrors
+    // the GET handlers. Without this, any authenticated caller could delete
+    // another tenant's input file by id (cross-user deletion / IDOR).
+    const ownership = await assertFileOwnership(c, db, id);
+    if (ownership) return ownership;
     deleteInputFile(id);
     return c.body(null, 204);
   });
@@ -269,23 +275,28 @@ export function createFilesRoutes(db: DbAdapter, authMiddleware: MiddlewareHandl
   router.get("/runs/:run_id/files/:filename", authMiddleware, async (c) => {
     const { run_id, filename } = c.req.param();
 
-    // Verify the caller owns the run before serving any byte.
-    const run = await db.getRun(run_id);
-    if (!run) {
-      return c.json(
-        { error: { code: "RUN_NOT_FOUND", message: `Run ${run_id} not found or expired` } },
-        404,
-      );
-    }
-    if (run.user_id !== getUser(c).id) {
+    // A resource-scoped (delegated) key cannot read a run's output files.
+    if (isDelegatedKey(getUser(c))) {
       return c.json(
         {
           error: {
-            code: "FORBIDDEN",
-            message: "You do not have access to this run's files",
+            code: "KEY_SCOPE_FORBIDDEN",
+            message: "This endpoint is not available to a resource-scoped API key.",
           },
         },
         403,
+      );
+    }
+
+    // Verify the caller owns the run before serving any byte.
+    const run = await db.getRun(run_id);
+    // Opaque 404: a non-owner gets the same "not found" as a non-existent run,
+    // so they cannot tell "exists but not yours" from "does not exist" (aligns
+    // run-file reads with the registry's 404-opaque reads).
+    if (!run || run.user_id !== getUser(c).id) {
+      return c.json(
+        { error: { code: "RUN_NOT_FOUND", message: `Run ${run_id} not found or expired` } },
+        404,
       );
     }
 

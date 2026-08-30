@@ -62,6 +62,10 @@ web_modules/
 # Output of 'npm pack'
 *.tgz
 
+# Runtime-image build-context staging (CI copies packages/web/dist here before
+# `docker build`; the workspace tarballs above are the *.tgz siblings)
+infra/runtime-image/web-dist/
+
 # Yarn Integrity file
 .yarn-integrity
 
@@ -148,6 +152,7 @@ skrun.db-*
 # Local tool config
 .claude/
 .playwright-mcp/
+.mcp.json
 
 # One-off local dev helpers — wipe scripts, sweep scripts. Never committed.
 scripts/wipe-*.mjs

@@ -1,7 +1,7 @@
 name: pdf-processing
 version: 1.1.0
 
-# v1.1.0: vision-native. Accepts a PDF directly via Skrun's multimodal-inputs (#56).
+# v1.1.0: vision-native. Accepts a PDF directly via Skrun's multimodal-inputs.
 # The LLM reads the PDF with its native document capability — no upstream extraction tool needed.
 # v1.0.0 (text-mode + extract tool placeholder) is removed.
 

@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { FileInfo, RunEvent } from "@skrun-dev/runtime";
+import type { FileInfo, RunEvent, RuntimeAdapter } from "@skrun-dev/runtime";
 import {
   createLogger,
+  FlyioAdapter,
   isHostAllowed,
   LLMRouter,
   LocalAdapter,
@@ -27,9 +28,19 @@ import { depsCache } from "../cache/deps-cache.js";
 import { getInputFile } from "../cache/input-cache.js";
 import { registerOutput } from "../cache/output-cache.js";
 import type { DbAdapter } from "../db/adapter.js";
+import type { Agent } from "../db/schema.js";
 import { getUser } from "../middleware/auth.js";
+import type { FlyioRuntimeDeps, RuntimeMode } from "../runtime/adapter-selection.js";
+import { assertAgentRunnableOrThrow } from "../services/access.js";
+import { resolveCreatorKeys } from "../services/creator-llm-key.js";
+import { assertKeyScopeOrThrow, isMasterCredential } from "../services/key-scope.js";
 import type { RegistryService } from "../services/registry.js";
 import { RegistryError } from "../services/registry.js";
+import type { KeyProvider } from "../services/secrets/key-provider.js";
+import {
+  isRunGatedByVerification,
+  type VerificationPolicy,
+} from "../services/verification-policy.js";
 import { formatSSEEvent } from "../utils/sse.js";
 import { dispatchRegistryError, persistRunCompletion } from "./_helpers.js";
 
@@ -82,14 +93,96 @@ function hintForBadVersion(raw: string): string {
   return "";
 }
 
+export interface CreateRunRoutesOptions {
+  /** Default `"local"`. `"flyio"` switches each run to a Fly.io sandbox machine. */
+  runtimeMode?: RuntimeMode;
+  /** Required when `runtimeMode === "flyio"`. Constructed at startup by `buildFlyioDeps`. */
+  flyioDeps?: FlyioRuntimeDeps;
+  /** Operator verification policy. Default `"admin"` (legacy gate) when unset. */
+  verificationPolicy?: VerificationPolicy;
+  /**
+   * Encryption provider for creator-attached LLM keys, built once at startup via
+   * `getKeyProvider()` (the boot interlock). Used at run time to decrypt an
+   * agent's creator keys harness-side. When omitted (or unconfigured), no creator
+   * key is resolved and resolution falls back to caller > server.
+   */
+  keyProvider?: KeyProvider;
+}
+
+/**
+ * Build the per-run ToolRegistry for the active runtime mode.
+ *
+ * - LocalAdapter path: instantiates real `ScriptToolProvider` (from the
+ *   extracted bundle dir on disk) + per-MCP-server `McpToolProvider`
+ *   (cached across runs by config key). Throws `McpConnectError` on
+ *   handshake failure; the route layer surfaces 502.
+ * - FlyioAdapter path: returns an EMPTY registry. The cloud adapter
+ *   builds its own per-request registry post-spawn from the runner's
+ *   `/init` response (script tools + MCP tools live in the sandbox, not
+ *   the harness). Passing an empty registry preserves the constructor
+ *   contract until a future refactor splits the ctor.
+ */
+async function buildToolRegistryForAdapter(
+  runtimeMode: RuntimeMode,
+  agentConfig: import("@skrun-dev/schema").AgentConfig,
+  bundleDir: string,
+  allowedHosts: string[],
+  runOutputDir: string,
+): Promise<ToolRegistry> {
+  const toolRegistry = new ToolRegistry();
+  if (runtimeMode === "flyio") {
+    return toolRegistry;
+  }
+
+  // LocalAdapter path — register real providers.
+  if (bundleDir) {
+    const { existsSync } = await import("node:fs");
+    const scriptsDir = join(bundleDir, "scripts");
+    if (existsSync(scriptsDir)) {
+      const scriptProvider = new ScriptToolProvider(
+        scriptsDir,
+        agentConfig.tools,
+        allowedHosts,
+        runOutputDir,
+        { bundleRoot: bundleDir, depsCache },
+      );
+      await toolRegistry.addProvider(scriptProvider);
+    }
+  }
+
+  for (const mcpServer of agentConfig.mcp_servers) {
+    const tempProvider = new McpToolProvider(mcpServer, undefined, allowedHosts);
+    const configKey = `${tempProvider.getConfigKey()}:${JSON.stringify(allowedHosts)}`;
+    let mcpProvider = mcpCache.get(configKey);
+    if (!mcpProvider) {
+      mcpProvider = tempProvider;
+      // Throws `McpConnectError` on timeout / transport failure.
+      await mcpProvider.listTools();
+      mcpCache.set(configKey, mcpProvider);
+    }
+    await toolRegistry.addProvider(mcpProvider);
+  }
+
+  return toolRegistry;
+}
+
 export function createRunRoutes(
   service: RegistryService,
   db: DbAdapter,
   authMiddleware: MiddlewareHandler,
+  opts: CreateRunRoutesOptions = {},
 ): Hono {
   const router = new Hono();
+  const runtimeMode: RuntimeMode = opts.runtimeMode ?? "local";
+  const flyioDeps = opts.flyioDeps;
+  if (runtimeMode === "flyio" && !flyioDeps) {
+    throw new Error(
+      "createRunRoutes: runtimeMode=flyio requires flyioDeps — set both via createApp.",
+    );
+  }
 
-  // POST /run is public — any authenticated user can run any agent (marketplace model)
+  // POST /run is run-authorized (see assertAgentRunnableOrThrow): public agents
+  // run for any authenticated caller; private agents only for their owner/admin.
   router.post("/agents/:namespace/:name/run", authMiddleware, async (c) => {
     const { namespace, name } = c.req.param();
     const runId = randomUUID();
@@ -170,8 +263,12 @@ export function createRunRoutes(
     if (webhookUrl) {
       try {
         const url = new URL(webhookUrl);
-        const isDev = process.env.NODE_ENV !== "production";
-        if (!isDev && url.protocol !== "https:") {
+        // Fail-closed: reject non-HTTPS / private webhook hosts unless the
+        // operator explicitly opts in for local testing (the same
+        // SKRUN_ALLOW_LOCAL_WEBHOOKS flag honored by utils/webhook.ts at
+        // delivery time, so local http://localhost webhooks work end to end).
+        const allowLocal = process.env.SKRUN_ALLOW_LOCAL_WEBHOOKS === "true";
+        if (!allowLocal && url.protocol !== "https:") {
           return c.json(
             {
               error: {
@@ -183,12 +280,11 @@ export function createRunRoutes(
           );
         }
         // Reject private / cloud-metadata / link-local hosts even in
-        // unrestricted ["*"] mode (isHostAllowed defense-in-depth via isPrivateHost).
-        // Dev mode bypass: same rationale as the HTTPS check above — local
-        // webhook listeners on `http://localhost:NNNN/...` are the standard
-        // way to test webhook delivery during development. Production keeps
-        // the guard so AWS IMDS / localhost services are unreachable.
-        if (!isDev && !isHostAllowed(url.hostname, ["*"])) {
+        // unrestricted ["*"] mode. This is a string-level fast-fail at intake;
+        // the delivery-time guard in utils/webhook.ts re-checks the RESOLVED
+        // IP (connect-time, DNS-rebinding-safe). The opt-in above relaxes both
+        // for local testing; the default keeps AWS IMDS / localhost unreachable.
+        if (!allowLocal && !isHostAllowed(url.hostname, ["*"])) {
           return c.json(
             {
               error: {
@@ -268,12 +364,151 @@ export function createRunRoutes(
       }
     }
 
+    // 2a. Parse the caller's base-URL declaration (optional).
+    // Same shape as X-LLM-API-Key — a {provider: url} map. Semantics: "the
+    // endpoint MY key for this provider belongs to". It is a statement of intent
+    // by the credential's owner, checked against the agent's declared base_url
+    // once the bundle is parsed (see the caller gate below). Absent stays
+    // `undefined` rather than `{}`: the distinction carries meaning in the gate.
+    let callerBaseUrls: Record<string, string> | undefined;
+    const llmBaseUrlHeader = c.req.header("X-LLM-Base-URL");
+    if (llmBaseUrlHeader) {
+      try {
+        const parsed = JSON.parse(llmBaseUrlHeader);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          return c.json(
+            {
+              error: {
+                code: "INVALID_LLM_BASE_URL_HEADER",
+                message:
+                  'X-LLM-Base-URL must be a JSON object, e.g. {"anthropic": "https://api.example.com/v1"}',
+              },
+            },
+            400,
+          );
+        }
+        for (const [key, value] of Object.entries(parsed)) {
+          if (typeof value !== "string") {
+            return c.json(
+              {
+                error: {
+                  code: "INVALID_LLM_BASE_URL_HEADER",
+                  message: `X-LLM-Base-URL value for "${key}" must be a string`,
+                },
+              },
+              400,
+            );
+          }
+          try {
+            new URL(value);
+          } catch {
+            return c.json(
+              {
+                error: {
+                  code: "INVALID_LLM_BASE_URL_HEADER",
+                  message: `X-LLM-Base-URL value for "${key}" is not a valid URL`,
+                },
+              },
+              400,
+            );
+          }
+        }
+        callerBaseUrls = parsed as Record<string, string>;
+      } catch {
+        return c.json(
+          {
+            error: {
+              code: "INVALID_LLM_BASE_URL_HEADER",
+              message: "X-LLM-Base-URL header is not valid JSON",
+            },
+          },
+          400,
+        );
+      }
+    }
+
+    // 2b. Run-authorization: load the agent row once, gate by visibility, and
+    // reuse it for the bundle pull + run tracking (single DB read). Private
+    // agents are owner/admin-only; a non-owner gets a 404 byte-identical to a
+    // genuinely-absent agent. Runs BEFORE the bundle pull so no storage work
+    // happens for an unauthorized caller (constant-time opacity).
+    const user = getUser(c);
+    let agent: Agent | null;
+    try {
+      agent = await db.getAgent(namespace, name);
+      assertAgentRunnableOrThrow(agent, user, namespace, name);
+      // 2c. API-key scope (operation + resource). The key resolved to the owner
+      // account by run-auth above; this NARROWS what that key may do (a run-only
+      // or agent-scoped key restricts even an admin owner). Throws
+      // 403 KEY_SCOPE_FORBIDDEN — only reachable once ownership passed (so no
+      // existence leak), and BEFORE the bundle pull (no storage work on denial).
+      assertKeyScopeOrThrow(user, agent, "agent:run");
+    } catch (err) {
+      return dispatchRegistryError(c, err);
+    }
+
+    // 2d. Environment-override authorization: only the owner/admin may override
+    // the creator's declared environment (e.g. widen allowed_hosts, swap
+    // secrets). Checked BEFORE the bundle pull so an unauthorized override
+    // fails fast; the actual shallow merge happens at step 5b.
+    if (environmentOverride && !(agent?.owner_id === user.id || user.role === "admin")) {
+      return c.json(
+        {
+          error: {
+            code: "ENV_OVERRIDE_FORBIDDEN",
+            message: "environment override is restricted to the agent owner",
+          },
+        },
+        403,
+      );
+    }
+
+    // 2e. Caller-key policy + creator-key resolution. AFTER the #65 scope gate and
+    // BEFORE the bundle pull. `creator_only` rejects a run that carries its own
+    // X-LLM-API-Key — loud (a caller must never wrongly believe their key, or
+    // their billing, is in play). creatorKeys are decrypted harness-side HERE
+    // (early) so the sanitizeEvent closure below captures them for redaction.
+    if (agent?.llm_key_policy === "creator_only" && callerKeys !== undefined) {
+      return c.json(
+        {
+          error: {
+            code: "CALLER_KEY_NOT_ALLOWED",
+            message:
+              "This agent does not accept caller-provided LLM keys — it runs on the creator's key. Omit the X-LLM-API-Key header.",
+          },
+        },
+        403,
+      );
+    }
+    let creatorKeys: Record<string, string> | undefined;
+    if (agent && opts.keyProvider) {
+      try {
+        creatorKeys = await resolveCreatorKeys(db, opts.keyProvider, agent.id);
+      } catch {
+        // A creator key is attached but cannot be decrypted (e.g. the master key
+        // was rotated away). Fail loud — never silently fall through to a wrong
+        // tier / wrong payer — without surfacing the underlying crypto error.
+        return c.json(
+          {
+            error: {
+              code: "CREATOR_KEY_UNREADABLE",
+              message:
+                "A creator LLM key is attached but could not be decrypted on this server (check SKRUN_SECRETS_ENCRYPTION_KEY).",
+            },
+          },
+          500,
+        );
+      }
+    }
+
     // 3. Load agent from registry (optionally pinned to `requestedVersion`)
     let bundleBuffer: Buffer;
     let resolvedVersion: string;
     let resolvedVerified: boolean;
     try {
-      const result = await service.pull(namespace, name, requestedVersion);
+      const result = await service.pull(namespace, name, requestedVersion, {
+        preloadedAgent: agent ?? undefined,
+      });
       bundleBuffer = result.buffer;
       resolvedVersion = result.version;
       resolvedVerified = result.verified;
@@ -297,12 +532,14 @@ export function createRunRoutes(
       return dispatchRegistryError(c, err);
     }
 
-    // 3b. Hard verified gate — admin must approve a version before it can run.
-    // Per-version flag enables incremental trust: a new push starts unverified
-    // without invalidating prior verified versions (pinned callers protected).
-    // Pre-empts LLM allocation, MCP connect, file alloc, DB write — none of
-    // which should happen for an unapproved version.
-    if (!resolvedVerified) {
+    // 3b. Verified gate, governed by the operator verification policy. Under the
+    // `admin` policy a version must be approved before it can run (the legacy
+    // behavior); under `owner`/`disabled` the owner is the trust authority and
+    // private agents run without this gate (sandbox isolation + reactive abuse).
+    // The gate is visibility-independent: setting an agent public is disabled, so
+    // every live agent is private. Pre-empts LLM allocation, MCP connect, file
+    // alloc, DB write — none of which should happen for a gated version.
+    if (isRunGatedByVerification(opts.verificationPolicy ?? "admin", resolvedVerified)) {
       return c.json(
         {
           error: {
@@ -322,7 +559,7 @@ export function createRunRoutes(
 
     try {
       const cacheKey = `${namespace}/${name}/${resolvedVersion}`;
-      const entry = getOrExtract(bundleCache, cacheKey, bundleBuffer);
+      const entry = await getOrExtract(bundleCache, cacheKey, bundleBuffer);
       bundleDir = entry.dir;
       skillContent = entry.files["SKILL.md"] ?? "";
       agentYamlContent = entry.files["agent.yaml"] ?? "";
@@ -358,6 +595,66 @@ export function createRunRoutes(
       );
     }
 
+    // 5b. Caller gate — layer 3 of the credential-destination rule.
+    //
+    // The rule the whole finding reduces to: a credential may only be sent to an
+    // endpoint chosen by the credential's OWNER. `model.base_url` is chosen by
+    // the agent's author; an `X-LLM-API-Key` belongs to the caller. When those
+    // are different people, the caller must have named the destination.
+    //
+    // This is the earliest possible point: `base_url` lives inside the versioned
+    // bundle, so it is not knowable before `parseAgentYaml` above — unlike the
+    // `creator_only` reject, which fires pre-pull. It still precedes every LLM
+    // allocation, which is what matters.
+    //
+    // The exemption is `owner AND master credential`, not `owner` alone: a
+    // delegated `scope_kind:"agents"` key carries the OWNER's `user.id` by
+    // construction (auth.ts builds the context from the key's owner, and such a
+    // key can only be minted over agents the minter owns), so `owner_id ===
+    // user.id` is true for the very party this gate exists to protect against.
+    // An admin is deliberately NOT exempt — unlike the env-override gate above —
+    // because an admin does not own the caller's LLM key either.
+    if (callerKeys !== undefined && agent) {
+      const isSamePrincipal = agent.owner_id === user.id && isMasterCredential(user);
+      if (!isSamePrincipal) {
+        const declared = agentConfig.model?.base_url;
+        const provider = agentConfig.model?.provider;
+        const consented = provider ? callerBaseUrls?.[provider] : undefined;
+        const sameOrigin = (a: string, b: string): boolean => {
+          try {
+            return new URL(a).origin === new URL(b).origin;
+          } catch {
+            return false;
+          }
+        };
+        // Compared by ORIGIN, not exact string: legitimate paths differ
+        // ("/v1" vs "/api/paas/v4/") and the exfiltration risk is the host.
+        const mismatch =
+          declared && consented
+            ? !sameOrigin(declared, consented)
+            : Boolean(declared) !== Boolean(consented);
+        if (mismatch) {
+          return c.json(
+            {
+              error: {
+                code: "CALLER_BASE_URL_NOT_CONSENTED",
+                message: declared
+                  ? `This agent sends model requests to ${new URL(declared).origin}, which you did not choose. ` +
+                    "Your X-LLM-API-Key would be sent there. To proceed, declare that origin in the " +
+                    `X-LLM-Base-URL header, e.g. {"${provider}": "${new URL(declared).origin}"}.` +
+                    (consented
+                      ? ` You declared ${new URL(consented).origin}, which does not match.`
+                      : "")
+                  : "You declared an X-LLM-Base-URL, but this agent does not use a custom endpoint — " +
+                    "your key would go to the provider's default. Omit the header to proceed.",
+              },
+            },
+            403,
+          );
+        }
+      }
+    }
+
     const modelStr = agentConfig.model
       ? `${agentConfig.model.provider}/${agentConfig.model.name}`
       : null;
@@ -378,7 +675,7 @@ export function createRunRoutes(
       ? modelStr.slice(modelStr.indexOf("/") + 1)
       : (modelStr ?? "");
 
-    // 5b. Merge environment override (if provided)
+    // 5b. Merge environment override (owner/admin-only — authorized at step 2c).
     if (environmentOverride) {
       const { networking: netOverride, ...flatOverride } = environmentOverride as {
         networking?: { allowed_hosts?: string[] };
@@ -479,8 +776,10 @@ export function createRunRoutes(
       }
     }
 
-    // 7. Setup tool registry
-    const toolRegistry = new ToolRegistry();
+    // 7. Setup tool registry via the adapter-aware helper.
+    //    - LocalAdapter path builds real script + MCP providers inline.
+    //    - FlyioAdapter path skips registry construction; the cloud
+    //      adapter wires its own RPC providers post-spawn from /init.
     const warnings: string[] = [];
     const allowedHosts = agentConfig.environment.networking.allowed_hosts;
 
@@ -491,69 +790,33 @@ export function createRunRoutes(
     const runOutputDir = join(tmpdir(), `skrun-outputs-${runId}`);
     mkdirSync(runOutputDir, { recursive: true });
 
-    if (bundleDir) {
-      const { existsSync } = await import("node:fs");
-      const scriptsDir = join(bundleDir, "scripts");
-      if (existsSync(scriptsDir)) {
-        // Hard 403 verified gate upstream (Phase 3b) ensures only admin-approved
-        // versions reach this code path — scripts register unconditionally now.
-        const scriptProvider = new ScriptToolProvider(
-          scriptsDir,
-          agentConfig.tools,
-          allowedHosts,
-          runOutputDir,
-          { bundleRoot: bundleDir, depsCache },
-        );
-        await toolRegistry.addProvider(scriptProvider);
-      }
-    }
-
+    let toolRegistry: ToolRegistry;
     try {
-      for (const mcpServer of agentConfig.mcp_servers) {
-        const tempProvider = new McpToolProvider(mcpServer, undefined, allowedHosts);
-        const configKey = `${tempProvider.getConfigKey()}:${JSON.stringify(allowedHosts)}`;
-        let mcpProvider = mcpCache.get(configKey);
-        if (!mcpProvider) {
-          mcpProvider = tempProvider;
-          // Throws `McpConnectError` on timeout / transport failure. Only
-          // cache on success — caching a broken provider would lock the
-          // bad state in for the TTL window.
-          await mcpProvider.listTools();
-          mcpCache.set(configKey, mcpProvider);
-        }
-        await toolRegistry.addProvider(mcpProvider);
-      }
+      toolRegistry = await buildToolRegistryForAdapter(
+        runtimeMode,
+        agentConfig,
+        bundleDir,
+        allowedHosts,
+        runOutputDir,
+      );
     } catch (err) {
       if (err instanceof McpConnectError) {
         return c.json(
-          {
-            error: {
-              code: err.code,
-              message: err.message,
-              details: err.details,
-            },
-          },
+          { error: { code: err.code, message: err.message, details: err.details } },
           502,
         );
       }
       throw err;
     }
 
-    // 8. Track run in database
-    const caller = getUser(c);
-    let agentId: string | null = null;
-    try {
-      const agentRecord = await db.getAgent(namespace, name);
-      agentId = agentRecord?.id ?? null;
-    } catch {
-      // Non-critical — run tracking proceeds with null agent_id
-    }
+    // 8. Track run in database (reuse the agent + user loaded at run-auth)
     await db.createRun({
       id: runId,
-      agent_id: agentId,
+      agent_id: agent?.id ?? null,
       agent_version: `${namespace}/${name}@${resolvedVersion}`,
       model: modelStr,
-      user_id: caller.id,
+      user_id: user.id,
+      api_key_id: user.key?.id ?? null,
       status: "running",
       input,
     });
@@ -568,12 +831,55 @@ export function createRunRoutes(
     // key. We prefix with the request's namespace so the DB row is scoped to
     // `<namespace>/<slug>`. Two same-slug agents in different namespaces stay
     // isolated.
-    const adapter = new LocalAdapter(
-      globalRouter,
-      toolRegistry,
-      createNamespacedStateCallbacks(db, namespace),
-      log,
-    );
+    const stateCallbacks = createNamespacedStateCallbacks(db, namespace);
+    let adapter: RuntimeAdapter;
+    if (runtimeMode === "flyio") {
+      const deps = flyioDeps as FlyioRuntimeDeps; // ctor-validated; cast is safe
+      adapter = new FlyioAdapter(
+        deps.flyApi,
+        deps.storage,
+        globalRouter,
+        toolRegistry,
+        stateCallbacks,
+        {
+          runtimeImage: deps.runtimeImageTag,
+          // Absent unless the operator configured one; then a run wakes a
+          // pre-created machine instead of creating its own.
+          pool: deps.pool,
+          // Persist the operator-only cold-start telemetry as soon as the runner
+          // is ready (fire-and-forget) — captured even for runs that later fail.
+          // machine_id / private_ip stay off the tenant-facing run response (they
+          // are omitted by the GET /runs serializer); phase_timings is the public
+          // breakdown also carried by the runner_spawned event.
+          onRunnerSpawned: (info) => {
+            db.updateRun(runId, {
+              machine_id: info.machineId,
+              private_ip: info.privateIp,
+              phase_timings: info.phases as unknown as Record<string, number>,
+            }).catch((err) =>
+              log.error(
+                {
+                  event: "db_update_failed",
+                  run_id: runId,
+                  error: err instanceof Error ? err.message : String(err),
+                },
+                "DB updateRun failed (runner_spawned telemetry)",
+              ),
+            );
+          },
+        },
+        log,
+      );
+    } else {
+      adapter = new LocalAdapter(globalRouter, toolRegistry, stateCallbacks, log);
+    }
+
+    // Bundle key follows the registry's storage convention (see
+    // RegistryService.pull). FlyioAdapter reads it to generate the
+    // presigned download URL handed to the spawned runner — LocalAdapter
+    // ignores it (bundle is already on the harness filesystem).
+    const bundleKey = `${namespace}/${name}/${resolvedVersion}.agent`;
+
     const runRequest = {
       agentConfig,
       skillContent,
@@ -581,9 +887,15 @@ export function createRunRoutes(
       input,
       runId,
       callerKeys,
+      creatorKeys,
       agent_version: resolvedVersion,
       outputDir: runOutputDir as string | undefined,
       resolvedInputs,
+      bundleKey,
+      // Caller-disconnect / harness-shutdown safety: the cloud adapter
+      // listens on this to guarantee a spawned machine is destroyed even
+      // when the SSE stream closes mid-run.
+      abortSignal: c.req.raw.signal,
       // environmentId for prompt-cache routing. The API doesn't have
       // persistent env records keyed by ID today; "default" gives stable
       // cache pools per (agent, version). Future feature can hash
@@ -592,22 +904,37 @@ export function createRunRoutes(
     };
 
     // Helper: build files array with download URLs from FileInfo[]
+    //
+    // The url field follows the runtime that produced the file:
+    // - Cloud mode (FlyioAdapter): the runtime sets `f.url` to a presigned
+    //   R2 / MinIO GET URL — direct download from object storage, no proxy
+    //   hop through this API. file_id is undefined in cloud mode (no
+    //   /api/files/:id route hosts the bytes — they live in R2 only).
+    // - Self-host mode (LocalAdapter): `f.url` is unset; we fall back to
+    //   the run-scoped route + propagate file_id so the unified /api/files
+    //   namespace works.
     const buildFilesResponse = (files: FileInfo[] | undefined) =>
       (files ?? []).map((f) => ({
         name: f.name,
         size: f.size,
-        url: `/api/runs/${runId}/files/${encodeURIComponent(f.name)}`,
+        url: f.url ?? `/api/runs/${runId}/files/${encodeURIComponent(f.name)}`,
         ...(f.file_id && { file_id: f.file_id }),
       }));
 
-    // --- Sanitize helper: strip caller keys from event error messages ---
+    // --- Sanitize helpers: strip caller + creator key values from error
+    // messages, both on the wire (sanitizeEvent) AND before the DB error column
+    // (sanitizeError, used in all three failure paths — B-3). A provider 4xx can
+    // echo a key fragment; without this it would land in runs.error + GET /runs/:id. ---
+    const runSecrets = [...Object.values(callerKeys ?? {}), ...Object.values(creatorKeys ?? {})];
+    const sanitizeError = (message: string): string =>
+      runSecrets.length > 0 ? redactSecretsFromString(message, runSecrets) : message;
     const sanitizeEvent = (event: RunEvent): RunEvent => {
-      if (event.type === "run_error" && callerKeys) {
+      if (event.type === "run_error" && runSecrets.length > 0) {
         return {
           ...event,
           error: {
             ...event.error,
-            message: redactSecretsFromString(event.error.message, Object.values(callerKeys)),
+            message: sanitizeError(event.error.message),
           },
         };
       }
@@ -647,7 +974,7 @@ export function createRunRoutes(
             } else if (event.type === "run_error") {
               db.updateRun(runId, {
                 status: "failed",
-                error: event.error.message,
+                error: sanitizeError(event.error.message),
                 completed_at: new Date().toISOString(),
               }).catch((err) =>
                 log.error(
@@ -730,7 +1057,7 @@ export function createRunRoutes(
               await db
                 .updateRun(runId, {
                   status: "failed",
-                  error: event.error.message,
+                  error: sanitizeError(event.error.message),
                   completed_at: new Date().toISOString(),
                 })
                 .catch((err) =>
@@ -853,10 +1180,7 @@ export function createRunRoutes(
     } catch (err) {
       const isTimeout = (err as Error).name === "TimeoutError";
       let errorMessage = err instanceof Error ? err.message : "Agent execution failed";
-
-      if (callerKeys) {
-        errorMessage = redactSecretsFromString(errorMessage, Object.values(callerKeys));
-      }
+      errorMessage = sanitizeError(errorMessage);
 
       // Track failed run
       await db

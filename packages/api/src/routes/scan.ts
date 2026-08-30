@@ -1,33 +1,48 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
-import { gzipSync } from "node:zlib";
+import { readdir } from "node:fs/promises";
+import { join, relative, resolve, sep } from "node:path";
+import { isExcludedEntry, packAgentTar } from "@skrun-dev/schema";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import type { DbAdapter } from "../db/adapter.js";
 import { getUser } from "../middleware/auth.js";
+import { assertKeyCanPushOrThrow } from "../services/key-scope.js";
 import type { RegistryService } from "../services/registry.js";
 import { dispatchRegistryError } from "./_helpers.js";
 
-// --- Tar builder (replicates CLI skrun build logic) ---
+/**
+ * Same segment shape the registry routes enforce on `:name` (nine routes) and
+ * `agent-llm-keys` (two). A superset of the schema's own AGENT_NAME_REGEX, so
+ * every directory with a legal agent name still scans and pushes; one that
+ * would fail it is already unusable through every other registry route.
+ */
+const PATH_SEGMENT_REGEX = /^[a-z0-9-]{1,64}$/;
 
-const EXCLUDE_PATTERNS = new Set(["node_modules", ".git", "dist", ".env", ".DS_Store"]);
-
-function isExcluded(name: string): boolean {
-  if (EXCLUDE_PATTERNS.has(name)) return true;
-  if (name.startsWith(".") && name !== ".") return true;
-  if (name.endsWith(".secret")) return true;
-  return false;
+/**
+ * Containment check with the trailing separator.
+ *
+ * `"/srv/agents-backup".startsWith("/srv/agents")` is `true`, so a sibling
+ * directory sharing the prefix passes a bare `startsWith` — reproduced end to
+ * end as an HTTP 200 through the full app. The repo already gets this right
+ * three times elsewhere (storage/local.ts:27, utils/bundle.ts:70,
+ * routes/files.ts:314); this brings the two scan sites in line.
+ */
+function isInside(child: string, parent: string): boolean {
+  return child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
 }
 
-function collectFiles(dir: string, base: string = dir): string[] {
+// --- Bundle builder (shares the .agent tar codec + exclude contract with the
+// CLI `skrun build`, via @skrun-dev/schema — so the two writers never diverge). ---
+
+export async function collectFiles(dir: string, base: string = dir): Promise<string[]> {
   const files: string[] = [];
-  const entries = readdirSync(dir, { withFileTypes: true });
+  const entries = await readdir(dir, { withFileTypes: true });
 
   for (const entry of entries) {
-    if (isExcluded(entry.name)) continue;
+    if (isExcludedEntry(entry.name)) continue;
     const fullPath = join(dir, entry.name);
     if (entry.isDirectory()) {
-      files.push(...collectFiles(fullPath, base));
+      files.push(...(await collectFiles(fullPath, base)));
     } else {
       files.push(relative(base, fullPath));
     }
@@ -36,43 +51,13 @@ function collectFiles(dir: string, base: string = dir): string[] {
   return files.sort();
 }
 
-function createTarEntry(filePath: string, content: Buffer): Buffer {
-  const header = Buffer.alloc(512);
-  const nameBytes = Buffer.from(filePath, "utf-8");
-  nameBytes.copy(header, 0, 0, Math.min(nameBytes.length, 100));
-
-  Buffer.from("0000644\0").copy(header, 100); // mode
-  Buffer.from("0001000\0").copy(header, 108); // uid
-  Buffer.from("0001000\0").copy(header, 116); // gid
-  Buffer.from(`${content.length.toString(8).padStart(11, "0")}\0`).copy(header, 124); // size
-  Buffer.from("00000000000\0").copy(header, 136); // mtime
-  header[156] = 48; // type: regular file
-  Buffer.from("ustar\0").copy(header, 257); // magic
-  Buffer.from("00").copy(header, 263); // version
-
-  // Checksum
-  Buffer.from("        ").copy(header, 148);
-  let checksum = 0;
-  for (let i = 0; i < 512; i++) {
-    checksum += header[i] ?? 0;
-  }
-  Buffer.from(`${checksum.toString(8).padStart(6, "0")}\0 `).copy(header, 148);
-
-  const paddingSize = (512 - (content.length % 512)) % 512;
-  return Buffer.concat([header, content, Buffer.alloc(paddingSize)]);
-}
-
-function buildAgentBundle(agentDir: string): Buffer {
-  const files = collectFiles(agentDir);
-  const parts: Buffer[] = [];
-
-  for (const file of files) {
-    const content = readFileSync(join(agentDir, file));
-    parts.push(createTarEntry(file, content));
-  }
-
-  parts.push(Buffer.alloc(1024)); // end-of-archive
-  return gzipSync(Buffer.concat(parts));
+async function buildAgentBundle(agentDir: string): Promise<Buffer> {
+  const files = await collectFiles(agentDir);
+  const entries = files.map((file) => ({
+    name: file,
+    content: readFileSync(join(agentDir, file)),
+  }));
+  return packAgentTar(entries);
 }
 
 // --- Routes ---
@@ -107,7 +92,7 @@ export function createScanRoutes(
 
     for (const entry of entries) {
       const entryPath = join(resolvedDir, entry);
-      if (!entryPath.startsWith(resolvedDir)) continue;
+      if (!isInside(entryPath, resolvedDir)) continue;
 
       try {
         const stat = statSync(entryPath);
@@ -143,9 +128,24 @@ export function createScanRoutes(
     const { name } = c.req.param();
     const user = getUser(c);
     const resolvedDir = resolve(agentsDir);
+
+    // `:name` is percent-decoded by Hono, so `..%2fagents-backup` arrives as a
+    // traversal. Validate the segment as the registry routes do, BEFORE joining.
+    if (!PATH_SEGMENT_REGEX.test(name)) {
+      return c.json(
+        {
+          error: {
+            code: "INVALID_AGENT_NAME",
+            message: "Agent name must match ^[a-z0-9-]{1,64}$",
+          },
+        },
+        400,
+      );
+    }
+
     const agentPath = join(resolvedDir, name);
 
-    if (!agentPath.startsWith(resolvedDir)) {
+    if (!isInside(agentPath, resolvedDir)) {
       return c.json({ error: { code: "FORBIDDEN", message: "Invalid agent path" } }, 403);
     }
 
@@ -176,8 +176,19 @@ export function createScanRoutes(
       // Use default version
     }
 
+    // API-key scope (same gate as the regular push route — this is the second
+    // push entrypoint and must not be a bypass).
+    if (user.key) {
+      try {
+        const existing = await db.getAgent(user.namespace, name);
+        assertKeyCanPushOrThrow(user, existing);
+      } catch (err) {
+        return dispatchRegistryError(c, err);
+      }
+    }
+
     // Build bundle in memory (tar.gz) — same format as skrun build
-    const bundle = buildAgentBundle(agentPath);
+    const bundle = await buildAgentBundle(agentPath);
 
     try {
       const metadata = await service.push(user.namespace, name, version, bundle, user.id);

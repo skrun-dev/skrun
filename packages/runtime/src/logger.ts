@@ -13,7 +13,7 @@ export function createLogger(name: string, destination?: pino.DestinationStream)
       name: `skrun:${name}`,
       level,
       redact: {
-        paths: ["callerKeys.*", "details.callerKeys.*"],
+        paths: ["callerKeys.*", "details.callerKeys.*", "creatorKeys.*", "details.creatorKeys.*"],
         censor: "[REDACTED]",
       },
     },

@@ -52,3 +52,27 @@ export function assertAgentVisibleOrThrow(
     throw new RegistryError("NOT_FOUND", `Agent ${requestedNs}/${requestedName} not found`, 404);
   }
 }
+
+/**
+ * Run-authorization gate for `POST /run`. `public` agents are runnable by any
+ * authenticated caller; everything else (`private`, or absent) **delegates to
+ * `assertAgentVisibleOrThrow`** so the opaque 404 shape is shared and cannot
+ * drift between the read path and the run path. Owner/admin may run a private
+ * agent; a non-owner gets a 404 byte-identical to a genuinely-absent agent.
+ *
+ * This gate answers "may this account reach this agent at all?" (ownership /
+ * visibility). API-key scoping is a SEPARATE, narrower restriction layered
+ * AFTER this one (`services/key-scope.ts`): a key always belongs to its owner,
+ * so it passes here by ownership, and the key-scope gate then narrows what that
+ * key may do. There is no cross-account "allowed-branch" here — a restricted
+ * key restricts its own account, it never grants a foreign one access.
+ */
+export function assertAgentRunnableOrThrow(
+  agent: Agent | null,
+  user: UserContext,
+  requestedNs: string,
+  requestedName: string,
+): asserts agent is Agent {
+  if (agent && agent.visibility === "public") return;
+  assertAgentVisibleOrThrow(agent, user, requestedNs, requestedName);
+}

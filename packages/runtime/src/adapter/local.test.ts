@@ -97,6 +97,13 @@ describe("LocalAdapter.executeStream", () => {
     state = createMemoryState();
   });
 
+  it("VT-5: emits no runner_spawned event (cold-start telemetry is flyio-only)", async () => {
+    router.registerProvider("mock", createMockProvider());
+    const adapter = new LocalAdapter(router, tools, state);
+    const events = await collectEvents(adapter.executeStream(createRunRequest()));
+    expect(events.some((e) => e.type === "runner_spawned")).toBe(false);
+  });
+
   it("yields run_start as first event", async () => {
     router.registerProvider("mock", createMockProvider());
     const adapter = new LocalAdapter(router, tools, state);

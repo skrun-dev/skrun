@@ -4,8 +4,20 @@ import { Hono } from "hono";
 import type { DbAdapter } from "../db/adapter.js";
 import { getUser } from "../middleware/auth.js";
 import { assertAgentVisibleOrThrow } from "../services/access.js";
+import {
+  assertKeyCanPushOrThrow,
+  assertKeyCanReadAgentOrThrow,
+  assertKeyScopeOrThrow,
+  assertNotDelegatedOrThrow,
+  isDelegatedKey,
+} from "../services/key-scope.js";
 import type { RegistryService } from "../services/registry.js";
-import { dispatchRegistryError } from "./_helpers.js";
+import {
+  canSetVerified,
+  type VerificationPolicy,
+  verificationKind,
+} from "../services/verification-policy.js";
+import { dispatchRegistryError, requireMasterCredential } from "./_helpers.js";
 
 const logger = createLogger("registry");
 
@@ -41,6 +53,7 @@ export function createRegistryRoutes(
   service: RegistryService,
   authMiddleware: MiddlewareHandler,
   db: DbAdapter,
+  verificationPolicy: VerificationPolicy = "admin",
 ): Hono {
   const router = new Hono();
 
@@ -118,6 +131,18 @@ export function createRegistryRoutes(
       notes = decoded;
     }
 
+    // API-key scope: the key must permit push; a resource-scoped key may only
+    // push to its granted agents and cannot create a brand-new one. Loaded once
+    // here (sk_live only — session/dev-token carry no key and skip the read).
+    if (user.key) {
+      try {
+        const existing = await db.getAgent(namespace, name);
+        assertKeyCanPushOrThrow(user, existing);
+      } catch (err) {
+        return dispatchRegistryError(c, err);
+      }
+    }
+
     try {
       const body = await c.req.arrayBuffer();
       const buffer = Buffer.from(body);
@@ -140,6 +165,8 @@ export function createRegistryRoutes(
     try {
       const agent = await db.getAgent(namespace, name);
       assertAgentVisibleOrThrow(agent, getUser(c), namespace, name);
+      // A resource-scoped (delegated) key cannot pull source.
+      assertNotDelegatedOrThrow(getUser(c));
       const result = await service.pull(namespace, name, undefined, { preloadedAgent: agent });
       c.header("Content-Type", "application/octet-stream");
       c.header("Content-Disposition", `attachment; filename="${name}-${result.version}.agent"`);
@@ -158,6 +185,7 @@ export function createRegistryRoutes(
     try {
       const agent = await db.getAgent(namespace, name);
       assertAgentVisibleOrThrow(agent, getUser(c), namespace, name);
+      assertNotDelegatedOrThrow(getUser(c));
       const result = await service.pull(namespace, name, version, { preloadedAgent: agent });
       c.header("Content-Type", "application/octet-stream");
       c.header("Content-Disposition", `attachment; filename="${name}-${result.version}.agent"`);
@@ -176,6 +204,18 @@ export function createRegistryRoutes(
     const page = Number(c.req.query("page") ?? "1");
     const limit = Number(c.req.query("limit") ?? "20");
     const user = getUser(c);
+    // A delegated key cannot enumerate the account's agents (read-confined).
+    if (isDelegatedKey(user)) {
+      return c.json(
+        {
+          error: {
+            code: "KEY_SCOPE_FORBIDDEN",
+            message: "This endpoint is not available to a resource-scoped API key.",
+          },
+        },
+        403,
+      );
+    }
     const userId = user.role === "admin" ? undefined : user.id;
     const result = await service.list(page, limit, userId);
     return c.json({ ...result, page, limit });
@@ -191,6 +231,8 @@ export function createRegistryRoutes(
     try {
       const agent = await db.getAgent(namespace, name);
       assertAgentVisibleOrThrow(agent, getUser(c), namespace, name);
+      // A delegated key may read metadata only for its in-scope agents.
+      assertKeyCanReadAgentOrThrow(getUser(c), agent);
       const metadata = await service.getMetadata(namespace, name);
       return c.json(metadata);
     } catch (err) {
@@ -206,6 +248,7 @@ export function createRegistryRoutes(
     try {
       const agent = await db.getAgent(namespace, name);
       assertAgentVisibleOrThrow(agent, getUser(c), namespace, name);
+      assertNotDelegatedOrThrow(getUser(c));
       const versions = await service.getVersions(namespace, name);
       return c.json({ versions });
     } catch (err) {
@@ -213,29 +256,56 @@ export function createRegistryRoutes(
     }
   });
 
-  // Verify a specific version — admin-only. Per-version trust: each version
-  // is reviewed independently, push of a new version starts at verified=false,
-  // and pinned production callers keep their verified status through author
+  // Verify a specific version. The attestation authority is governed by the
+  // operator verification policy (admin-only by default; the agent owner may
+  // self-attest under `owner`/`disabled`). Per-version trust: each version is
+  // reviewed independently, push of a new version starts at verified=false, and
+  // pinned production callers keep their verified status through author
   // iteration. Promotion to admin is a manual SQL UPDATE — there is
-  // intentionally no API for elevation. dev-token in self-host mode auto-
-  // grants admin so the local-dev UX still works.
+  // intentionally no API for elevation. dev-token in self-host mode auto-grants
+  // admin so the local-dev UX still works.
   router.patch("/agents/:namespace/:name/versions/:version/verify", authMiddleware, async (c) => {
     const { namespace, name, version } = c.req.param();
     const _invalidName = validateAgentParams(c, namespace, name);
     if (_invalidName) return _invalidName;
     const user = getUser(c);
 
-    if (user.role !== "admin") {
+    // Verification authority is governed by the operator policy. Under `admin`
+    // only an instance admin may attest — the role check alone, no agent read.
+    // Under `owner`/`disabled` the agent owner may attest their own agents, so
+    // load the agent for its owner_id (404 if absent); `setVersionVerified`
+    // stays the per-version 404 source under `admin`.
+    // Load the agent when the policy needs its owner_id (owner/disabled) OR when
+    // an sk_live key needs a resource-scope check. Under `admin` policy with a
+    // session/dev-token, no agent read (role check alone).
+    const agent =
+      verificationPolicy !== "admin" || user.key != null
+        ? await db.getAgent(namespace, name)
+        : null;
+    if (verificationPolicy !== "admin" && !agent) {
       return c.json(
-        {
-          error: {
-            code: "FORBIDDEN",
-            message:
-              "Only an admin can verify agent versions. Promotion to admin requires a manual SQL UPDATE on the users table (see docs/self-hosting.md → Admin role).",
-          },
-        },
-        403,
+        { error: { code: "NOT_FOUND", message: `Agent ${namespace}/${name} not found` } },
+        404,
       );
+    }
+    const agentOwnerId = agent?.owner_id ?? "";
+
+    if (!canSetVerified(verificationPolicy, user, { owner_id: agentOwnerId })) {
+      const message =
+        verificationPolicy === "admin"
+          ? "Only an admin can verify agent versions. Promotion to admin requires a manual SQL UPDATE on the users table (see docs/self-hosting.md → Admin role)."
+          : "Only the agent owner or an admin can verify this agent's versions.";
+      return c.json({ error: { code: "FORBIDDEN", message } }, 403);
+    }
+
+    // API-key scope: verify needs `agent:verify` + (for a resource-scoped key)
+    // the agent in its grants. sk_live only; a missing agent 404s below.
+    if (user.key && agent) {
+      try {
+        assertKeyScopeOrThrow(user, agent, "agent:verify");
+      } catch (err) {
+        return dispatchRegistryError(c, err);
+      }
     }
 
     let body: { verified: boolean };
@@ -264,11 +334,100 @@ export function createRegistryRoutes(
           actor: { user_id: user.id, namespace: user.namespace, role: user.role },
           target: { namespace, name, version },
           action: body.verified ? "verify" : "unverify",
+          kind: verificationKind(user),
           timestamp: new Date().toISOString(),
         },
         `${user.namespace} ${body.verified ? "verified" : "unverified"} ${namespace}/${name}@${version}`,
       );
 
+      return c.json(updated);
+    } catch (err) {
+      return dispatchRegistryError(c, err);
+    }
+  });
+
+  // Change agent visibility — auth required, namespace owner OR admin.
+  // Write-side convention (like verify/delete): announce permission denial
+  // with an explicit 403 (NOT the opaque read-side 404), and return 404 only
+  // when the agent genuinely doesn't exist in the caller's own namespace.
+  router.patch("/agents/:namespace/:name/visibility", authMiddleware, async (c) => {
+    const { namespace, name } = c.req.param();
+    const _invalidName = validateAgentParams(c, namespace, name);
+    if (_invalidName) return _invalidName;
+    const user = getUser(c);
+
+    // Agent-lifecycle administration requires a master credential — a delegated
+    // or operation-limited key cannot change visibility / delete.
+    const denied = requireMasterCredential(c);
+    if (denied) return denied;
+
+    if (namespace !== user.namespace && user.role !== "admin") {
+      return c.json(
+        {
+          error: {
+            code: "FORBIDDEN",
+            message: `You don't have permission to change visibility in namespace '${namespace}'`,
+          },
+        },
+        403,
+      );
+    }
+
+    let body: { visibility: "private" | "public" };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: { code: "INVALID_REQUEST", message: "Invalid JSON body" } }, 400);
+    }
+
+    if (body.visibility !== "private" && body.visibility !== "public") {
+      return c.json(
+        {
+          error: {
+            code: "INVALID_REQUEST",
+            message: 'Body must contain { visibility: "private" | "public" }',
+          },
+        },
+        400,
+      );
+    }
+
+    // Public visibility is a marketplace primitive; until the marketplace exists
+    // the hosting model is private-only. Reject `public` here — the column and
+    // the run-authorization branch are retained for later reactivation, only the
+    // set-path affordance is withheld. The ownership check above runs first, so a
+    // non-owner gets 403 (no oracle that public is disabled).
+    if (body.visibility === "public") {
+      return c.json(
+        {
+          error: {
+            code: "PUBLIC_VISIBILITY_DISABLED",
+            message:
+              "Public visibility ships with the marketplace; agents are private-only for now.",
+          },
+        },
+        400,
+      );
+    }
+
+    try {
+      const updated = await db.setVisibility(namespace, name, body.visibility);
+      if (!updated) {
+        return c.json(
+          { error: { code: "NOT_FOUND", message: `Agent ${namespace}/${name} not found` } },
+          404,
+        );
+      }
+      logger.info(
+        {
+          event: "agent_visibility_change",
+          actor: { user_id: user.id, namespace: user.namespace, role: user.role },
+          target: { namespace, name },
+          action: body.visibility,
+          timestamp: new Date().toISOString(),
+        },
+        `${user.namespace} set ${namespace}/${name} visibility=${body.visibility}`,
+      );
       return c.json(updated);
     } catch (err) {
       return dispatchRegistryError(c, err);
@@ -286,6 +445,9 @@ export function createRegistryRoutes(
     const _invalidNameV = validateAgentParams(c, namespace, name);
     if (_invalidNameV) return _invalidNameV;
     const user = getUser(c);
+
+    const denied = requireMasterCredential(c);
+    if (denied) return denied;
 
     if (namespace !== user.namespace && user.role !== "admin") {
       return c.json(
@@ -316,6 +478,9 @@ export function createRegistryRoutes(
     const _invalidName = validateAgentParams(c, namespace, name);
     if (_invalidName) return _invalidName;
     const user = getUser(c);
+
+    const denied = requireMasterCredential(c);
+    if (denied) return denied;
 
     if (namespace !== user.namespace && user.role !== "admin") {
       return c.json(

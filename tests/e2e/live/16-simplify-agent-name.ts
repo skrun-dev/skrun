@@ -93,8 +93,12 @@ outputs:
 
 /**
  * Open the local SQLite DB read-only. Returns null if the DB doesn't exist
- * (e.g., production-class env where the registry is backed by Supabase).
- * Tests that depend on direct DB access skip themselves cleanly in that case.
+ * (e.g., cloud mode where the registry is backed by Postgres). Only the
+ * direct-DB checks VT-15a/b (agents.name has no slash, agent_state.agent_name
+ * carries its namespace prefix) use this — they are violation-ABSENCE
+ * assertions with no clean API equivalent (agent_state has no public route),
+ * so they skip cleanly off the local backend and a stale skrun.db can't
+ * false-fail them. VT-9a (a presence check) was migrated to the API instead.
  */
 function openLocalDb(): Database.Database | null {
   const dbFile = join(ROOT, "skrun.db");
@@ -203,24 +207,23 @@ outputs:
     console.log(`Testing VT-9: push slug-only ${AGENT} ${V1}...`);
     dirs.push(buildAndPush(V1));
     {
-      const db = openLocalDb();
-      if (db) {
-        try {
-          const row = db
-            .prepare("SELECT namespace, name FROM agents WHERE namespace = ? AND name = ?")
-            .get(NS, AGENT) as { namespace: string; name: string } | undefined;
-          results.push({
-            agent: "simplify-name",
-            feature: "VT-9a: registry row has (namespace=dev, name=simplify-name-live)",
-            passed: row?.namespace === NS && row?.name === AGENT,
-            duration: 0,
-            cost: 0,
-            detail: `row=${JSON.stringify(row ?? null)}`,
-          });
-        } finally {
-          db.close();
-        }
-      }
+      // VT-9a: assert the registry stored identity (namespace, name) with no
+      // drift from the bundle yaml. Queried via the API — backend-agnostic, so
+      // it works against both a local SQLite and a cloud Postgres registry. (The
+      // old direct better-sqlite3 read of skrun.db was absent in cloud mode and,
+      // worse, returned a STALE row from a leftover local skrun.db → false fail.)
+      const res = await fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}`, {
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      });
+      const meta = res.ok ? ((await res.json()) as { namespace?: string; name?: string }) : null;
+      results.push({
+        agent: "simplify-name",
+        feature: "VT-9a: registry stored identity is (namespace=dev, name=simplify-name-live)",
+        passed: res.ok && meta?.namespace === NS && meta?.name === AGENT,
+        duration: 0,
+        cost: 0,
+        detail: `status=${res.status} meta=${JSON.stringify(meta ?? null)}`,
+      });
     }
 
     // ── VT-9b: verify + run completes past the gate ───────────────────────

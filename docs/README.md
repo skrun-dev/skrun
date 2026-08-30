@@ -15,7 +15,7 @@ A quick index of the guides and reference docs.
 
 ## Deploy
 
-- **[Self-hosting guide](./self-hosting.md)** — deploy Skrun on your own infrastructure (Docker, env vars, OAuth, SQLite vs Supabase, reverse proxy).
+- **[Self-hosting guide](./self-hosting.md)** — deploy Skrun on your own infrastructure (Docker, env vars, OAuth, SQLite vs Postgres, reverse proxy).
 
 ## Interactive
 

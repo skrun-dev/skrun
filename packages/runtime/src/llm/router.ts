@@ -1,6 +1,9 @@
 import { getModelCapabilities, type ModelConfig, type ModelProvider } from "@skrun-dev/schema";
 import type { Logger } from "../logger.js";
 import { createLogger } from "../logger.js";
+import { isPrivateHost } from "../security/network.js";
+import { createGuardedFetch } from "../security/safe-fetch.js";
+import { redactSecretsFromString } from "../utils/redact.js";
 import { hashCacheKey } from "./cache-key.js";
 import { estimateCost } from "./cost.js";
 import { LLMCapabilityError } from "./errors.js";
@@ -25,6 +28,41 @@ import type {
 import type { ResolvedToolChoice } from "./tool-choice.js";
 
 const MAX_TOOL_ITERATIONS = 10;
+
+/**
+ * Fast-failover timeout for the primary LLM call (ms). When a fallback model is
+ * configured and the primary hangs longer than this, stop waiting and switch to
+ * the fallback — instead of blocking on the provider SDK's own timeout (~180s).
+ * Tunable via SKRUN_PRIMARY_FAILOVER_MS. Default 45s: long enough for a
+ * legitimately slow turn (large context / high thinking), ~4x faster than the
+ * SDK timeout on a genuine hang.
+ */
+const PRIMARY_FAILOVER_TIMEOUT_MS = Number(process.env.SKRUN_PRIMARY_FAILOVER_MS) || 45_000;
+
+/** Rejection thrown when the primary call exceeds the failover timeout — caught by the fallback path. */
+class PrimaryFailoverTimeout extends Error {
+  constructor(ms: number) {
+    super(`Primary LLM call exceeded the ${ms}ms failover timeout — switching to fallback`);
+    this.name = "PrimaryFailoverTimeout";
+  }
+}
+
+/**
+ * Race the primary call against a failover timeout that rejects; the timer is
+ * cleared as soon as the primary settles.
+ *
+ * Caveat: on timeout the abandoned primary keeps running in the background until
+ * its own timeout/close — it may still complete (a wasted, billable LLM call)
+ * and any partial tool-loop work it did is discarded (the fallback restarts from
+ * the user input). Acceptable for a fallback trigger.
+ */
+function racePrimaryWithFailover<T>(primary: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new PrimaryFailoverTimeout(ms)), ms);
+  });
+  return Promise.race([primary, timeout]).finally(() => clearTimeout(timer));
+}
 
 export interface LLMRouterResponse {
   content: string;
@@ -75,6 +113,59 @@ export interface AgentContext {
   environmentId: string;
 }
 
+/**
+ * Whether this server may direct a model call at a private / loopback address.
+ *
+ * Fail-closed, mirroring `SKRUN_ALLOW_LOCAL_WEBHOOKS`: an operator running a local
+ * inference server (Ollama / vLLM / LocalAI — documented in docs/agent-yaml.md)
+ * opts in explicitly, and a multi-tenant deployment never does.
+ */
+function localModelHostsAllowed(): boolean {
+  return process.env.SKRUN_ALLOW_LOCAL_MODEL_HOSTS === "true";
+}
+
+/**
+ * Whether this server may pair its OWN provider key with an agent-declared
+ * `base_url`. Fail-closed: safe only where every agent is authored by the
+ * operator (single-tenant self-host).
+ */
+function serverKeyWithCustomBaseUrlAllowed(): boolean {
+  return process.env.SKRUN_ALLOW_SERVER_KEY_CUSTOM_BASE_URL === "true";
+}
+
+/**
+ * Validate an agent-declared `base_url` before it becomes the destination of a
+ * request that carries an API key.
+ *
+ * `base_url` is a deliberate feature — alternative OpenAI-compatible providers and
+ * local inference servers. What it cannot be allowed to do is choose where SOMEONE
+ * ELSE'S credential goes: it is declared in `agent.yaml` by the agent AUTHOR, while
+ * the key on the request may belong to the OPERATOR (server tier) or to the CALLER
+ * (`X-LLM-API-Key`). And because the LLM loop runs in the harness rather than the
+ * sandbox, an unchecked value also reaches hosts the agent's own `allowed_hosts`
+ * egress rules exist to keep it away from.
+ */
+function assertModelBaseUrlAllowed(baseUrl: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new Error(`model.base_url is not a valid URL: "${baseUrl}".`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(
+      `model.base_url must use http or https (got "${parsed.protocol}" in "${baseUrl}").`,
+    );
+  }
+  if (!localModelHostsAllowed() && isPrivateHost(parsed.hostname)) {
+    throw new Error(
+      `model.base_url host "${parsed.hostname}" is a private or reserved address. ` +
+        "Set SKRUN_ALLOW_LOCAL_MODEL_HOSTS=true on this server to allow a local " +
+        "inference endpoint (Ollama / vLLM / LocalAI).",
+    );
+  }
+}
+
 export class LLMRouter {
   private providers = new Map<string, LLMProvider>();
   private logger: Logger;
@@ -118,6 +209,7 @@ export class LLMRouter {
     toolChoice?: ResolvedToolChoice,
     parallelTools?: boolean,
     agentContext?: AgentContext,
+    creatorKeys?: Record<string, string>,
   ): Promise<LLMRouterResponse> {
     const start = Date.now();
     let totalPromptTokens = 0;
@@ -142,7 +234,11 @@ export class LLMRouter {
 
     // Try primary provider
     try {
-      const result = await this.callWithToolLoop(
+      // When a fallback is configured, race the primary against a short
+      // failover timeout so a hanging primary switches to the fallback fast
+      // (instead of blocking on the provider SDK's ~180s timeout). The timeout
+      // rejection is handled by the catch → fallback path below.
+      const primaryCall = this.callWithToolLoop(
         modelConfig.provider,
         modelConfig.name,
         systemPrompt,
@@ -156,7 +252,11 @@ export class LLMRouter {
         toolChoice,
         parallelTools,
         cacheKey,
+        creatorKeys,
       );
+      const result = modelConfig.fallback
+        ? await racePrimaryWithFailover(primaryCall, PRIMARY_FAILOVER_TIMEOUT_MS)
+        : await primaryCall;
       totalPromptTokens += result.usage.promptTokens;
       totalCompletionTokens += result.usage.completionTokens;
       totalCacheReadTokens += result.usage.cacheReadTokens ?? 0;
@@ -180,7 +280,13 @@ export class LLMRouter {
             event: "primary_failed",
             provider: modelConfig.provider,
             model: modelConfig.name,
-            error: primaryError instanceof Error ? primaryError.message : String(primaryError),
+            // Sanitize the provider error before logging: a 401/4xx can echo a
+            // key fragment, and pino's `redact` paths can't scrub a free-text
+            // scalar. Strip every active caller + creator key value first.
+            error: redactSecretsFromString(
+              primaryError instanceof Error ? primaryError.message : String(primaryError),
+              [...Object.values(callerKeys ?? {}), ...Object.values(creatorKeys ?? {})],
+            ),
           },
           "Primary LLM failed, trying fallback",
         );
@@ -199,6 +305,7 @@ export class LLMRouter {
           toolChoice,
           parallelTools,
           cacheKey,
+          creatorKeys,
         );
         totalPromptTokens += result.usage.promptTokens;
         totalCompletionTokens += result.usage.completionTokens;
@@ -234,6 +341,7 @@ export class LLMRouter {
     toolChoice?: ResolvedToolChoice,
     parallelTools?: boolean,
     cacheKey?: string,
+    creatorKeys?: Record<string, string>,
   ): Promise<{
     content: string;
     usage: {
@@ -243,7 +351,7 @@ export class LLMRouter {
       cacheWriteTokens?: number;
     };
   }> {
-    const llmProvider = this.resolveProvider(provider, callerKeys, baseUrl);
+    const llmProvider = this.resolveProvider(provider, callerKeys, baseUrl, creatorKeys);
 
     let totalPromptTokens = 0;
     let totalCompletionTokens = 0;
@@ -347,24 +455,51 @@ export class LLMRouter {
     providerName: string,
     callerKeys?: Record<string, string>,
     baseUrl?: string,
+    creatorKeys?: Record<string, string>,
   ): LLMProvider {
+    // Per-provider resolution chain: caller > creator > server > error. A custom
+    // base_url is ORTHOGONAL to the key source — it's the agent's endpoint
+    // override, threaded into whichever tier supplies the key, so a creator key
+    // is used WITH the base_url rather than bypassing the custom endpoint.
+    //
+    // Validated FIRST, before any tier is chosen: the destination is agent-declared
+    // and every tier below attaches a credential to it.
+    if (baseUrl) {
+      assertModelBaseUrlAllowed(baseUrl);
+    }
     // 1. Caller-provided key → ephemeral provider instance
     if (callerKeys?.[providerName]) {
       return this.createProvider(providerName, callerKeys[providerName], baseUrl);
     }
-    // 2. Custom base_url → ephemeral provider with server key + custom endpoint
+    // 2. Creator-attached key (decrypted harness-side) → ephemeral instance
+    if (creatorKeys?.[providerName]) {
+      return this.createProvider(providerName, creatorKeys[providerName], baseUrl);
+    }
+    // 3. Custom base_url + the SERVER's own key. Fail-closed by default: the agent
+    // author picks the endpoint, so this tier hands the operator's credential to a
+    // destination the operator did not choose. Opt in only where every agent on the
+    // instance is authored by the operator.
     if (baseUrl) {
+      if (!serverKeyWithCustomBaseUrlAllowed()) {
+        throw new Error(
+          `Agent declares model.base_url ("${baseUrl}") and supplied no key for provider ` +
+            `"${providerName}". This server does not send its own key to an agent-declared ` +
+            "endpoint. Attach a creator key to the agent, pass one via the X-LLM-API-Key " +
+            "header, or set SKRUN_ALLOW_SERVER_KEY_CUSTOM_BASE_URL=true if every agent here " +
+            "is authored by the operator.",
+        );
+      }
       const envKey = process.env[`${providerName.toUpperCase()}_API_KEY`] ?? "";
       return this.createProvider(providerName, envKey, baseUrl);
     }
-    // 3. Server-side provider (registered at startup from env vars)
+    // 4. Server-side provider (registered at startup from env vars)
     const serverProvider = this.providers.get(providerName);
     if (serverProvider) {
       return serverProvider;
     }
-    // 3. No key available
+    // 5. No key available
     throw new Error(
-      `No API key available for provider "${providerName}". Provide one via X-LLM-API-Key header or set ${providerName.toUpperCase()}_API_KEY env var.`,
+      `No API key available for provider "${providerName}". Provide one via the X-LLM-API-Key header, attach a creator key to the agent, or set the ${providerName.toUpperCase()}_API_KEY env var.`,
     );
   }
 
@@ -373,7 +508,30 @@ export class LLMRouter {
     // If base_url is provided, use OpenAI-compatible provider regardless of provider name
     // (Ollama, vLLM, LocalAI all expose OpenAI-compatible endpoints)
     if (baseUrl) {
-      return new OpenAICompatibleProvider(providerName, apiKey || "no-key", baseUrl);
+      // This is the ONE site where an agent-declared endpoint
+      // becomes a provider, so it is the one that gets the connect-time SSRF guard —
+      // the same one webhook / file-input / MCP already use. It is NOT set in the
+      // constructor: this class also backs OpenAI/Mistral/Grok/Groq at fixed
+      // endpoints, whose transport must not change.
+      //
+      // The guard and `assertModelBaseUrlAllowed` cover DISJOINT cases, measured:
+      // undici skips `connect.lookup` for an IP literal, so the guard never sees
+      // `http://127.0.0.1/...` — the declaration-time check is the only defence
+      // there. Conversely a public hostname RESOLVING to a private address passes
+      // the literal check and is stopped only here. Both are required.
+      //
+      // `allowPrivateHosts` must track the same opt-in the declaration-time check
+      // honours, or the documented Ollama-on-localhost case (docs/agent-yaml.md:39)
+      // would pass the first check and be blocked at connect.
+      return new OpenAICompatibleProvider(
+        providerName,
+        apiKey || "no-key",
+        baseUrl,
+        undefined,
+        createGuardedFetch({
+          allowPrivateHosts: localModelHostsAllowed(),
+        }) as unknown as typeof fetch,
+      );
     }
     switch (providerName) {
       case "anthropic":

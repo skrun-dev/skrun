@@ -1,5 +1,6 @@
 import { type FileInputField, type WireFileSource, WireFileSourceSchema } from "@skrun-dev/schema";
 import { isHostAllowed } from "../security/network.js";
+import { SsrfBlockedError, safeFetch } from "../security/safe-fetch.js";
 
 // ============================================================================
 // SkrunPart — internal multimodal representation
@@ -16,6 +17,7 @@ export type SkrunPart =
 // ============================================================================
 
 export const INLINE_BASE64_MAX_BYTES = 4 * 1024 * 1024; // 4 MB
+const URL_FETCH_TIMEOUT_MS = 30_000; // bound on file-input URL fetches
 
 export class ResolveError extends Error {
   readonly code: string;
@@ -64,7 +66,22 @@ async function resolveWirePart(
       `URL host '${u.hostname}' is not in the agent's allowed_hosts allowlist`,
     );
   }
-  const res = await fetch(wire.url);
+  let res: Awaited<ReturnType<typeof safeFetch>>;
+  try {
+    res = await safeFetch(wire.url, undefined, { timeoutMs: URL_FETCH_TIMEOUT_MS });
+  } catch (err) {
+    // safeFetch throws SsrfBlockedError directly (bad scheme) or rejects with it
+    // as the fetch error's `cause` (host resolves to a private/reserved IP).
+    const cause = err instanceof Error && err.cause instanceof Error ? err.cause : err;
+    if (err instanceof SsrfBlockedError || cause instanceof SsrfBlockedError) {
+      const blocked = err instanceof SsrfBlockedError ? err : (cause as SsrfBlockedError);
+      throw new ResolveError("URL_NOT_ALLOWED", blocked.message);
+    }
+    throw new ResolveError(
+      "URL_FETCH_FAILED",
+      `Fetching '${wire.url}' failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+  }
   if (!res.ok) {
     throw new ResolveError(
       "URL_FETCH_FAILED",

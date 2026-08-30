@@ -33,6 +33,7 @@ The `agent.yaml` file is Skrun's extension to the Agent Skills standard. It decl
 
 ```yaml
 # Self-hosted (Ollama, vLLM, LocalAI)
+# Needs SKRUN_ALLOW_LOCAL_MODEL_HOSTS=true on the server — see below.
 model:
   provider: openai
   name: llama3
@@ -63,7 +64,39 @@ model:
   base_url: https://api.z.ai/api/paas/v4/
 ```
 
-Set the API key via `X-LLM-API-Key` header or the `OPENAI_API_KEY` env var (it's used for any OpenAI-compatible endpoint when `base_url` is set).
+### Which key goes to your `base_url`
+
+A custom `base_url` is chosen by whoever writes the `agent.yaml`. The key on the
+request may belong to someone else — so the rule the runtime enforces is:
+
+> **A key is only sent to an endpoint chosen by that key's owner.**
+
+| Key | Who owns it | What happens |
+|-----|-------------|--------------|
+| **Creator key** attached to the agent | you, the author | Used with your `base_url`. Nothing to configure — you chose both. |
+| **Caller key** (`X-LLM-API-Key`), caller is you | you | Same: used with your `base_url`. This is the normal local/self-host flow. |
+| **Caller key**, caller is *someone else* | the caller | They must name the origin they expect, in `X-LLM-Base-URL` (e.g. `{"openai": "https://api.deepseek.com"}`). Otherwise the run is refused with `403 CALLER_BASE_URL_NOT_CONSENTED`, which names your endpoint so they can decide. Compared by origin — the path need not match. |
+| **Server key** (`OPENAI_API_KEY` etc. on the host) | the operator | **Not sent to a custom `base_url` by default.** An operator running only their own agents can opt in with `SKRUN_ALLOW_SERVER_KEY_CUSTOM_BASE_URL=true`. |
+
+*(Before v1.0 the server key was paired with any agent-declared `base_url`
+automatically. On a multi-tenant host that let an agent author direct the
+operator's credential at a host of their choosing, so it is now opt-in.)*
+
+### Local inference endpoints
+
+`base_url` values on private or loopback addresses — `http://localhost:11434/v1`,
+`127.0.0.1`, `192.168.x.x`, link-local — are **refused by default**, because the
+LLM loop runs in the server process rather than in the agent sandbox, so the
+agent's `allowed_hosts` rules do not constrain it.
+
+Running Ollama / vLLM / LocalAI on the same host is exactly what the feature is
+for, so an operator enables it explicitly:
+
+```bash
+SKRUN_ALLOW_LOCAL_MODEL_HOSTS=true
+```
+
+Leave it off on any host that runs agents you did not write.
 
 **Models per provider** (capabilities: image / document / audio / cache). Source of truth: `packages/schema/src/capability.ts`. Refreshed against authoritative provider docs May 2026. Models are grouped by identical capability flags. Snapshot / dated model IDs (e.g. `claude-opus-4-7-20260416`) resolve to their base entry via longest-prefix matching, so they don't need their own row here.
 
@@ -155,7 +188,7 @@ Scripts are bundled into the `.agent` archive at build time and available on the
 
 > **Note on MCP**: MCP servers expose their own schemas via the protocol (`tools/list`). Do NOT declare MCP tools in `tools:` — only local scripts. See `mcp_servers` below.
 
-> **Note**: On multi-user instances, `scripts/` only execute for **verified agents**. Non-verified agents can still run (LLM + MCP), but scripts are skipped. Operators verify agents via `PATCH /api/agents/:ns/:name/verify` (see [API reference](api.md#verify-an-agent)). In dev mode (`dev-token`), verification is bypassed — all scripts execute locally.
+> **Note**: On multi-user instances, `scripts/` only execute for **verified versions** — verification is per version, not per agent. A non-verified version can still run (LLM + MCP), but scripts are skipped. Verification is flipped with `PATCH /api/agents/:ns/:name/versions/:version/verify` (see [Verify a version](api.md#verify-a-version-admin-only)); who may flip it is set by `SKRUN_VERIFICATION_POLICY`. In dev mode (`dev-token`), verification is bypassed — all scripts execute locally.
 
 ### `tool_choice` (optional)
 - **Type**: string
@@ -482,7 +515,7 @@ Defines how and where the agent runs — networking, filesystem access, executio
 | `filesystem` | enum | `read-only` | `none`, `read-only`, `read-write` |
 | `secrets` | string[] | `[]` | Required secret names (injected as env vars) |
 | `timeout` | string | `300s` | Max execution time (format: `Ns`) |
-| `max_cost` | number | - | Cost cap per run in USD |
+| `max_cost` | number | - | Cost cap per run in USD — **enforced**: the run aborts with a `run_error`/`COST_EXCEEDED` terminus once the aggregate estimated cost crosses it (omit for no cap) |
 | `sandbox` | enum | `strict` | `strict` or `permissive` |
 
 **Networking modes** (inferred from `allowed_hosts`):
@@ -502,9 +535,9 @@ Enforcement: MCP remote connections are checked before connect. Tool scripts rec
 | Env var | Value | Purpose |
 |---------|-------|---------|
 | `SKRUN_ALLOWED_HOSTS` | Comma-separated allowed hosts | Network allowlist (advisory) |
-| `SKRUN_OUTPUT_DIR` | Path to output directory | Write files here to produce deliverables (see [Files API](api.md#files-api)) |
+| `SKRUN_OUTPUT_DIR` | Path to output directory | Write files here to produce deliverables (see [Output files](api.md#output-files)) |
 
-**Per-run override**: callers can override any environment field in the POST /run request body (see [API docs](api.md#post-run)).
+**Per-run override**: callers can override any environment field in the POST /run request body (see [Run an agent](api.md#run-an-agent)).
 
 > **Migration from v0.4.0**: `permissions` and `runtime` top-level fields were replaced by `environment` in v0.5.0. See [CHANGELOG](../CHANGELOG.md) for the migration guide.
 
@@ -519,7 +552,12 @@ Enforcement: MCP remote connections are checked before connect. Tool scripts rec
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `type` | enum | `kv` | `kv` (persistent key-value) or `none` |
-| `ttl` | string | `30d` | State retention (format: `Nd`) |
+| `ttl` | string | `30d` | Declared state retention (format: `Nd`). ⚠️ **Not enforced yet** — see below |
+
+> ⚠️ **`ttl` is currently declarative.** It is parsed and validated, but nothing expires state on that
+> schedule: KV state persists until the agent is deleted (the row cascades with it). Do not rely on it to
+> age out sensitive data — set `type: none` for an agent that should hold none, or clear keys explicitly
+> from the agent itself.
 
 ### `tests` (optional)
 - **Type**: array

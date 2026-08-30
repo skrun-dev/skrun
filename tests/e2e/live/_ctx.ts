@@ -91,9 +91,25 @@ export async function startRegistry(): Promise<void> {
       // for `dev-token` to work — see packages/api/src/auth/github-oauth.ts).
       GITHUB_CLIENT_ID: "",
       GITHUB_CLIENT_SECRET: "",
+      // dev-token is now an explicit fail-secure opt-in (SKRUN_DEV_AUTH); the
+      // live registry must enable it. NODE_ENV=development keeps it inside the
+      // createApp interlock's trusted allowlist.
+      SKRUN_DEV_AUTH: "1",
+      NODE_ENV: "development",
+      // The live suite spins up a localhost callback server to exercise webhook
+      // delivery — the exact local-webhook-testing case this opt-in serves. It
+      // is off by default (private/reserved webhook targets are blocked), so the
+      // harness enables it explicitly, mirroring SKRUN_DEV_AUTH above.
+      SKRUN_ALLOW_LOCAL_WEBHOOKS: "true",
       // Force agents directory to the renamed dir (some local .env files may
       // still point at the legacy `examples/`).
       SKRUN_AGENTS_DIR: "./agents",
+      // Pin the dashboard root by absolute path. Its default ("../web/dist") is
+      // resolved relative to cwd, which assumes cwd = packages/api (as under
+      // `pnpm dev:registry`). This harness spawns with cwd = ROOT, so the
+      // relative default would miss the built SPA and the dashboard phase would
+      // 404 on a built dist. The published image pins an absolute dir the same way.
+      SKRUN_DASHBOARD_DIR: join(ROOT, "packages/web/dist"),
     },
     stdio: ["ignore", logFd, logFd],
   });
@@ -114,6 +130,39 @@ export function stopRegistry(): void {
   if (registryProcess) {
     registryProcess.kill("SIGTERM");
     registryProcess = null;
+  }
+}
+
+/**
+ * Purge every agent in the `dev` namespace before the suite runs.
+ *
+ * In cloud mode the live registry uses a persistent backend (DATABASE_URL →
+ * Postgres) but ephemeral MemoryStorage for bundles. Agent rows from a prior
+ * run therefore survive in the DB while their bundles are gone, so a later
+ * pull / run fails with BUNDLE_NOT_FOUND. Deleting up front keeps the DB and
+ * the (fresh) storage in sync. Scoped to `dev` so pointing the suite at a
+ * shared cloud DB never touches real users' agents. No-op on a fresh DB.
+ */
+export async function cleanupDevNamespace(): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`${REGISTRY}/api/agents?limit=200`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+  } catch {
+    return; // registry unreachable — let the phases surface the real error
+  }
+  if (!res.ok) return;
+  const body = (await res.json()) as { agents?: Array<{ namespace: string; name: string }> };
+  const devAgents = (body.agents ?? []).filter((a) => a.namespace === "dev");
+  for (const a of devAgents) {
+    await fetch(`${REGISTRY}/api/agents/${a.namespace}/${a.name}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+  }
+  if (devAgents.length > 0) {
+    console.log(`Pre-flight cleanup: purged ${devAgents.length} dev/* agent(s).`);
   }
 }
 

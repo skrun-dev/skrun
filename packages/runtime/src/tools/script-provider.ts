@@ -143,11 +143,13 @@ export class ScriptToolProvider implements ToolProvider {
     //   - resolvedDeps Python → venv-local python.
     //   - resolvedDeps Node → system node + NODE_PATH=<depsPath>/node_modules.
     const command = resolveCommand(script.ext, resolvedDeps);
-    // Node v24+ has native TypeScript support (type stripping) and auto-detects
-    // module type from file extension / package.json. The legacy
-    // `--input-type=module` flag is rejected by Node v24 ("--input-type can
-    // only be used with string input via --eval, --print, or STDIN").
-    const cmdArgs = [script.path];
+    // `.ts` scripts run through Node's native type-stripping
+    // (`--experimental-strip-types`; native + default from Node 22.18/23.6 — the
+    // runner is pinned to Node 22.12 where the flag is still required). Without
+    // it, `node script.ts` fails with ERR_UNKNOWN_FILE_EXTENSION. `.js`/`.py`
+    // take no extra flag. (The legacy `--input-type=module` flag is rejected by
+    // Node v24 and was dropped.)
+    const cmdArgs = buildInterpreterArgs(script.ext, script.path);
     const spawnEnv = buildSpawnEnv(this.allowedHosts, this.outputDir, resolvedDeps);
 
     return new Promise((resolve) => {
@@ -230,8 +232,26 @@ function resolveCommand(ext: string, resolvedDeps: ResolvedDeps | null): string 
     // disambiguate from system `python2` still present on some distros.
     return process.platform === "win32" ? "python" : "python3";
   }
-  // .js / .ts / .mjs / .cjs — always spawn `node`.
+  // .js / .ts — always spawn `node` (interpreter only; the `.ts` type-stripping
+  // flag is added in buildInterpreterArgs below, not here).
   return "node";
+}
+
+/**
+ * Build the spawn arguments for a script (interpreter flags + the script path).
+ *
+ * `.ts` scripts are run through Node's native type-stripping
+ * (`--experimental-strip-types`) — required on the runner's pinned Node 22.12,
+ * a no-op default from Node 22.18/23.6. Without it, `node script.ts` fails with
+ * `ERR_UNKNOWN_FILE_EXTENSION`. `.js`/`.py` take no extra flag. Erasable syntax
+ * only: `enum`/`namespace` throw a clear error (escalate to
+ * `--experimental-transform-types` if a real need ever arises).
+ */
+export function buildInterpreterArgs(ext: string, scriptPath: string): string[] {
+  if (ext === ".ts") {
+    return ["--experimental-strip-types", scriptPath];
+  }
+  return [scriptPath];
 }
 
 /**
@@ -278,20 +298,15 @@ function buildSpawnEnv(
     if (value !== undefined) base[name] = value;
   }
 
-  // 2. All SKRUN_* vars — these are the contract the runtime publishes for
-  //    scripts to consume (deps dir, output dir, allowed hosts, ...).
-  //    Safe by design: anything skrun puts under this prefix is meant to
-  //    be visible to scripts.
-  for (const [name, value] of Object.entries(process.env)) {
-    if (name.startsWith("SKRUN_") && value !== undefined) base[name] = value;
-  }
-
-  // 3. Per-run advisory vars (always set last so they overwrite any inherited
-  //    SKRUN_* value of the same name).
+  // 2. Explicit SKRUN_* contract vars the runtime publishes for scripts. The
+  //    former blanket `SKRUN_*` copy was removed: it also swept secret-shaped
+  //    vars such as SKRUN_SECRETS_ENCRYPTION_KEY (the AES master key that
+  //    decrypts creators' LLM keys) into untrusted script processes. Only the
+  //    documented contract vars below are exposed.
   base.SKRUN_ALLOWED_HOSTS = allowedHosts.join(",");
   base.SKRUN_OUTPUT_DIR = outputDir;
 
-  // 4. NODE_PATH when Node deps were resolved.
+  // 3. NODE_PATH when Node deps were resolved.
   if (resolvedDeps?.ecosystem === "node") {
     base.NODE_PATH = join(resolvedDeps.depsPath, "node_modules");
   }

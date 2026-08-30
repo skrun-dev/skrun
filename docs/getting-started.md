@@ -320,7 +320,7 @@ See [`agent.yaml` → File inputs](./agent-yaml.md#inputs-required) for full det
 
 ## What's next
 
-- **Ship to production** — [Self-hosting guide](./self-hosting.md) (OAuth, Supabase, reverse proxy) or wait for the managed cloud at `skrun.sh`.
+- **Ship to production** — [Self-hosting guide](./self-hosting.md) (OAuth, Postgres, reverse proxy) or wait for the managed cloud at `skrun.sh`.
 - **Build a stateful agent** — see [Concepts → State](./concepts.md#state) and the [`meeting-transcript-to-action-items`](../agents/meeting-transcript-to-action-items/) example, which maintains an open-actions ledger across runs (run after each meeting and prior actions auto-resolve when next transcript mentions them as done).
 - **Produce downloadable artifacts** — see the [`csv-to-executive-report`](../agents/csv-to-executive-report/) example which turns a CSV into a multi-page PDF with charts, or [`knowledge-base-from-vault`](../agents/knowledge-base-from-vault/) which bundles a Markdown vault into a navigable HTML site as a `.zip` artifact.
 - **Add MCP tools** — connect to Slack, GitHub, a headless browser, etc. See [Concepts → MCP](./concepts.md#mcp) and the [`web-scraper` example](../agents/web-scraper/).

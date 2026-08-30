@@ -17,11 +17,13 @@
 -- re-verify each version explicitly via
 -- PATCH /api/agents/:ns/:name/versions/:version/verify.
 
-BEGIN;
+-- Note: no `BEGIN;`/`COMMIT;` here — the migrations-runner wraps
+-- each file in a transaction at apply-time. Nested BEGIN inside an outer
+-- transaction would commit the inner half early. Lint check in
+-- migrations-runner.ts enforces this convention at boot.
 
 -- Add the per-version verified flag. Existing rows acquire verified=false
 -- automatically — admins re-verify each version through the new endpoint.
+-- IF NOT EXISTS makes the migration idempotent (mid-crash recovery safe).
 ALTER TABLE agent_versions
-  ADD COLUMN verified boolean NOT NULL DEFAULT false;
-
-COMMIT;
+  ADD COLUMN IF NOT EXISTS verified boolean NOT NULL DEFAULT false;

@@ -1,0 +1,4 @@
+/* Test fixture asset — for asserting serveStatic returns text/css. */
+:root {
+  --fixture: 1;
+}

@@ -1,17 +1,18 @@
 // Tests for `skrun build` file inclusion/exclusion logic (#57 SC-5, SC-6).
 //
 // We exercise `collectFiles` directly rather than running `runBuild` end-to-end:
-// the `EXCLUDE_PATTERNS` change is consumed exclusively by `collectFiles`,
-// which then feeds `createTarBuffer`. Verifying the file list returned by
-// `collectFiles` is a sufficient unit test for the exclusion contract — the
-// downstream tar packaging hasn't changed and is covered by the existing CLI
-// integration tests.
+// the exclusion contract is consumed exclusively by `collectFiles`, which then
+// feeds the shared tar codec (`packAgentTar`). Verifying the file list returned
+// by `collectFiles` is a sufficient unit test for the exclusion contract — the
+// tar packaging itself (POSIX names, round-trip, binary fidelity) is covered by
+// the codec's own tests in `@skrun-dev/schema`.
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { AGENT_BUNDLE_EXCLUDES } from "@skrun-dev/schema";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { collectFiles, EXCLUDE_PATTERNS } from "./build.js";
+import { collectFiles } from "./build.js";
 
 let bundle: string;
 
@@ -30,20 +31,20 @@ function writeIn(relativePath: string, content: string): void {
   writeFileSync(full, content);
 }
 
-describe("EXCLUDE_PATTERNS", () => {
+describe("AGENT_BUNDLE_EXCLUDES (shared exclude contract)", () => {
   it("includes the legacy patterns", () => {
-    expect(EXCLUDE_PATTERNS.has("node_modules")).toBe(true);
-    expect(EXCLUDE_PATTERNS.has(".git")).toBe(true);
-    expect(EXCLUDE_PATTERNS.has("dist")).toBe(true);
-    expect(EXCLUDE_PATTERNS.has(".env")).toBe(true);
-    expect(EXCLUDE_PATTERNS.has(".DS_Store")).toBe(true);
+    expect(AGENT_BUNDLE_EXCLUDES.has("node_modules")).toBe(true);
+    expect(AGENT_BUNDLE_EXCLUDES.has(".git")).toBe(true);
+    expect(AGENT_BUNDLE_EXCLUDES.has("dist")).toBe(true);
+    expect(AGENT_BUNDLE_EXCLUDES.has(".env")).toBe(true);
+    expect(AGENT_BUNDLE_EXCLUDES.has(".DS_Store")).toBe(true);
   });
 
   it("includes the #57 Python deps cache patterns", () => {
-    expect(EXCLUDE_PATTERNS.has("__pycache__")).toBe(true);
-    expect(EXCLUDE_PATTERNS.has(".pytest_cache")).toBe(true);
-    expect(EXCLUDE_PATTERNS.has("venv")).toBe(true);
-    expect(EXCLUDE_PATTERNS.has(".venv")).toBe(true);
+    expect(AGENT_BUNDLE_EXCLUDES.has("__pycache__")).toBe(true);
+    expect(AGENT_BUNDLE_EXCLUDES.has(".pytest_cache")).toBe(true);
+    expect(AGENT_BUNDLE_EXCLUDES.has("venv")).toBe(true);
+    expect(AGENT_BUNDLE_EXCLUDES.has(".venv")).toBe(true);
   });
 });
 

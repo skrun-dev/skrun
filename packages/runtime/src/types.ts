@@ -1,5 +1,6 @@
 import type { AgentConfig } from "@skrun-dev/schema";
 import type { SkrunPart } from "./llm/parts.js";
+import type { ToolDefinition } from "./tools/types.js";
 
 export interface FileInfo {
   name: string;
@@ -9,6 +10,14 @@ export interface FileInfo {
    * Used by `GET /api/files/:id/content` for output retrieval.
    */
   file_id?: string;
+  /**
+   * Presigned GET URL for cloud-mode (`FlyioAdapter`) outputs — the file
+   * lives in R2 / MinIO and is fetched directly by the caller. Unset for
+   * `LocalAdapter` outputs (those live on the harness filesystem and are
+   * served via `/api/files/:id/content`). Short TTL (~15 minutes); caller
+   * should download or re-request before the URL expires.
+   */
+  url?: string;
 }
 
 export interface RunRequest {
@@ -20,6 +29,13 @@ export interface RunRequest {
   state?: Record<string, unknown>;
   /** Caller-provided LLM API keys (provider name → API key). Overrides server-side env keys. */
   callerKeys?: Record<string, string>;
+  /**
+   * Creator-attached LLM keys (provider name → API key), decrypted harness-side.
+   * Consulted AFTER callerKeys and BEFORE the server env key in the resolution
+   * chain (caller > creator > server). Like callerKeys, never forwarded to the
+   * sandbox — used only by the harness LLMRouter.
+   */
+  creatorKeys?: Record<string, string>;
   /** Resolved agent version (semver) actually being executed. Echoed in run_start and final results. */
   agent_version?: string;
   /** Directory where tool scripts can write output files. Set by the runtime. */
@@ -39,6 +55,22 @@ export interface RunRequest {
    * isolation.
    */
   environmentId?: string;
+  /**
+   * Storage key of the agent's bundle archive (e.g.
+   * `tarcroi/email-drafter/1.0.0.agent`). Used by the cloud `FlyioAdapter`
+   * to generate a presigned download URL that the spawned runner uses to
+   * fetch the bundle. Unused by `LocalAdapter` (which mounts the bundle
+   * from the host filesystem).
+   */
+  bundleKey?: string;
+  /**
+   * Optional `AbortSignal` to interrupt a running execution. The cloud
+   * `FlyioAdapter` listens for abort to guarantee the spawned machine is
+   * destroyed even when the caller closes the SSE stream / the harness
+   * shuts down mid-run. Wired in route handlers (e.g. `c.req.raw.signal`
+   * in Hono). `LocalAdapter` ignores it for now.
+   */
+  abortSignal?: AbortSignal;
 }
 
 export interface RunResult {
@@ -148,11 +180,30 @@ export interface OutputValidationWarningEvent extends BaseRunEvent {
 }
 
 /**
+ * Periodic informational event emitted during long waits to keep the SSE
+ * stream alive + signal what the harness is doing right now. The runtime
+ * fires one every ~30s during LLM calls, tool dispatch, and outputs
+ * upload. Existing SSE consumers MUST ignore unknown event types so this
+ * is backward-compatible.
+ *
+ * Known `stage` values:
+ *  - `"waiting_llm"` — awaiting an LLM provider response
+ *  - `"waiting_tool"` — awaiting a tool's `callTool` result (script or MCP)
+ *  - `"uploading_outputs"` — cloud adapter sync-uploading outputs to R2
+ */
+export interface RunHeartbeatEvent extends BaseRunEvent {
+  type: "run_heartbeat";
+  stage: "waiting_llm" | "waiting_tool" | "uploading_outputs";
+}
+
+/**
  * Terminus event for an unrecoverable run failure.
  *
  * Known `error.code` values:
  *  - `OUTPUT_SCHEMA_INVALID` — final LLM output failed validation against the
  *    declared `outputs` schema, and the auto-repair retry also failed.
+ *  - `COST_EXCEEDED` — the run's aggregate estimated cost exceeded the agent's
+ *    declared `environment.max_cost`; the run is aborted before completing.
  *  - any provider/runtime-specific code (LLM error, timeout, etc.) — the field
  *    is intentionally typed as `string` to accommodate future codes without a
  *    coordinated SDK release.
@@ -162,6 +213,79 @@ export interface RunErrorEvent extends BaseRunEvent {
   error: { code: string; message: string };
 }
 
+/**
+ * Per-phase cold-start timing for a cloud (Fly) runner spawn, in milliseconds.
+ * Only `create_api_ms` is always present (harness-measured); the derived and
+ * in-VM fields are OPTIONAL because the runner image and the harness deploy
+ * independently — an older runner may not report them, and the harness must
+ * degrade rather than fail.
+ */
+export interface SpawnPhases {
+  /**
+   * The Fly Machines API round-trip that produced a runner (harness-measured).
+   * Normally `create`; on a pool-served run it is the `start` that woke a
+   * pre-created machine — the same role in the sequence, a different verb.
+   */
+  create_api_ms: number;
+  /**
+   * Whether this run was served by a pre-created machine rather than one created
+   * for it. Present only when a pool is configured, so its absence means "no pool"
+   * rather than "pool missed".
+   */
+  pool_hit?: boolean;
+  /** Time to wake a pre-created machine and see it answer (pool-served runs only). */
+  pool_resume_ms?: number;
+  /** Time to hand a woken machine its run credential and egress rules. */
+  pool_claim_ms?: number;
+  /**
+   * Whether the woken machine genuinely resumed from its snapshot, or silently
+   * cold-booted instead — the platform documents the resume as an attempt, not a
+   * guarantee. Recorded because a pool whose machines all cold-boot still "works"
+   * while quietly delivering a fraction of the benefit, and averaging the two
+   * together would hide it.
+   */
+  pool_resumed_from_snapshot?: boolean;
+  /**
+   * Host-side schedule + image pull, DERIVED as (create->healthz) minus
+   * vm_boot_ms. The harness cannot observe the image pull directly; this is the
+   * residual once the runner's own boot time is subtracted. Omitted when the
+   * runner did not report vm_boot_ms.
+   */
+  host_schedule_pull_ms?: number;
+  /** In-VM kernel-boot -> runner-listening (runner reads /proc/uptime at listen). */
+  vm_boot_ms?: number;
+  /** In-VM entrypoint egress/iptables setup (a sub-part of vm_boot_ms). */
+  entrypoint_egress_ms?: number;
+  /**
+   * In-VM time spent loading the runner program's modules (a sub-part of
+   * vm_boot_ms). With entrypoint_egress_ms this splits vm_boot into its parts,
+   * so start-up work is attributed rather than inferred by subtraction.
+   */
+  module_load_ms?: number;
+  /** In-VM /init: agent bundle download. */
+  init_bundle_ms?: number;
+  /** In-VM /init: bundle extract. */
+  init_extract_ms?: number;
+  /** In-VM /init: MCP server connect (0 when the agent declares no MCP servers). */
+  init_mcp_ms?: number;
+}
+
+/**
+ * Informational event emitted once, right after the cloud runner is ready
+ * (post-/init), carrying the per-phase cold-start breakdown. Fills the
+ * otherwise-silent gap between `run_start` and the first agent-loop event so
+ * consumers can see where a slow first run spends its time.
+ *
+ * Carries DURATIONS ONLY. The machine id and private IP are operator-internal
+ * and travel via the adapter's `onRunnerSpawned` callback, never over the event
+ * stream. LocalAdapter runs (no VM) do not emit this event. Existing SSE
+ * consumers ignore unknown event types, so this is backward-compatible.
+ */
+export interface RunnerSpawnedEvent extends BaseRunEvent {
+  type: "runner_spawned";
+  phases: SpawnPhases;
+}
+
 export type RunEvent =
   | RunStartEvent
   | ToolCallEvent
@@ -169,5 +293,44 @@ export type RunEvent =
   | ToolCallErrorEvent
   | LlmCompleteEvent
   | OutputValidationWarningEvent
+  | RunHeartbeatEvent
+  | RunnerSpawnedEvent
   | RunCompleteEvent
   | RunErrorEvent;
+
+/**
+ * The runner's `POST /init` response contract, shared by the runner
+ * (infra/runtime-image) and the FlyioAdapter. `phases`/`boot` are OPTIONAL: the
+ * runner image and the harness deploy independently, so a newer harness may
+ * receive an older runner's `{ ok, tools }` response and MUST degrade rather
+ * than throw.
+ */
+export interface InitResult {
+  ok: true;
+  tools: ToolDefinition[];
+  phases?: {
+    bundle_ms: number;
+    extract_ms: number;
+    mcp_ms: number;
+  };
+  boot?: {
+    vm_boot_ms?: number;
+    entrypoint_egress_ms?: number;
+    module_load_ms?: number;
+  };
+}
+
+/**
+ * Operator-only spawn telemetry delivered to the api layer via the FlyioAdapter
+ * `onRunnerSpawned` callback (NOT the event stream — the api sees only events,
+ * and machine_id/private_ip must stay off the tenant-facing surface). Persisted
+ * to operator-only columns on the run record.
+ */
+export interface RunnerSpawnedInfo {
+  machineId: string;
+  privateIp: string;
+  phases: SpawnPhases;
+}
+
+/** Callback signature for `FlyioAdapterOptions.onRunnerSpawned`. */
+export type OnRunnerSpawned = (info: RunnerSpawnedInfo) => void;

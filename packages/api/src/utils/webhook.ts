@@ -1,8 +1,19 @@
 import { createHmac } from "node:crypto";
-import type { Logger } from "@skrun-dev/runtime";
+import { type Logger, safeFetch } from "@skrun-dev/runtime";
 
 const MAX_RETRIES = 3;
 const BACKOFF_BASE_MS = 1000; // 1s, 4s, 16s (base^2 per retry)
+const WEBHOOK_TIMEOUT_MS = 10_000; // per-attempt bound — an unresponsive endpoint aborts
+
+/**
+ * Whether webhook delivery may target private/loopback hosts. Fail-closed: off
+ * unless SKRUN_ALLOW_LOCAL_WEBHOOKS is explicitly "true" (local webhook
+ * testing). The request-intake check in routes/run.ts reads the same flag, so a
+ * developer who sets it can exercise http://localhost webhooks end to end.
+ */
+export function localWebhooksAllowed(): boolean {
+  return process.env.SKRUN_ALLOW_LOCAL_WEBHOOKS === "true";
+}
 
 /**
  * Deliver a webhook payload with HMAC-SHA256 signature and retry logic.
@@ -26,14 +37,22 @@ export async function deliverWebhook(
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Skrun-Signature": `sha256=${signature}`,
+      const res = await safeFetch(
+        url,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Skrun-Signature": `sha256=${signature}`,
+          },
+          body,
         },
-        body,
-      });
+        {
+          timeoutMs: WEBHOOK_TIMEOUT_MS,
+          followRedirects: false,
+          allowPrivateHosts: localWebhooksAllowed(),
+        },
+      );
 
       if (res.ok) return;
 

@@ -271,6 +271,30 @@ export class SkrunClient {
     return (await res.json()) as AgentVersionInfo;
   }
 
+  /**
+   * Set an agent's visibility. `private` ⇒ only the owner (or an admin) can
+   * `POST /run`; `public` ⇒ any authenticated caller can. Namespace ownership
+   * is required (mirrors the dashboard toggle). Returns the updated agent.
+   *
+   * @param agent - "namespace/name" string or { namespace, name } object
+   * @param visibility - "private" or "public"
+   */
+  async setVisibility(
+    agent: AgentIdentifier,
+    visibility: "private" | "public",
+  ): Promise<AgentMetadata> {
+    const { namespace, name } = this.parseAgent(agent);
+    const res = await this.request(`/api/agents/${namespace}/${name}/visibility`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ visibility }),
+    });
+    return (await res.json()) as AgentMetadata;
+  }
+
   // --- Private helpers ---
 
   private parseAgent(agent: AgentIdentifier): { namespace: string; name: string } {
@@ -301,6 +325,9 @@ export class SkrunClient {
     };
     if (options?.llmKeys) {
       headers["X-LLM-API-Key"] = JSON.stringify(options.llmKeys);
+    }
+    if (options?.llmBaseUrls) {
+      headers["X-LLM-Base-URL"] = JSON.stringify(options.llmBaseUrls);
     }
     return headers;
   }

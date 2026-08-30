@@ -1,0 +1,41 @@
+# Caddyfile.example — Skrun self-host reverse proxy.
+#
+# Caddy handles TLS termination (via Let's Encrypt) and reverse-proxies
+# the API container. The `flush_interval -1` directive is REQUIRED for
+# Server-Sent Events: it disables Caddy's response buffering so each
+# event written by the Hono SSE handler flushes through to the client
+# immediately. Without it, SSE consumers see events arrive in batch
+# every ~8KB or 5s — breaking the run_heartbeat / live token streaming
+# UX.
+#
+# Replace `{$DOMAIN}` via the env var:
+#   DOMAIN=skrun.example.com docker compose up -d
+# For local dev / no TLS:
+#   DOMAIN=:80 docker compose up -d
+#
+# See https://caddyserver.com/docs/caddyfile/directives/reverse_proxy
+# for the full directive reference.
+
+{$DOMAIN} {
+	# Reverse proxy to the API container.
+	reverse_proxy api:4000 {
+		# REQUIRED for SSE (POST /run with Accept: text/event-stream).
+		# Disables response buffering — each yielded event flushes through.
+		flush_interval -1
+	}
+
+	# Sensible defaults for self-host: 50 MB request bodies (above the
+	# bundle decompression cap default of 50 MB compressed). Adjust to
+	# match BUNDLE_MAX_DECOMPRESSED_MB / INPUT_FILES_MAX_SIZE_MB if you
+	# bumped them.
+	request_body {
+		max_size 50MB
+	}
+
+	# Structured access log to stdout. Caddy auto-formats as JSON;
+	# `docker logs caddy` shows the requests.
+	log {
+		output stdout
+		format json
+	}
+}

@@ -1,7 +1,14 @@
+import type { ApiKeyScopeKind } from "./db/schema.js";
+
 export interface AgentMetadata {
   name: string;
   namespace: string;
   description: string;
+  /**
+   * Access control. `private` (default) ⇒ only the owner/admin can run the
+   * agent; `public` ⇒ any authenticated caller can.
+   */
+  visibility: "private" | "public";
   /**
    * Verified state of the latest version (by push time). Computed at read
    * time from `agent_versions.verified` of the most recently pushed version.
@@ -37,6 +44,26 @@ export interface RegistryErrorResponse {
   };
 }
 
+/**
+ * The scope context of the `sk_live` API key that authenticated the request,
+ * attached by the auth middleware. `null`/absent means the caller used a
+ * session cookie or `dev-token` — an unrestricted "master credential".
+ *
+ * Scope enforcement (services/key-scope.ts) keys off THIS, never `role`: a
+ * restricted/limited key restricts even an admin owner, because the key — not
+ * the person — is the delegated credential.
+ */
+export interface KeyContext {
+  /** The api_keys row id (recorded on runs.api_key_id for per-key metering). */
+  id: string;
+  /** `account` = the owner's whole account; `agents` = restricted to `agent_ids`. */
+  scope_kind: ApiKeyScopeKind;
+  /** Operation scopes: `agent:run` | `agent:push` | `agent:verify`. */
+  operations: string[];
+  /** Granted agent ids (only for `scope_kind === 'agents'`; empty = deny-all). */
+  agent_ids: string[];
+}
+
 export interface UserContext {
   id: string;
   namespace: string;
@@ -44,6 +71,11 @@ export interface UserContext {
   email?: string;
   avatar_url?: string;
   plan?: string;
+  /**
+   * API-key scope context (sk_live only). `null` for session/dev-token =
+   * unrestricted master credential. Populated by the auth middleware.
+   */
+  key?: KeyContext | null;
   /**
    * Instance-level privilege. The auth middleware populates this from the
    * User row (`'user'` default, `'admin'` after a manual SQL promotion).

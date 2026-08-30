@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath, sep } from "node:path";
+import { NotSupportedError } from "@skrun-dev/runtime";
 import type { StorageAdapter } from "./adapter.js";
 
 export class LocalStorage implements StorageAdapter {
@@ -53,5 +54,19 @@ export class LocalStorage implements StorageAdapter {
 
   async exists(key: string): Promise<boolean> {
     return existsSync(this.resolve(key));
+  }
+
+  async getPresignedDownloadUrl(_key: string, _expiresIn: number): Promise<string> {
+    throw new NotSupportedError(
+      "LocalStorage.getPresignedDownloadUrl",
+      "presigned URLs require an S3-compatible backend — use R2Storage",
+    );
+  }
+
+  async getPresignedUploadUrl(_key: string, _expiresIn: number): Promise<string> {
+    throw new NotSupportedError(
+      "LocalStorage.getPresignedUploadUrl",
+      "presigned URLs require an S3-compatible backend — use R2Storage",
+    );
   }
 }

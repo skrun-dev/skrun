@@ -1,0 +1,45 @@
+# Skrun — minimal self-host override.
+#
+# Compose-overlay file that strips the prod-parity services (Postgres,
+# MinIO, Redis) from `docker-compose.yml` so the stack runs against the
+# API's built-in SQLite + LocalStorage defaults. Best for single-user
+# self-host (one operator, one machine, no shared cache).
+#
+#   docker compose \
+#     -f infra/docker-compose.yml \
+#     -f infra/docker-compose.minimal.yml \
+#     up -d
+#
+# Trade-offs versus prod-parity:
+#   - SQLite DB at /var/lib/skrun/skrun.db (single-process writer; fine
+#     for self-host but doesn't scale horizontally).
+#   - LocalStorage at /var/lib/skrun/.skrun/bundles/ (no presigned URLs;
+#     bundles are served via the API's `/api/files/:id/content` proxy).
+#   - No Redis cache for MCP / deps — every fresh process re-warms.
+
+services:
+  api:
+    environment:
+      # Override the prod-parity env block.
+      DATABASE_URL: ""
+      S3_ENDPOINT: ""
+      S3_ACCESS_KEY_ID: ""
+      S3_SECRET_ACCESS_KEY: ""
+      S3_BUCKET: ""
+    depends_on: !reset []
+    volumes:
+      # SQLite + bundle files live on a volume so they survive container
+      # restarts. Without this, the read_only rootfs would refuse writes.
+      - skrun-data:/var/lib/skrun
+    # Override tmpfs to include /var/lib/skrun's parent? — handled by the
+    # named volume above; read_only is still enforced for the rest of
+    # the FS. The api process must write only inside the named volume.
+
+  # Drop the services not used in minimal mode.
+  preflight: !reset null
+  postgres: !reset null
+  minio: !reset null
+  redis: !reset null
+
+volumes:
+  skrun-data:

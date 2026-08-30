@@ -50,7 +50,7 @@ A **Namespace** identifies who published an agent in the registry. It is the **o
 
 This split keeps the bundle portable: the same `.agent` file pushed under two namespaces produces two distinct registry entries (`alice/seo-audit` and `bob/seo-audit`) without re-editing the yaml.
 
-**Permissions are scoped by namespace.** Only the namespace owner can push to their namespace. **Registry reads** (list, metadata, versions, pull, stats) are filtered to the caller's own namespace by default — non-owners see the same `404 NOT_FOUND` response whether the agent doesn't exist OR they simply don't have access (opacity by design; see [Multi-tenancy in self-hosting](./self-hosting.md#multi-tenancy)). **Invocation** (`POST /run`) is intentionally cross-namespace — anyone with a valid auth can call any verified agent (marketplace model). **Admin role** bypasses the read filter and is required to flip verification or delete cross-namespace. Verification is admin-only (orthogonal to namespace ownership) — see Verification below.
+**Permissions are scoped by namespace.** Only the namespace owner can push to their namespace. **Registry reads** (list, metadata, versions, pull, stats) are filtered to the caller's own namespace by default — non-owners see the same `404 NOT_FOUND` response whether the agent doesn't exist OR they simply don't have access (opacity by design; see [Multi-tenancy in self-hosting](./self-hosting.md#multi-tenancy)). **Invocation** (`POST /run`) follows the agent's visibility: agents are **private by default**, so only the owner (or an admin) can call one and a non-owner gets that same opaque `404` — see [Visibility & access](#visibility--access). To delegate one agent to an outside caller, the owner mints an agent-scoped key. **Admin role** bypasses the read filter and can delete cross-namespace. **Who may flip verification is the operator's choice** (`SKRUN_VERIFICATION_POLICY`, default `admin`) — see Verification below.
 
 **Where you see it**: registry URLs (`/api/agents/<namespace>/<slug>/run`), CLI display strings (`Pushed acme/seo-audit@1.0.0`), CLI namespace errors, API 403 on cross-namespace push attempts, the Agents page in the dashboard.
 
@@ -100,7 +100,11 @@ This separation means the same agent logic can run in different environments (de
 
 **State** is a key-value store scoped to an agent, persisted across runs. An agent can emit `_state` in its output to write; subsequent runs for the same agent receive the state as context. This is what makes a stateful agent — it accumulates context over time (e.g., SEO audit comparing scores week over week, onboarding agent remembering questions already asked).
 
-State is enabled via `agent.yaml` `state: { type: kv, ttl: 30d }`. Set `type: none` to disable. Storage backend depends on the DbAdapter: in-memory (tests), SQLite (local dev), Supabase (production).
+> ⚠️ **One agent, one state — shared by every caller.** A single row per agent, keyed on the agent name; no partition by caller. If more than one party can run the agent, they all read and write the same state, and what one run stores is replayed into the next caller's prompt. Namespacing inside the state does not help — the whole object is injected on every run. Where callers must not see each other's data: `type: none`, or a separate agent per caller.
+
+State is enabled via `agent.yaml` `state: { type: kv, ttl: 30d }`. Set `type: none` to disable. The storage backend follows the DbAdapter: in-memory (tests), SQLite (local dev), any standard Postgres ≥ 14 (production).
+
+> ⚠️ **`ttl` is declared but not enforced yet.** The field is parsed and validated, but nothing expires state on that schedule — KV state persists until the agent is deleted (the row cascades with it). Do not rely on `ttl` to age out sensitive data: use `type: none` for an agent that should hold none, or clear keys explicitly from the agent itself.
 
 **Where you see it**: `agent.yaml` `state:` section, agent output `_state` field, `GET /api/agents/<ns>/<name>/state` (dashboard).
 
@@ -108,17 +112,88 @@ State is enabled via `agent.yaml` `state: { type: kv, ttl: 30d }`. Set `type: no
 
 ## Verification
 
-**Verification** is a **per-version** admin-gated flag that controls whether a version of an agent can be invoked via `POST /run`. Unverified versions return `403 AGENT_NOT_VERIFIED` from the runtime — no LLM call, no MCP connection, no DB write happens for an unapproved version. The verified flag lets an operator vet what runs in their Skrun before any caller can use it.
+**Verification** is a **per-version** flag, governed by the operator **verification policy**, that controls whether a version of an agent can be invoked via `POST /run`. Under the default policy an unverified version returns `403 AGENT_NOT_VERIFIED` from the runtime — no LLM call, no MCP connection, no DB write happens for an unapproved version. The verified flag lets an operator vet what runs in their Skrun before any caller can use it.
 
 Verification is per version, not per agent. Pushing a new version is a pure INSERT — it never touches the verified state of any existing version. A caller pinning `version: "1.0.0"` keeps running even if the author pushes a not-yet-verified v1.1.0 (the new version is what's blocked, not the old one). Without a version pin, `POST /run` resolves to the most recently pushed version; if that one is unverified, the call gets 403 — pin an older verified version to keep running.
 
-Only an **admin** can flip the flag. Promotion to admin is a manual SQL update on the `users` table (no API for elevation by design); the local `dev-token` is mapped to admin automatically so single-user self-host flows just work. New pushes always start at `verified=false`. Every verify and unverify call writes a structured pino log entry (`event: "agent_version_verify"`) carrying the actor identity, target version, and action — the forensic trail for any future audit-log UI.
+**Who may flip the flag — and whether it gates runs at all — is the operator's choice**, via `SKRUN_VERIFICATION_POLICY` (default `admin`):
+
+- **`admin`** — only an instance admin may attest a version, and an unverified version cannot run (the legacy behavior). Promotion to admin is a manual SQL update on the `users` table (no API for elevation by design).
+- **`owner`** — the agent **owner** is the trust authority for their own agents: they (or an admin) may attest, and a private agent runs without the verification gate (the owner's responsibility plus sandbox isolation cover safety). Suited to multi-tenant hosting where one operator can't vet everyone's agents.
+- **`disabled`** — verification never gates a run; the flag is inert metadata.
+
+The local `dev-token` (when `SKRUN_DEV_AUTH` is enabled — `pnpm dev:registry` does this) is mapped to admin automatically so single-user self-host flows just work. New pushes always start at `verified=false`. Every verify and unverify call writes a structured pino log entry (`event: "agent_version_verify"`) carrying the actor identity, target version, action, and `kind` (`admin` or `owner_self`) — the forensic trail for any future audit-log UI.
 
 **Where you see it**:
 - API: `PATCH /api/agents/<ns>/<name>/versions/<version>/verify`, `POST /run` returns 403 with `code: "AGENT_NOT_VERIFIED"` for unverified versions.
-- CLI: `skrun verify <ns>/<name>@<version>` and `skrun unverify <ns>/<name>@<version>` (admin only).
+- CLI: `skrun verify <ns>/<name>@<version>` and `skrun unverify <ns>/<name>@<version>` (authority set by `SKRUN_VERIFICATION_POLICY`).
 - SDK: `client.verifyVersion(agent, version, verified)` and a typed `SkrunNotVerifiedError` consumers can catch.
 - Dashboard: per-row Status badges + Verify/Unverify buttons in the versions table on agent-detail; playground Run button disabled with an amber banner when the selected version is unverified.
+
+---
+
+## Visibility & access
+
+**Visibility** controls *who can call* an agent — a separate axis from verification (which controls *whether a version is approved to run at all*). Every agent has a `visibility` of `private` (the default) or `public`:
+
+- **`private`** — only the agent's owner (or an instance admin) can `POST /run`. Anyone else gets a `404` byte-identical to a genuinely-missing agent, so a private agent's very existence stays hidden.
+- **`public`** — any authenticated caller can `POST /run`. **Public is a marketplace capability; the set-path is disabled for now** — agents are **private-only** until the marketplace ships. The `visibility` column and the run-authorization branch are retained, so the capability reactivates without a migration.
+
+Authentication is always required — there is no anonymous run. The access credential (an `sk_live_…` key or a session) answers *who are you*; visibility answers *may you call this agent*. Both are distinct from the LLM key (`X-LLM-API-Key`), which only decides who pays for the inference.
+
+Visibility affects run-authorization **only**. A `public` agent is *runnable* by anyone authenticated, but its source bundle, metadata, and version list stay owner-only — you can execute a public agent, not download or inspect it. Public *discovery* (listing/search) is a separate, later capability.
+
+Because the agent's declared environment (e.g. `allowed_hosts`) is part of its safety contract, the per-run `environment` override is restricted to the owner/admin: a non-owner running a public agent who supplies an override gets `403 ENV_OVERRIDE_FORBIDDEN`. Runtime parameters belong in `input`, not in an environment override.
+
+- API: `PATCH /api/agents/<ns>/<name>/visibility` with `{ "visibility": "private" }` (namespace owner or admin). `"public"` is rejected with `400 PUBLIC_VISIBILITY_DISABLED` until the marketplace.
+- CLI: `skrun visibility <ns>/<name> private`.
+- SDK: `client.setVisibility(agent, "private")`.
+- Dashboard: a visibility badge on agent-detail (the public toggle is hidden while the set-path is disabled).
+
+---
+
+## LLM keys
+
+Running an agent needs an LLM API key. Skrun resolves one **per provider**, in order:
+
+1. **Caller key** — the `X-LLM-API-Key` request header (a JSON map of `provider → key`). The caller brings their own key and pays for that run.
+2. **Creator key** — a key the agent's owner attaches to the agent (encrypted at rest). This lets a creator offer *"call my agent, I cover the inference"*: their callers don't need a key, and the creator pays. Attach one per provider your agent's model (and fallback) use.
+3. **Server key** — an instance-level `<PROVIDER>_API_KEY` env var. Self-host only; the hosted cloud sets none.
+
+If no tier has a key for the provider a model needs, the run errors. The model order (primary then fallback) is the agent author's choice — key availability never reorders it; each model independently resolves its provider's key through the chain above.
+
+A creator key is **write-only**: it is encrypted with `SKRUN_SECRETS_ENCRYPTION_KEY` before storage and never returned — reads expose only the provider and the last four characters.
+
+**Caller-key policy.** Each agent has an `llm_key_policy`:
+
+- **`open`** (default) — callers may bring their own key (the chain above).
+- **`creator_only`** — caller keys are rejected: a run carrying `X-LLM-API-Key` gets `403 CALLER_KEY_NOT_ALLOWED`, and the agent runs only on the creator's key. Set this when every call should be billed to you.
+
+Manage creator keys + the policy (namespace owner/admin, account-wide credential):
+
+- API: `PUT /api/agents/<ns>/<name>/llm-keys/<provider>` `{ "key": "…" }`, `DELETE …`, `GET …/llm-keys` (policy + presence), `PUT …/llm-key-policy` `{ "policy": "creator_only" }`.
+- CLI: `skrun llm-key set <provider> --agent <ns>/<name>` (key from stdin or `--key-env`, never an argument), `… list`, `… rm <provider>`, `… policy creator-only`.
+- Dashboard: an "LLM keys" panel on agent-detail (owner-only).
+
+---
+
+## API-key scopes
+
+An `sk_live_…` key has **two scope axes**, both enforced. A session login and (in self-host) `dev-token` carry no key and are unrestricted "master" credentials.
+
+- **Operation** — what the key may *do*: `agent:run`, `agent:push`, `agent:verify`. A new key defaults to all three (a "full" key); a **run-only** key carries just `agent:run`.
+- **Resource** (`scope_kind`) — *which agents* the key may touch: `account` (the default — your whole account) or `agents` (restricted to specific agents you own).
+
+The headline use case is the **restricted client key** (the Stripe/GitHub-fine-grained-token pattern). A key always belongs to its creator's account, so handing one to a client lets them act *as a narrowed slice of your account* — they never need their own Skrun account:
+
+```bash
+# Mint a run-only key scoped to a single agent, for a customer:
+skrun keys create --name client-acme --agent dev/my-agent --run-only
+```
+
+That key can `POST /run` **only** `dev/my-agent` and nothing else: not your other agents (`403 KEY_SCOPE_FORBIDDEN`), not the source via `GET /pull`, not the version list, not your run history or stats, and it cannot mint or revoke keys. A resource-scoped key may read only the **metadata** of its in-scope agents (enough to know the inputs). Account-management actions (key CRUD, visibility, delete) require an account-wide *full* key — so a delegated or run-only key can never escalate to a broader one.
+
+Scopes are created from the dashboard (Settings → Create Key → **Access** + **Scope**) or `skrun keys create`; `skrun keys list` / `skrun keys revoke <id>` round out the group. Every run records the calling key (`runs.api_key_id`) so usage can be metered per key — i.e. per client.
 
 ---
 
@@ -178,11 +253,11 @@ LLM providers bill input tokens at a higher rate than cached tokens — typicall
 
 **Cache invalidation triggers** (Anthropic explicit cache only — implicit providers re-detect prefix automatically): tool definitions change, image add / remove / reorder in messages, `tool_choice` value change, thinking-settings change, web-search or citations toggling, and any system prompt content change (even one character). Repeat calls with stable system + tools survive across iterations of the tool-loop without re-write.
 
-**Where you see it**: `usage.cache_read_tokens` + `usage.cache_write_tokens` in POST /run responses ([api.md](api.md#post-runs-execute-an-agent)), the SDK's typed `usage` object, the OpenAPI schema. The `cache` column in [agent-yaml.md → Models per provider](agent-yaml.md#model-required) marks per-model support. No agent.yaml configuration is required — caching is automatic for every supported model.
+**Where you see it**: `usage.cache_read_tokens` + `usage.cache_write_tokens` in POST /run responses ([api.md](api.md#run-an-agent)), the SDK's typed `usage` object, the OpenAPI schema. The `cache` column in [agent-yaml.md → Models per provider](agent-yaml.md#model-required) marks per-model support. No agent.yaml configuration is required — caching is automatic for every supported model.
 
 ### Tracking your savings
 
-Operators care about dollars, not tokens. The runtime snapshots a USD savings value at run completion: live as `cost.saved` on the `POST /run` response, persisted as `usage_cache_savings_usd` on the run record, and aggregated in `GET /api/stats` + `GET /api/agents/:ns/:name/stats`. The dashboard renders all three (home tile, run-detail Cost cell, agent-detail stat). Full field reference in [api.md](api.md#post-runs-execute-an-agent).
+Operators care about dollars, not tokens. The runtime snapshots a USD savings value at run completion: live as `cost.saved` on the `POST /run` response, persisted as `usage_cache_savings_usd` on the run record, and aggregated in `GET /api/stats` + `GET /api/agents/:ns/:name/stats`. The dashboard renders all three (home tile, run-detail Cost cell, agent-detail stat). Full field reference in [api.md](api.md#run-an-agent).
 
 ---
 

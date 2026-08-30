@@ -1,12 +1,12 @@
 name: receipts-to-expenses
 version: 0.4.0
 
-# v0.4.0: tool_choice: build_workbook (#58) so Gemini Flash always invokes the
+# v0.4.0: tool_choice: build_workbook so Gemini Flash always invokes the
 #         workbook builder (previously skipped, returning JSON only — vt29 live fail).
-# v0.3.0: deps now auto-resolved by Skrun runtime via requirements.txt (#57).
+# v0.3.0: deps now auto-resolved by Skrun runtime via requirements.txt.
 #         Manual `pip install -r requirements.txt` no longer needed.
 # v0.2.0: vision-native. Receipts are passed as image inputs (JPEG/PNG/WebP/HEIC),
-#         read directly by the LLM via Skrun's multimodal-inputs feature (#56).
+#         read directly by the LLM via Skrun's multimodal-inputs feature.
 # v0.1.0: text-mode + read_receipts tool + upstream OCR (removed in v0.2.0).
 
 model:

@@ -14,9 +14,11 @@
 -- Safe to drop: every row was already false (migration 007 reset). No data
 -- preservation needed.
 
-BEGIN;
+-- Note: no `BEGIN;`/`COMMIT;` here — the migrations-runner wraps
+-- each file in a transaction at apply-time. Nested BEGIN inside an outer
+-- transaction would commit the inner half early. Lint check in
+-- migrations-runner.ts enforces this convention at boot.
 
+-- IF EXISTS makes the migration idempotent (mid-crash recovery safe).
 ALTER TABLE agents
-  DROP COLUMN verified;
-
-COMMIT;
+  DROP COLUMN IF EXISTS verified;

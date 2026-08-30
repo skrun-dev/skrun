@@ -10,7 +10,7 @@ import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { renderWithProviders } from "../../test-utils";
 import { ImportDialog } from "./import-dialog";
 
@@ -134,6 +134,23 @@ describe("ImportDialog UploadTab — VT-17 form fields replace filename parsing"
     await waitFor(() => {
       expect(capturedNamespace).toBe("tarcroi");
     });
+  });
+
+  it('VT-17f: the "Choose file" button opens the native file picker (regression guard)', async () => {
+    // Regression: the trigger was a <Btn> (a <button>) nested inside a <label>
+    // wrapping the file <input>. A button inside a label swallows the click and
+    // never opens the picker, so the button did nothing. The fix drives the
+    // input via a ref + onClick. Assert the button click reaches input.click().
+    const user = userEvent.setup();
+    renderWithProviders(<ImportDialog open onClose={() => {}} />);
+    await screen.findByLabelText("Namespace");
+
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+    const clickSpy = vi.spyOn(fileInput as HTMLInputElement, "click");
+
+    await user.click(screen.getByRole("button", { name: "Choose file" }));
+    expect(clickSpy).toHaveBeenCalledTimes(1);
   });
 
   it("VT-17e: does NOT parse the filename to derive namespace (regression guard)", async () => {

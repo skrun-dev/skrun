@@ -85,9 +85,24 @@ export class OpenAICompatibleProvider implements LLMProvider {
   private client: OpenAI;
   private cacheBehavior: CacheBehavior;
 
-  constructor(name: string, apiKey: string, baseURL?: string, cacheBehavior?: CacheBehavior) {
+  /**
+   * `fetchImpl` overrides the SDK's transport. It exists for **one** caller:
+   * `LLMRouter.createProvider`, when the endpoint is an agent-declared
+   * `model.base_url` and therefore attacker-influenced — it passes the
+   * connect-time SSRF guard so every resolved address is validated before the
+   * socket opens. The four first-party factories below
+   * serve fixed endpoints and deliberately leave it undefined, keeping the
+   * SDK's own transport. Appended last so those four call sites are untouched.
+   */
+  constructor(
+    name: string,
+    apiKey: string,
+    baseURL?: string,
+    cacheBehavior?: CacheBehavior,
+    fetchImpl?: typeof fetch,
+  ) {
     this.name = name;
-    this.client = new OpenAI({ apiKey, baseURL });
+    this.client = new OpenAI({ apiKey, baseURL, ...(fetchImpl && { fetch: fetchImpl }) });
     this.cacheBehavior = cacheBehavior ?? { extractCachedTokens: true };
   }
 

@@ -47,6 +47,18 @@ await client.verifyVersion("acme/my-agent", "1.0.0", true);
 await client.verifyVersion("acme/my-agent", "1.0.0", false);
 ```
 
+By default an agent is **private** — only its owner (or an admin) can call
+`POST /run`, and anyone else gets a `404` identical to a missing agent:
+
+```ts
+await client.setVisibility("acme/my-agent", "private");
+```
+
+`"public"` is a marketplace capability and its set-path is **disabled for now** —
+the call is rejected with `400 PUBLIC_VISIBILITY_DISABLED`. To let an outside
+caller run one of your agents today, mint an **agent-scoped `sk_live_` key**
+instead: they run that agent and nothing else, with no Skrun account.
+
 Pushing a new version doesn't touch the verified state of prior versions
 — pinned production callers (`client.run(..., { version: "1.0.0" })`)
 keep running while admins review the new version separately.
@@ -93,6 +105,7 @@ Bob — same bundle, two registry entries.
 | `client.getVersions(agent)` | List version strings |
 | `client.list(opts?)` | List agents (paginated) |
 | `client.verifyVersion(agent, version, verified)` | Flip per-version verified flag (admin only) |
+| `client.setVisibility(agent, visibility)` | Set agent visibility. Only `"private"` is accepted today — `"public"` returns `400 PUBLIC_VISIBILITY_DISABLED` until the marketplace ships |
 
 See [docs/api.md](https://github.com/skrun-dev/skrun/blob/main/docs/api.md) for the wire format and [docs/concepts.md](https://github.com/skrun-dev/skrun/blob/main/docs/concepts.md) for the architecture.
 

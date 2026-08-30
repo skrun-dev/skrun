@@ -61,6 +61,12 @@ export interface Agent {
   description: string;
   owner_id: string;
   /**
+   * Access control. `private` (default) ⇒ only the owner/admin can run the
+   * agent; `public` ⇒ any authenticated caller can. Optional for forward
+   * compatibility with responses that predate the field.
+   */
+  visibility?: "private" | "public";
+  /**
    * Verified state of the latest version (by push time). Drives the listing
    * badge. Computed by the registry service from `agent_versions.verified`
    * of the most recently pushed version. False when the agent has no
@@ -142,8 +148,19 @@ export interface ApiKey {
   key_prefix: string;
   name: string;
   scopes: string[];
+  /** Resource binding: `account` (the whole account) or `agents` (scoped). */
+  scope_kind: "account" | "agents";
   created_at: string;
   last_used_at: string | null;
+}
+
+export interface CreateKeyInput {
+  name: string;
+  /** `account` (default) or `agents` (a list of `namespace/name` you own). */
+  scope_kind?: "account" | "agents";
+  agents?: string[];
+  /** Operation scopes; omit for a full key (`agent:run/push/verify`). */
+  scopes?: string[];
 }
 
 export class ApiError extends Error {
@@ -234,6 +251,8 @@ export interface MeResponse {
   avatar_url?: string | null;
   plan: string;
   role: "admin" | "user";
+  /** Operator verification policy (read-only). Missing = legacy "admin". */
+  verification_policy?: "admin" | "owner" | "disabled";
 }
 
 export function useMe() {
@@ -393,6 +412,129 @@ export function useVerifyVersion() {
   });
 }
 
+/**
+ * Agent visibility mutation. Calls `PATCH /api/agents/:ns/:name/visibility`
+ * (namespace owner / admin — non-owners receive 403 from the server).
+ * Invalidates the single-agent metadata + the listing so the badge updates.
+ */
+export function useSetVisibility() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      namespace,
+      name,
+      visibility,
+    }: {
+      namespace: string;
+      name: string;
+      visibility: "private" | "public";
+    }) =>
+      apiFetch(`/agents/${namespace}/${name}/visibility`, {
+        method: "PATCH",
+        body: JSON.stringify({ visibility }),
+      }),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["agent", variables.namespace, variables.name] });
+      queryClient.invalidateQueries({ queryKey: ["agents"] });
+    },
+  });
+}
+
+// ── Creator-attached LLM keys ───────────────────────────────────────────────
+
+export type AgentLlmKeyPolicy = "open" | "creator_only";
+
+/** Presence of a creator-attached LLM key — the plaintext is never returned. */
+export interface AgentLlmKeyInfo {
+  provider: string;
+  last4: string;
+  updated_at?: string;
+}
+
+export interface AgentLlmKeysResponse {
+  policy: AgentLlmKeyPolicy;
+  keys: AgentLlmKeyInfo[];
+}
+
+/** An agent's caller-key policy + the presence of its creator LLM keys (write-only). */
+export function useAgentLlmKeys(namespace: string, name: string) {
+  return useQuery<AgentLlmKeysResponse>({
+    queryKey: ["agent-llm-keys", namespace, name],
+    queryFn: () => apiFetch(`/agents/${namespace}/${name}/llm-keys`),
+  });
+}
+
+/** Attach (or replace) the creator's LLM key for a provider. Body never echoed. */
+export function useSetAgentLlmKey() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      namespace,
+      name,
+      provider,
+      key,
+    }: {
+      namespace: string;
+      name: string;
+      provider: string;
+      key: string;
+    }) =>
+      apiFetch(`/agents/${namespace}/${name}/llm-keys/${provider}`, {
+        method: "PUT",
+        body: JSON.stringify({ key }),
+      }),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["agent-llm-keys", variables.namespace, variables.name],
+      });
+    },
+  });
+}
+
+export function useRemoveAgentLlmKey() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      namespace,
+      name,
+      provider,
+    }: {
+      namespace: string;
+      name: string;
+      provider: string;
+    }) => apiFetchRaw(`/agents/${namespace}/${name}/llm-keys/${provider}`, { method: "DELETE" }),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["agent-llm-keys", variables.namespace, variables.name],
+      });
+    },
+  });
+}
+
+export function useSetLlmKeyPolicy() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      namespace,
+      name,
+      policy,
+    }: {
+      namespace: string;
+      name: string;
+      policy: AgentLlmKeyPolicy;
+    }) =>
+      apiFetch(`/agents/${namespace}/${name}/llm-key-policy`, {
+        method: "PUT",
+        body: JSON.stringify({ policy }),
+      }),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["agent-llm-keys", variables.namespace, variables.name],
+      });
+    },
+  });
+}
+
 export function useImportAgent() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -448,10 +590,15 @@ export function useApiKeys() {
 export function useCreateApiKey() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (name: string) =>
-      apiFetch<{ key: string } & ApiKey>("/keys", {
+    mutationFn: (input: CreateKeyInput) =>
+      apiFetch<{ key: string; agents: string[] } & ApiKey>("/keys", {
         method: "POST",
-        body: JSON.stringify({ name: name || "Unnamed key" }),
+        body: JSON.stringify({
+          name: input.name || "Unnamed key",
+          scope_kind: input.scope_kind ?? "account",
+          agents: input.agents ?? [],
+          scopes: input.scopes,
+        }),
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["api-keys"] });
