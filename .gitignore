@@ -144,6 +144,12 @@ vite.config.ts.timestamp-*
 
 # Skrun build artifacts
 *.agent
+# …except the checked-in test fixtures. `*.agent` is meant for the output of
+# `skrun build`, but it also swallowed a bundle we deliberately track: it stayed
+# in this repo only because it was force-added, and it silently failed to arrive
+# in the public mirror, where `git add` honours this file and skipped it. The
+# test that reads it then passed here and failed there.
+!packages/schema/tests/fixtures/*.agent
 skrun.db
 skrun.db-*
 *.sqlite*
