@@ -447,11 +447,27 @@ export function createRunRoutes(
       return dispatchRegistryError(c, err);
     }
 
-    // 2d. Environment-override authorization: only the owner/admin may override
-    // the creator's declared environment (e.g. widen allowed_hosts, swap
-    // secrets). Checked BEFORE the bundle pull so an unauthorized override
-    // fails fast; the actual shallow merge happens at step 5b.
-    if (environmentOverride && !(agent?.owner_id === user.id || user.role === "admin")) {
+    // 2d. Environment-override authorization: only the owner presenting a
+    // management credential — or an admin — may override the creator's declared
+    // environment. What an override actually reaches downstream is
+    // `allowed_hosts` (the sandbox egress allowlist), `timeout` and `max_cost`,
+    // so widening it is a real privilege, not a preference.
+    //
+    // Ownership alone is not enough: a delegated key carries its minter's id,
+    // so the owner's own restricted key would satisfy an ownership-only test
+    // and could widen the very environment it was scoped down from. The
+    // credential type has to be read too.
+    //
+    // `user.role === "admin"` stays a standalone disjunct on purpose — the
+    // admin path is unchanged here, and the destination gate further down
+    // treats admins differently, deliberately.
+    //
+    // Checked BEFORE the bundle pull so an unauthorized override fails fast;
+    // the actual shallow merge happens at step 5c.
+    if (
+      environmentOverride &&
+      !((agent?.owner_id === user.id && isMasterCredential(user)) || user.role === "admin")
+    ) {
       return c.json(
         {
           error: {
@@ -505,6 +521,10 @@ export function createRunRoutes(
     let bundleBuffer: Buffer;
     let resolvedVersion: string;
     let resolvedVerified: boolean;
+    // Checksum on record for the resolved version. Null for a bundle published
+    // before checksums were recorded; it then travels as undefined and the
+    // sandbox extracts as before.
+    let resolvedBundleSha256: string | null;
     try {
       const result = await service.pull(namespace, name, requestedVersion, {
         preloadedAgent: agent ?? undefined,
@@ -512,6 +532,7 @@ export function createRunRoutes(
       bundleBuffer = result.buffer;
       resolvedVersion = result.version;
       resolvedVerified = result.verified;
+      resolvedBundleSha256 = result.sha256;
     } catch (err) {
       // Special-case: enrich VERSION_NOT_FOUND with up to 10 most recent
       // versions so the caller can recover without a separate round-trip.
@@ -675,7 +696,7 @@ export function createRunRoutes(
       ? modelStr.slice(modelStr.indexOf("/") + 1)
       : (modelStr ?? "");
 
-    // 5b. Merge environment override (owner/admin-only — authorized at step 2c).
+    // 5c. Merge environment override (owner/admin-only — authorized at step 2d).
     if (environmentOverride) {
       const { networking: netOverride, ...flatOverride } = environmentOverride as {
         networking?: { allowed_hosts?: string[] };
@@ -892,6 +913,11 @@ export function createRunRoutes(
       outputDir: runOutputDir as string | undefined,
       resolvedInputs,
       bundleKey,
+      // Travels with the key so the sandbox can check the copy it downloads
+      // for itself. The bytes verified in this process are not the bytes that
+      // end up running the scripts — those come from a second read, made from
+      // inside the sandbox.
+      bundleSha256: resolvedBundleSha256 ?? undefined,
       // Caller-disconnect / harness-shutdown safety: the cloud adapter
       // listens on this to guarantee a spawned machine is destroyed even
       // when the SSE stream closes mid-run.

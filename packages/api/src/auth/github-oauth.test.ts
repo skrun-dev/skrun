@@ -159,5 +159,116 @@ describe("GitHub OAuth", () => {
 
       await expect(fetchGithubUser("bad-token")).rejects.toThrow("user fetch failed");
     });
+
+    // DT-17 branch (a). `GET /user` returns the PUBLIC profile address and null
+    // when the user keeps theirs private — a common default — so for an unknown
+    // share of accounts it is empty. These pin that /user/emails is consulted,
+    // that only verified addresses are accepted, and that no failure of the extra
+    // call can cost a user their login.
+    //
+    // Routed by URL rather than by call order: the order is an implementation
+    // detail and a test that encodes it breaks on a harmless refactor.
+    function routeFetch(routes: Record<string, Response | (() => never)>): void {
+      vi.mocked(fetch).mockImplementation(((url: string) => {
+        const hit = routes[String(url)];
+        if (!hit) return Promise.resolve(new Response("not routed", { status: 404 }));
+        if (typeof hit === "function") return Promise.reject(new Error("network down"));
+        return Promise.resolve(hit.clone());
+      }) as unknown as typeof fetch);
+    }
+
+    const profile = (email: string | null) =>
+      new Response(
+        JSON.stringify({ id: 1, login: "alice", email, avatar_url: "https://avatars/1" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    const emails = (list: unknown) =>
+      new Response(JSON.stringify(list), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+
+    it("uses the primary verified address, even when the profile exposes another", async () => {
+      routeFetch({
+        "https://api.github.com/user": profile("public@example.com"),
+        "https://api.github.com/user/emails": emails([
+          { email: "other@example.com", primary: false, verified: true },
+          { email: "primary@example.com", primary: true, verified: true },
+        ]),
+      });
+
+      const user = await fetchGithubUser("gho_x");
+      expect(user.email).toBe("primary@example.com");
+    });
+
+    it("finds an address for a user whose profile email is private", async () => {
+      // The case the whole change exists for: /user gives null, and without the
+      // second call this account would have no address at all.
+      routeFetch({
+        "https://api.github.com/user": profile(null),
+        "https://api.github.com/user/emails": emails([
+          { email: "hidden@example.com", primary: true, verified: true },
+        ]),
+      });
+
+      expect((await fetchGithubUser("gho_x")).email).toBe("hidden@example.com");
+    });
+
+    it("never accepts an unverified address", async () => {
+      // Worse than none: account recovery is the reason to collect this, and
+      // recovering onto an address GitHub has not confirmed defeats it.
+      routeFetch({
+        "https://api.github.com/user": profile(null),
+        "https://api.github.com/user/emails": emails([
+          { email: "unverified@example.com", primary: true, verified: false },
+        ]),
+      });
+
+      expect((await fetchGithubUser("gho_x")).email).toBeNull();
+    });
+
+    it("takes a verified non-primary address when no primary is verified", async () => {
+      routeFetch({
+        "https://api.github.com/user": profile(null),
+        "https://api.github.com/user/emails": emails([
+          { email: "unverified@example.com", primary: true, verified: false },
+          { email: "secondary@example.com", primary: false, verified: true },
+        ]),
+      });
+
+      expect((await fetchGithubUser("gho_x")).email).toBe("secondary@example.com");
+    });
+
+    it("falls back to the profile address when the scope is missing (403)", async () => {
+      // A token minted before we requested user:email still logs in.
+      routeFetch({
+        "https://api.github.com/user": profile("public@example.com"),
+        "https://api.github.com/user/emails": new Response("Forbidden", { status: 403 }),
+      });
+
+      expect((await fetchGithubUser("gho_x")).email).toBe("public@example.com");
+    });
+
+    it("still signs the user in when the emails call throws", async () => {
+      routeFetch({
+        "https://api.github.com/user": profile("public@example.com"),
+        "https://api.github.com/user/emails": () => {
+          throw new Error("unreachable");
+        },
+      });
+
+      const user = await fetchGithubUser("gho_x");
+      expect(user.login).toBe("alice");
+      expect(user.email).toBe("public@example.com");
+    });
+
+    it("returns null when neither source has an address", async () => {
+      routeFetch({
+        "https://api.github.com/user": profile(null),
+        "https://api.github.com/user/emails": emails([]),
+      });
+
+      expect((await fetchGithubUser("gho_x")).email).toBeNull();
+    });
   });
 });

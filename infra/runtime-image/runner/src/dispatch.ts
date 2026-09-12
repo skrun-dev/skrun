@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, readdir, readFile, stat } from "node:fs/promises";
 import { extname, join, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import {
   McpToolProvider,
   ScriptToolProvider,
@@ -24,6 +26,13 @@ export interface InitOptions {
   tools: ToolConfig[];
   mcpServers: McpServer[];
   allowedHosts: string[];
+  /**
+   * Hex sha256 the downloaded bundle must match, as recorded when the version
+   * was published. The harness verifies its own copy of the object, but this
+   * process fetches the object again, and it is this second copy whose scripts
+   * actually run. Absent for a bundle published before checksums were kept.
+   */
+  bundleSha256?: string;
 }
 
 export interface OutputFileInfo {
@@ -81,6 +90,30 @@ async function downloadBundle(url: string, dest: string): Promise<void> {
   });
 }
 
+/**
+ * Compare the downloaded tarball against the checksum recorded when the
+ * version was published, in constant time.
+ *
+ * Called BEFORE extraction, and that ordering is the whole point: a check that
+ * ran afterwards would have already written the scripts it rejects into the
+ * directory the tool runner reads from.
+ */
+async function verifyBundleChecksum(tarballPath: string, expectedHex: string): Promise<void> {
+  const hash = createHash("sha256");
+  await pipeline(createReadStream(tarballPath), hash);
+  const actual = hash.digest();
+  const expected = Buffer.from(expectedHex, "hex");
+  // timingSafeEqual throws on differing lengths, so length is settled first.
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+    const shown = (hex: string) => `${hex.slice(0, 12)}...`;
+    throw new Error(
+      `bundle checksum mismatch: expected ${shown(expectedHex)}, downloaded ${shown(
+        actual.toString("hex"),
+      )} - refusing to extract`,
+    );
+  }
+}
+
 async function extractBundle(tarballPath: string, dest: string): Promise<void> {
   await mkdir(dest, { recursive: true });
   await new Promise<void>((resolve, reject) => {
@@ -107,6 +140,21 @@ export async function initRunner(opts: InitOptions): Promise<{
 
   const t0 = Date.now();
   await downloadBundle(opts.bundleUrl, BUNDLE_TMP_PATH);
+  // Between the download and the extraction, and nowhere else. A bundle
+  // published before checksums were kept arrives without one and still runs —
+  // but it says so, because the alternative is a run that looks verified and
+  // is not, and no reader can tell those two apart from silence.
+  // It sits inside the bundle phase rather than after it, so `bundle_ms` below
+  // reads as "time to obtain a bundle worth extracting" and `extract_ms` stays
+  // the tar alone.
+  if (opts.bundleSha256) {
+    await verifyBundleChecksum(BUNDLE_TMP_PATH, opts.bundleSha256);
+  } else {
+    process.stderr.write(
+      "[skrun-runner] bundle served without a checksum - extracting unverified " +
+        "(published before checksums were recorded, or sent by an older harness)\n",
+    );
+  }
   const t1 = Date.now();
   await extractBundle(BUNDLE_TMP_PATH, BUNDLE_ROOT);
   const t2 = Date.now();

@@ -160,6 +160,20 @@ export interface DeviceCode {
   last_polled_at: string | null;
 }
 
+/**
+ * A browser session, the row behind the `skrun_session` cookie. The id is
+ * stored SHA-256-HASHED: the raw id lives only in the cookie, so a read of this
+ * table never yields a usable credential (same discipline as `api_keys.key_hash`
+ * and `device_codes.device_code_hash`). `expires_at` is an absolute deadline —
+ * using a session never extends it. See auth/session.ts.
+ */
+export interface Session {
+  id_hash: string;
+  user_id: string;
+  created_at: string;
+  expires_at: string;
+}
+
 export type RunStatus = "running" | "completed" | "failed" | "cancelled";
 
 export interface Run {

@@ -22,6 +22,14 @@
 		# REQUIRED for SSE (POST /run with Accept: text/event-stream).
 		# Disables response buffering — each yielded event flushes through.
 		flush_interval -1
+
+		# OVERWRITE X-Forwarded-For with the address Caddy itself saw.
+		# The api reads the FIRST hop of this header when SKRUN_TRUST_PROXY
+		# is set (rate-limit keying); reverse_proxy's default APPENDS the
+		# client address to an incoming header instead of replacing it, so
+		# without this line the first hop would be whatever the caller
+		# forged — one client could masquerade as many.
+		header_up X-Forwarded-For {remote_host}
 	}
 
 	# Sensible defaults for self-host: 50 MB request bodies (above the

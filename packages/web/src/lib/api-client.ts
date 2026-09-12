@@ -152,6 +152,8 @@ export interface ApiKey {
   scope_kind: "account" | "agents";
   created_at: string;
   last_used_at: string | null;
+  /** When the key stops being accepted; `null` means it never expires. */
+  expires_at: string | null;
 }
 
 export interface CreateKeyInput {
@@ -161,6 +163,8 @@ export interface CreateKeyInput {
   agents?: string[];
   /** Operation scopes; omit for a full key (`agent:run/push/verify`). */
   scopes?: string[];
+  /** ISO-8601 instant; omit for a key that never expires. */
+  expires_at?: string;
 }
 
 export class ApiError extends Error {
@@ -593,11 +597,15 @@ export function useCreateApiKey() {
     mutationFn: (input: CreateKeyInput) =>
       apiFetch<{ key: string; agents: string[] } & ApiKey>("/keys", {
         method: "POST",
+        // This body enumerates its fields explicitly: a field added to the
+        // input type but not listed here is dropped in silence — the code
+        // compiles and the request leaves without the value.
         body: JSON.stringify({
           name: input.name || "Unnamed key",
           scope_kind: input.scope_kind ?? "account",
           agents: input.agents ?? [],
           scopes: input.scopes,
+          expires_at: input.expires_at,
         }),
       }),
     onSuccess: () => {

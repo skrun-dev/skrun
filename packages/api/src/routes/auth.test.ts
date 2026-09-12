@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { generateApiKey } from "../auth/api-key.js";
+import { generateApiKey, hashApiKey } from "../auth/api-key.js";
 import { hashCode } from "../auth/device-code.js";
-import { clearSessions, createSession } from "../auth/session.js";
+import { createSession, hashSessionId } from "../auth/session.js";
 import { MemoryDb } from "../db/memory.js";
 import { createApp } from "../index.js";
 import { MemoryStorage } from "../storage/memory.js";
@@ -44,7 +44,6 @@ describe("Auth Routes", () => {
     const ctx = createTestApp();
     app = ctx.app;
     db = ctx.db;
-    clearSessions();
     // Ensure OAuth is not configured + the allowlist is unset by default in tests
     delete process.env.GITHUB_CLIENT_ID;
     delete process.env.GITHUB_CLIENT_SECRET;
@@ -291,6 +290,32 @@ describe("Auth Routes", () => {
       expect((await (await poll(dc, verifier)).json()).error.code).toBe("expired_token");
     });
 
+    it("VT-15 (#116): the key minted by the login flow carries an expiry", async () => {
+      const user = await db.createUser({ github_id: "poll-exp", username: "expirer" });
+      const verifier = "v".repeat(43);
+      const challenge = createHash("sha256").update(verifier).digest("base64url");
+      const dc = "dc-expiry-secret";
+      await db.createDeviceCode({
+        device_code_hash: hashCode(dc),
+        user_code_hash: hashCode("EXPI-5555"),
+        code_challenge: challenge,
+        expires_at: new Date(Date.now() + 600_000).toISOString(),
+      });
+      await db.authorizeDeviceCode(hashCode("EXPI-5555"), user.id);
+
+      const res = await poll(dc, verifier);
+      expect(res.status).toBe(200);
+      const { token } = await res.json();
+      // Read the persisted row rather than the response: the expiry is a
+      // property of the credential, and the login response does not carry it.
+      const stored = await db.getApiKeyByHash(hashApiKey(token));
+      expect(stored?.expires_at).toBeTruthy();
+      const days =
+        (new Date(stored?.expires_at as string).getTime() - Date.now()) / (24 * 60 * 60 * 1000);
+      expect(days).toBeGreaterThan(89);
+      expect(days).toBeLessThan(91);
+    });
+
     it("CODE-209: expired_token + consumes the code when the authorized user no longer exists", async () => {
       const verifier = "v".repeat(43);
       const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -320,6 +345,16 @@ describe("Auth Routes", () => {
     }
     expect(statuses).toContain(200);
     expect(statuses).toContain(429);
+  });
+
+  it("RT-1 (#116): /auth/device/token stays rate-limited after the push/run remount", async () => {
+    // The push/run limiter remount must not displace the device mounts.
+    const statuses: number[] = [];
+    for (let i = 0; i < 121; i++) {
+      statuses.push((await app.request("/auth/device/token", { method: "POST" })).status);
+    }
+    expect(statuses).toContain(429);
+    expect(statuses.filter((s) => s !== 429).length).toBeGreaterThan(0);
   });
 
   it("device flow: multi-instance — a code authorized via the shared DB is pollable from another app instance", async () => {
@@ -599,6 +634,73 @@ describe("Auth Routes", () => {
     delete process.env.GITHUB_CLIENT_SECRET;
   });
 
+  // VT-13 (#124): the value handed to the browser is the raw id; the database
+  // holds only its hash. Asserting the row exists under the hash AND does not
+  // exist under the cookie value is what separates "a session was stored" from
+  // "a usable credential was stored".
+  it("VT-13 (#124): the login cookie is the raw id, the row holds only its hash", async () => {
+    process.env.GITHUB_CLIENT_ID = "test-id";
+    process.env.GITHUB_CLIENT_SECRET = "test-secret";
+    try {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation((url: string) => {
+          if (url.includes("login/oauth/access_token")) {
+            return Promise.resolve(
+              new Response(JSON.stringify({ access_token: "gho_test_token" }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              }),
+            );
+          }
+          if (url.includes("api.github.com/user")) {
+            return Promise.resolve(
+              new Response(JSON.stringify({ id: 424242, login: "hashy" }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              }),
+            );
+          }
+          return Promise.resolve(new Response("Not Found", { status: 404 }));
+        }),
+      );
+
+      const redirectRes = await app.request("/auth/github", { redirect: "manual" });
+      // biome-ignore lint/style/noNonNullAssertion: checked by isOAuthConfigured()
+      const location = new URL(redirectRes.headers.get("Location")!);
+      // biome-ignore lint/style/noNonNullAssertion: checked by isOAuthConfigured()
+      const state = location.searchParams.get("state")!;
+      // biome-ignore lint/style/noNonNullAssertion: checked by isOAuthConfigured()
+      const stateCookie = redirectRes.headers.get("Set-Cookie")!;
+
+      const res = await app.request(`/auth/github/callback?code=c&state=${state}`, {
+        headers: { Cookie: stateCookie.split(";")[0] },
+        redirect: "manual",
+      });
+      expect(res.status).toBe(302);
+      expect(res.headers.get("Location")).toContain("/dashboard");
+
+      // biome-ignore lint/style/noNonNullAssertion: test assertion — value checked by expect
+      const setCookie = res.headers.get("Set-Cookie")!;
+      const raw = setCookie.match(/skrun_session=([^;]+)/)?.[1] ?? "";
+      expect(raw).not.toBe("");
+      // A session id that was never awaited would arrive here as the string
+      // form of a promise, and every later request would simply fall through.
+      expect(raw).not.toContain("Promise");
+
+      const user = await db.getUserByGithubId("424242");
+      expect(user).toBeTruthy();
+
+      // Nothing is stored under the cookie value itself.
+      expect(await db.getSession(raw)).toBeNull();
+      const row = await db.getSession(hashSessionId(raw));
+      expect(row?.user_id).toBe(user?.id);
+    } finally {
+      delete process.env.GITHUB_CLIENT_ID;
+      delete process.env.GITHUB_CLIENT_SECRET;
+    }
+  });
+
   it("device flow: callback with the device cookie authorizes the code, clears it, no token", async () => {
     process.env.GITHUB_CLIENT_ID = "test-id";
     process.env.GITHUB_CLIENT_SECRET = "test-secret";
@@ -720,7 +822,7 @@ describe("Auth Routes", () => {
   // VT-4: POST /api/keys creates key
   it("VT-4: POST /api/keys creates key with correct format", async () => {
     const user = await db.createUser({ github_id: "gh-1", username: "alice" });
-    const sessionId = createSession(user.id);
+    const sessionId = await createSession(db, user.id);
 
     const res = await app.request("/api/keys", {
       method: "POST",
@@ -736,6 +838,86 @@ describe("Auth Routes", () => {
     expect(body.name).toBe("CI key");
     expect(body.key_prefix).toMatch(/^sk_live_[0-9a-f]{8}$/);
     expect(body.scopes).toContain("agent:push");
+  });
+
+  // VT-16 (#116): POST /api/keys accepts an expiry, persists it, and hands it
+  // back — both on the mint response and on the list.
+  it("VT-16: POST /api/keys persists an expires_at and GET /api/keys reads it back", async () => {
+    const user = await db.createUser({ github_id: "gh-exp", username: "alice" });
+    const sessionId = await createSession(db, user.id);
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    const res = await app.request("/api/keys", {
+      method: "POST",
+      headers: { Cookie: `skrun_session=${sessionId}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "client key", expires_at: expiresAt }),
+    });
+    expect(res.status).toBe(201);
+    const created = await res.json();
+    expect(created.expires_at).toBe(expiresAt);
+
+    const listRes = await app.request("/api/keys", {
+      headers: { Cookie: `skrun_session=${sessionId}` },
+    });
+    const listed = await listRes.json();
+    expect(listed.find((k: { id: string }) => k.id === created.id)?.expires_at).toBe(expiresAt);
+  });
+
+  it("VT-16b: an unparseable or past expires_at is refused 400 INVALID_REQUEST", async () => {
+    const user = await db.createUser({ github_id: "gh-exp2", username: "alice" });
+    const sessionId = await createSession(db, user.id);
+    const mint = (expires_at: string) =>
+      app.request("/api/keys", {
+        method: "POST",
+        headers: { Cookie: `skrun_session=${sessionId}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "bad key", expires_at }),
+      });
+
+    for (const bad of ["not-a-date", new Date(Date.now() - 60_000).toISOString()]) {
+      const res = await mint(bad);
+      expect(res.status, `expires_at=${bad}`).toBe(400);
+      expect((await res.json()).error.code).toBe("INVALID_REQUEST");
+    }
+  });
+
+  it("VT-16c: no expiry is imposed when the request omits one", async () => {
+    const user = await db.createUser({ github_id: "gh-exp3", username: "alice" });
+    const sessionId = await createSession(db, user.id);
+    const res = await app.request("/api/keys", {
+      method: "POST",
+      headers: { Cookie: `skrun_session=${sessionId}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "integration key" }),
+    });
+    // A key wired into someone else's integration must not acquire a lifetime
+    // the caller never asked for.
+    expect((await res.json()).expires_at).toBeNull();
+  });
+
+  it("VT-17: a key whose expires_at is past is refused 401", async () => {
+    const user = await db.createUser({ github_id: "gh-exp4", username: "alice" });
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: user.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "stale",
+      expires_at: new Date(Date.now() - 60_000).toISOString(),
+    });
+    const res = await app.request("/api/me", { headers: { Authorization: `Bearer ${key}` } });
+    expect(res.status).toBe(401);
+  });
+
+  it("RT-6: an existing key with no expiry stays accepted — expiry is never retroactive", async () => {
+    const user = await db.createUser({ github_id: "gh-exp5", username: "alice" });
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: user.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "legacy",
+    });
+    const res = await app.request("/api/me", { headers: { Authorization: `Bearer ${key}` } });
+    expect(res.status).toBe(200);
   });
 
   // VT-5: API key authenticates POST /run
@@ -761,7 +943,7 @@ describe("Auth Routes", () => {
   // VT-6: DELETE /api/keys revokes, key no longer works
   it("VT-6: API key revocation works", async () => {
     const user = await db.createUser({ github_id: "gh-1", username: "alice" });
-    const sessionId = createSession(user.id);
+    const sessionId = await createSession(db, user.id);
 
     // Create key
     const createRes = await app.request("/api/keys", {
@@ -862,7 +1044,7 @@ describe("Auth Routes", () => {
 
   it("VT-2: mint defaults to scope_kind 'account' + full operation scopes", async () => {
     const user = await db.createUser({ github_id: "gh-m2", username: "m2" });
-    const res = await mintAs(createSession(user.id), { name: "k" });
+    const res = await mintAs(await createSession(db, user.id), { name: "k" });
     expect(res.status).toBe(201);
     const body = await res.json();
     expect(body.scope_kind).toBe("account");
@@ -877,7 +1059,7 @@ describe("Auth Routes", () => {
       description: "",
       owner_id: user.id,
     });
-    const res = await mintAs(createSession(user.id), {
+    const res = await mintAs(await createSession(db, user.id), {
       name: "scoped",
       scope_kind: "agents",
       agents: ["m3/agent1"],
@@ -894,7 +1076,7 @@ describe("Auth Routes", () => {
     const bob = await db.createUser({ github_id: "gh-bob4", username: "bob4" });
     await db.createAgent({ name: "secret", namespace: "bob4", description: "", owner_id: bob.id });
     const alice = await db.createUser({ github_id: "gh-alice4", username: "alice4" });
-    const res = await mintAs(createSession(alice.id), {
+    const res = await mintAs(await createSession(db, alice.id), {
       name: "x",
       scope_kind: "agents",
       agents: ["bob4/secret"],
@@ -904,7 +1086,10 @@ describe("Auth Routes", () => {
 
   it("rejects an unknown operation scope → 400", async () => {
     const user = await db.createUser({ github_id: "gh-m5", username: "m5" });
-    const res = await mintAs(createSession(user.id), { name: "x", scopes: ["agent:nuke"] });
+    const res = await mintAs(await createSession(db, user.id), {
+      name: "x",
+      scopes: ["agent:nuke"],
+    });
     expect(res.status).toBe(400);
   });
 
@@ -970,7 +1155,7 @@ describe("Auth Routes", () => {
       email: "alice@test.com",
       avatar_url: "https://avatar/alice",
     });
-    const sessionId = createSession(user.id);
+    const sessionId = await createSession(db, user.id);
 
     const res = await app.request("/api/me", {
       headers: { Cookie: `skrun_session=${sessionId}` },
@@ -994,7 +1179,9 @@ describe("Auth Routes", () => {
     const policyDb = new MemoryDb();
     const policyApp = createApp(new MemoryStorage(), policyDb, { verificationPolicy: "owner" });
     const u = await policyDb.createUser({ github_id: "gh-vp", username: "vp" });
-    const sessionId = createSession(u.id);
+    // This case builds its own app on its own adapter: the session has to land
+    // in the adapter that app reads from, not in the suite's default one.
+    const sessionId = await createSession(policyDb, u.id);
 
     const res = await policyApp.request("/api/me", {
       headers: { Cookie: `skrun_session=${sessionId}` },
@@ -1074,10 +1261,13 @@ describe("Auth Routes", () => {
     }
   });
 
-  // VT-13: Logout clears session
-  it("VT-13: POST /auth/logout clears session cookie", async () => {
+  // VT-13: Logout clears session — and, since the store is the database,
+  // VT-12 (#124): it must also delete the row. Clearing only the cookie would
+  // leave a working credential behind for anyone who kept a copy of it.
+  it("VT-13: POST /auth/logout clears session cookie and deletes the row (#124)", async () => {
     const user = await db.createUser({ github_id: "gh-1", username: "alice" });
-    const sessionId = createSession(user.id);
+    const sessionId = await createSession(db, user.id);
+    expect(await db.getSession(hashSessionId(sessionId))).not.toBeNull();
 
     const res = await app.request("/auth/logout", {
       method: "POST",
@@ -1090,6 +1280,8 @@ describe("Auth Routes", () => {
     // biome-ignore lint/style/noNonNullAssertion: test assertion — value checked by expect
     const cookies = res.headers.get("Set-Cookie")!;
     expect(cookies).toContain("skrun_session=;");
+
+    expect(await db.getSession(hashSessionId(sessionId))).toBeNull();
   });
 
   // VT-14: Invalid API key returns 401

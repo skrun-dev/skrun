@@ -6,14 +6,19 @@ import { RedisRateLimiter } from "./redis.js";
 
 const logger = createLogger("ratelimit");
 
-export type RateLimiterFactory = (opts: { windowMs: number; max: number }) => RateLimiterAdapter;
+export type RateLimiterFactory = (opts: {
+  /** Counter namespace of the mount — on the shared store, what keeps its counter apart. */
+  name: string;
+  windowMs: number;
+  max: number;
+}) => RateLimiterAdapter;
 
 /**
  * Build a rate-limiter factory from env, once at app construction.
  * Redis backend when `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` are
  * both present (cloud multi-instance), otherwise in-memory (self-host single
  * instance) — same "configure from env, no hard dependency" shape as storage/db
- * selection. One shared `Redis` client is reused across both rate-limited routes.
+ * selection. One shared `Redis` client is reused across every rate-limited mount.
  */
 export function createRateLimiterFactory(env: NodeJS.ProcessEnv = process.env): RateLimiterFactory {
   const url = env.UPSTASH_REDIS_REST_URL;
@@ -25,7 +30,7 @@ export function createRateLimiterFactory(env: NodeJS.ProcessEnv = process.env): 
       { event: "ratelimit_backend", backend: "redis" },
       "Rate limiter: Upstash Redis (multi-instance coordinated)",
     );
-    return ({ windowMs, max }) => new RedisRateLimiter(windowMs, max, redis);
+    return ({ name, windowMs, max }) => new RedisRateLimiter(windowMs, max, redis, name);
   }
 
   logger.info(

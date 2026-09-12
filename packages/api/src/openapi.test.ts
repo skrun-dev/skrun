@@ -264,6 +264,39 @@ describe("OpenAPI Schema", () => {
     }
   });
 
+  // The machine-readable half of the published surface. The run path already
+  // advertised a 429 while no request on it ever crossed the limiter; the push
+  // path advertised none at all. Both are now true, and this pins them: a
+  // generated client that does not know about 429 / 413 retries into a wall.
+  it("push documents 429 + 413, run keeps its 429, and /api/keys documents expires_at", () => {
+    // biome-ignore lint/suspicious/noExplicitAny: deep schema traversal in a test
+    const push = schema.paths["/api/agents/{namespace}/{name}/push"] as any;
+    expect(push.post.responses["429"]).toBeDefined();
+    expect(push.post.responses["429"].description).toMatch(/RATE_LIMITED/);
+    expect(push.post.responses["413"]).toBeDefined();
+    expect(push.post.responses["413"].description).toMatch(/BUNDLE_TOO_LARGE/);
+    expect(push.post.responses["413"].description).toMatch(/SKRUN_PUSH_MAX_BODY_MB/);
+
+    // biome-ignore lint/suspicious/noExplicitAny: deep schema traversal in a test
+    const run = schema.paths["/api/agents/{namespace}/{name}/run"] as any;
+    expect(run.post.responses["429"]).toBeDefined();
+
+    // biome-ignore lint/suspicious/noExplicitAny: deep schema traversal in a test
+    const keys = schema.paths["/api/keys"] as any;
+    const reqSchema = keys.post.requestBody.content["application/json"].schema;
+    expect(reqSchema.properties.expires_at).toBeDefined();
+    expect(reqSchema.properties.expires_at.format).toBe("date-time");
+    // Optional on the request — a delegated key gets no imposed lifetime.
+    expect(reqSchema.required).not.toContain("expires_at");
+    expect(keys.post.responses["400"]).toBeDefined();
+    expect(
+      keys.post.responses["201"].content["application/json"].schema.properties.expires_at,
+    ).toBeDefined();
+    expect(
+      keys.get.responses["200"].content["application/json"].schema.items.properties.expires_at,
+    ).toBeDefined();
+  });
+
   it("VT-28 (#102): creator LLM key endpoints + error codes documented", () => {
     const paths = Object.keys(schema.paths);
     expect(paths).toContain("/api/agents/{namespace}/{name}/llm-keys");

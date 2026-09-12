@@ -110,17 +110,20 @@ function ApiKeysSection() {
       ) : (
         <div>
           {/* Header row */}
-          <div className="grid grid-cols-[1fr_120px_120px_80px] gap-3 px-4 h-9 bg-gray-50/60 dark:bg-gray-900/40 border-b border-gray-100 dark:border-gray-900 text-[10.5px] font-medium uppercase tracking-[0.06em] text-gray-500 items-center">
+          {/* The column template is written twice — header and row. Both must
+              change together or the cells drift out of line silently. */}
+          <div className="grid grid-cols-[1fr_120px_120px_120px_80px] gap-3 px-4 h-9 bg-gray-50/60 dark:bg-gray-900/40 border-b border-gray-100 dark:border-gray-900 text-[10.5px] font-medium uppercase tracking-[0.06em] text-gray-500 items-center">
             <span>Key</span>
             <span>Created</span>
             <span>Last used</span>
+            <span>Expires</span>
             <span className="text-right">Actions</span>
           </div>
           <div className="divide-y divide-gray-100 dark:divide-gray-900">
             {keys.map((key) => (
               <div
                 key={key.id}
-                className="grid grid-cols-[1fr_120px_120px_80px] gap-3 items-center px-4 py-3"
+                className="grid grid-cols-[1fr_120px_120px_120px_80px] gap-3 items-center px-4 py-3"
               >
                 <div>
                   <div className="text-[12.5px] font-medium text-gray-900 dark:text-gray-100 flex items-center gap-2">
@@ -142,6 +145,11 @@ function ApiKeysSection() {
                   className={`text-[11px] tabular-nums ${key.last_used_at ? "text-gray-700 dark:text-gray-300" : "text-gray-400"}`}
                 >
                   {key.last_used_at ? formatDate(key.last_used_at) : "Never"}
+                </span>
+                <span
+                  className={`text-[11px] tabular-nums ${key.expires_at ? "text-gray-700 dark:text-gray-300" : "text-gray-400"}`}
+                >
+                  {key.expires_at ? formatDate(key.expires_at) : "—"}
                 </span>
                 <div className="text-right">
                   <button
@@ -182,11 +190,27 @@ function ApiKeysSection() {
   );
 }
 
+/**
+ * Lifetimes offered at creation. 90 days is preselected — the same window the
+ * login flow uses — and "No expiration" is a separate, explicit choice rather
+ * than the default, so a key that never dies is something you asked for.
+ */
+const EXPIRY_CHOICES = [
+  { value: "90", label: "90 days" },
+  { value: "30", label: "30 days" },
+  { value: "180", label: "180 days" },
+  { value: "365", label: "365 days" },
+  { value: "never", label: "No expiration" },
+] as const;
+
+const DEFAULT_EXPIRY_CHOICE = "90";
+
 function CreateKeyDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [name, setName] = useState("");
   const [access, setAccess] = useState<"full" | "run-only">("full");
   const [scopeKind, setScopeKind] = useState<"account" | "agents">("account");
   const [agentRef, setAgentRef] = useState("");
+  const [expiryDays, setExpiryDays] = useState<string>(DEFAULT_EXPIRY_CHOICE);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const createKey = useCreateApiKey();
@@ -201,6 +225,14 @@ function CreateKeyDialog({ open, onClose }: { open: boolean; onClose: () => void
         scope_kind: scopeKind,
         agents: scopeKind === "agents" && agentRef ? [agentRef] : [],
         scopes: access === "run-only" ? ["agent:run"] : undefined,
+        // Absent for "No expiration" — the endpoint imposes no default, so
+        // omitting the field is what mints a key that never expires.
+        expires_at:
+          expiryDays === "never"
+            ? undefined
+            : new Date(
+                Date.now() + Number.parseInt(expiryDays, 10) * 24 * 60 * 60 * 1000,
+              ).toISOString(),
       });
       setCreatedKey(result.key);
     } catch {
@@ -231,6 +263,7 @@ function CreateKeyDialog({ open, onClose }: { open: boolean; onClose: () => void
     setAccess("full");
     setScopeKind("account");
     setAgentRef("");
+    setExpiryDays(DEFAULT_EXPIRY_CHOICE);
     setCopied(false);
     onClose();
   };
@@ -349,6 +382,24 @@ function CreateKeyDialog({ open, onClose }: { open: boolean; onClose: () => void
                   ))}
                 </select>
               )}
+            </fieldset>
+
+            <fieldset className="mb-4">
+              <legend className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                Expiration
+              </legend>
+              <select
+                aria-label="Expiration"
+                value={expiryDays}
+                onChange={(e) => setExpiryDays(e.target.value)}
+                className="w-full px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100"
+              >
+                {EXPIRY_CHOICES.map((choice) => (
+                  <option key={choice.value} value={choice.value}>
+                    {choice.label}
+                  </option>
+                ))}
+              </select>
             </fieldset>
 
             <div className="flex gap-3 justify-end">

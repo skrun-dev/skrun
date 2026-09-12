@@ -34,6 +34,7 @@ import {
   type Environment,
   type Run,
   type RunStatus,
+  type Session,
   type User,
 } from "./schema.js";
 
@@ -397,7 +398,8 @@ export class PostgresDb implements DbAdapter {
     const result = await this.pool.query<ApiKey>("SELECT * FROM api_keys WHERE key_hash = $1", [
       keyHash,
     ]);
-    return result.rows[0] ?? null;
+    const row = result.rows[0];
+    return row ? toApiKey(row) : null;
   }
 
   async createApiKey(data: {
@@ -440,7 +442,7 @@ export class PostgresDb implements DbAdapter {
         );
       }
       await client.query("COMMIT");
-      return result.rows[0];
+      return toApiKey(result.rows[0]);
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
@@ -466,7 +468,7 @@ export class PostgresDb implements DbAdapter {
     const result = await this.pool.query<ApiKey>("SELECT * FROM api_keys WHERE user_id = $1", [
       userId,
     ]);
-    return result.rows;
+    return result.rows.map(toApiKey);
   }
 
   async updateApiKeyLastUsed(id: string): Promise<void> {
@@ -551,6 +553,43 @@ export class PostgresDb implements DbAdapter {
 
   async purgeExpiredDeviceCodes(): Promise<void> {
     await this.pool.query("DELETE FROM device_codes WHERE expires_at < NOW()");
+  }
+
+  // ── Sessions (the browser session cookie store) ───────────────────────
+
+  async createSession(data: {
+    id_hash: string;
+    user_id: string;
+    expires_at: string;
+  }): Promise<void> {
+    await this.pool.query(
+      "INSERT INTO sessions (id_hash, user_id, created_at, expires_at) VALUES ($1, $2, NOW(), $3)",
+      [data.id_hash, data.user_id, data.expires_at],
+    );
+  }
+
+  /**
+   * The row or null. Does NOT filter on expiry: validateSession decides that
+   * once, for all three backends, and deletes the row it found expired.
+   *
+   * The row goes through `toSession` because `pg` hands back `Date` objects
+   * where the contract says ISO string. Returning `result.rows[0]` raw is the
+   * shape defect the neighbouring device-code lookups still carry.
+   */
+  async getSession(idHash: string): Promise<Session | null> {
+    const result = await this.pool.query<Session>("SELECT * FROM sessions WHERE id_hash = $1", [
+      idHash,
+    ]);
+    const row = result.rows[0];
+    return row ? toSession(row) : null;
+  }
+
+  async deleteSession(idHash: string): Promise<void> {
+    await this.pool.query("DELETE FROM sessions WHERE id_hash = $1", [idHash]);
+  }
+
+  async purgeExpiredSessions(): Promise<void> {
+    await this.pool.query("DELETE FROM sessions WHERE expires_at < NOW()");
   }
 
   // ── Agent LLM keys (creator-attached, encrypted) ──────────────────────
@@ -1086,4 +1125,37 @@ export class PostgresDb implements DbAdapter {
  */
 function redactUrl(url: string): string {
   return url.replace(/(postgres(?:ql)?:\/\/[^:]+:)[^@]+(@)/i, "$1***$2");
+}
+
+/**
+ * `pg` parses timestamp columns into `Date` objects, while the `DbAdapter`
+ * contract — and the memory and sqlite backends — carry ISO strings. A caller
+ * comparing what it wrote to what it reads back must see the same shape
+ * whichever backend answers, so the api_keys and sessions timestamps are
+ * normalised here. Strings pass through untouched (a driver returning text).
+ */
+function toIso(value: unknown): string {
+  return value instanceof Date ? value.toISOString() : String(value);
+}
+
+function toIsoOrNull(value: unknown): string | null {
+  if (value == null) return null;
+  return toIso(value);
+}
+
+function toApiKey(row: ApiKey): ApiKey {
+  return {
+    ...row,
+    created_at: toIso(row.created_at),
+    last_used_at: toIsoOrNull(row.last_used_at),
+    expires_at: toIsoOrNull(row.expires_at),
+  };
+}
+
+function toSession(row: Session): Session {
+  return {
+    ...row,
+    created_at: toIso(row.created_at),
+    expires_at: toIso(row.expires_at),
+  };
 }

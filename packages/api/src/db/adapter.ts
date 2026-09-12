@@ -10,6 +10,7 @@ import type {
   Environment,
   Run,
   RunStatus,
+  Session,
   User,
 } from "./schema.js";
 
@@ -76,8 +77,23 @@ export interface DbAdapter {
   // --- Agent LLM keys (creator-attached, encrypted at rest) ---
   /**
    * Upsert a creator's encrypted LLM key for `(agentId, provider)` — replaces any
-   * existing key for that pair. `ciphertext` is the opaque AES-256-GCM envelope;
-   * `last4` is display-only. Never returned by a read endpoint.
+   * existing key for that pair.
+   *
+   * `ciphertext` is the opaque AES-256-GCM envelope, and it is **never returned by
+   * a read endpoint**.
+   *
+   * `last4` is display-only and **IS** returned — by `listAgentLlmKeys` below.
+   * That exposure is deliberate and load-bearing: the cloud privacy policy states
+   * we keep the last four characters *"so you can tell one key from another"*, a
+   * sentence that only means anything if they are shown. Removing `last4` from the
+   * presence response would make a legal document false without touching the
+   * schema, so no migration guard would catch it. The round-trip test in
+   * `routes/agent-llm-keys.test.ts` pins the behaviour; this is the reason it is
+   * pinned.
+   *
+   * (This comment used to read "`last4` is display-only. Never returned by a read
+   * endpoint." — the second sentence attached to the wrong subject and read as an
+   * invitation to remove the very field a published text depends on.)
    */
   setAgentLlmKey(
     agentId: string,
@@ -209,6 +225,29 @@ export interface DbAdapter {
   consumeDeviceCode(deviceCodeHash: string): Promise<void>;
   /** Delete all expired codes (opportunistic sweep; no background job needed). */
   purgeExpiredDeviceCodes(): Promise<void>;
+
+  // --- Sessions (the browser session cookie store) ---
+  /**
+   * Store a browser session. **The caller hashes**: `id_hash` is the SHA-256 of
+   * the raw session id, which lives only in the cookie and never reaches this
+   * adapter — so a read of the table yields nothing usable as a credential.
+   * `expires_at` is an absolute deadline; using a session never extends it.
+   */
+  createSession(data: { id_hash: string; user_id: string; expires_at: string }): Promise<void>;
+  /**
+   * The row, or null when no session carries that hash.
+   *
+   * **Does NOT filter on expiry.** An expired row is returned like any other:
+   * the expiry decision belongs to one caller, taken once for all three
+   * backends, which then deletes the row it found expired. A backend filtering
+   * here would make that caller's delete unreachable — and the three backends
+   * would each be answering a slightly different question.
+   */
+  getSession(idHash: string): Promise<Session | null>;
+  /** Delete one session — logout, or a row found expired on read. */
+  deleteSession(idHash: string): Promise<void>;
+  /** Delete every expired session (the hourly sweep on each instance). */
+  purgeExpiredSessions(): Promise<void>;
 
   // --- Runs ---
   createRun(data: {

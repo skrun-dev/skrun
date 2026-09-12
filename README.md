@@ -154,7 +154,7 @@ Every Skrun registry ships with a full operator dashboard at `/dashboard`. No se
 - **Runs** — every execution across all agents, filterable by agent/ID/status/model.
 - **Run detail** — full I/O, tokens, cost, model, event timeline (tool calls, LLM calls).
 - **Playground** — call any agent interactively, watch SSE events live, save outputs.
-- **Settings** — profile + API keys (`sk_live_*`) with one-shot reveal and revocation.
+- **Settings** — profile + API keys (`sk_live_*`) with one-shot reveal, revocation, and a per-key expiry (or none).
 
 → **[Screenshot tour of all 7 pages](docs/getting-started.md#6-explore-the-dashboard)**
 

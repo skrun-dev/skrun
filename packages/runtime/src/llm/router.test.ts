@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Logger } from "../logger.js";
 import { createGuardedFetch } from "../security/safe-fetch.js";
+import { estimateCost } from "./cost.js";
 import type { LLMCallResponse, LLMProvider } from "./providers/types.js";
 import { LLMRouter } from "./router.js";
 
@@ -839,5 +840,106 @@ describe("model.base_url guard (SEC-001, audit/006)", () => {
     // No agent-declared endpoint means no guarded transport, so OpenAI/Mistral/
     // Grok/Groq at their fixed endpoints are untouched by this change.
     expect(vi.mocked(createGuardedFetch)).not.toHaveBeenCalled();
+  });
+});
+
+describe("tool-loop spend ceiling (#116)", () => {
+  const MODEL = { provider: "anthropic" as const, name: "claude-sonnet-4-20250514" };
+  const TOOLS = [{ name: "search", description: "Search", parameters: {} }];
+  const PROMPT_TOKENS = 1_000;
+  const COMPLETION_TOKENS = 200;
+  /**
+   * Mirrors `MAX_TOOL_ITERATIONS` in router.ts — the only bound the loop had
+   * before it started reading the ceiling from inside itself. The assertions
+   * below are what tell "stopped in the loop" apart from "stopped after it":
+   * both end on the same cost error, only the provider-call count differs.
+   */
+  const MAX_TOOL_ITERATIONS = 10;
+
+  /** A provider that asks for a tool on EVERY iteration, so only a bound can stop the loop. */
+  function alwaysAsksForATool() {
+    const call = vi.fn().mockResolvedValue({
+      content: "",
+      toolCalls: [{ name: "search", args: { q: "x" }, id: "t1" }],
+      usage: { promptTokens: PROMPT_TOKENS, completionTokens: COMPLETION_TOKENS },
+    });
+    const provider: LLMProvider = { name: "anthropic", call };
+    return { provider, call };
+  }
+
+  it("VT-12 (#116): the loop stops on the ceiling, well short of the iteration bound", async () => {
+    const r = new LLMRouter();
+    const { provider, call } = alwaysAsksForATool();
+    r.registerProvider("anthropic", provider);
+    const onToolCall = vi.fn().mockResolvedValue({ name: "search", result: "ok", id: "t1" });
+
+    // The ceiling sits between the 2nd and the 3rd iteration's cumulative
+    // spend, derived from the price table rather than hardcoded: a repricing
+    // moves the scenario instead of silently invalidating it.
+    const perIteration = estimateCost(MODEL.name, PROMPT_TOKENS, COMPLETION_TOKENS);
+    const maxCost = perIteration * 2.5;
+
+    const result = await r.call(
+      MODEL,
+      "sys",
+      "user",
+      TOOLS,
+      onToolCall,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { maxCost },
+    );
+
+    expect(result.costExceeded).toBe(true);
+    // The load-bearing assertion: the loop stopped inside itself. Reading the
+    // ceiling only on the way out would leave this at the iteration bound.
+    expect(call.mock.calls.length).toBeLessThan(MAX_TOOL_ITERATIONS);
+    expect(call).toHaveBeenCalledTimes(3);
+    // And it stopped before dispatching the tools of the iteration that tipped over.
+    expect(onToolCall).toHaveBeenCalledTimes(2);
+    // The returned cost is the one the ceiling was compared against.
+    expect(result.estimatedCost).toBeGreaterThan(maxCost);
+  });
+
+  it("RT-9 (#116): with no ceiling the loop is bounded only by its iteration count", async () => {
+    const r = new LLMRouter();
+    const { provider, call } = alwaysAsksForATool();
+    r.registerProvider("anthropic", provider);
+    const onToolCall = vi.fn().mockResolvedValue({ name: "search", result: "ok", id: "t1" });
+
+    const result = await r.call(MODEL, "sys", "user", TOOLS, onToolCall);
+
+    expect(result.costExceeded).toBeUndefined();
+    expect(call).toHaveBeenCalledTimes(MAX_TOOL_ITERATIONS);
+    expect(result.content).toMatch(/Max tool iterations reached/);
+  });
+
+  it("a ceiling that is never reached leaves the loop and the response untouched", async () => {
+    const r = new LLMRouter();
+    const { provider, call } = alwaysAsksForATool();
+    r.registerProvider("anthropic", provider);
+    const onToolCall = vi.fn().mockResolvedValue({ name: "search", result: "ok", id: "t1" });
+
+    const result = await r.call(
+      MODEL,
+      "sys",
+      "user",
+      TOOLS,
+      onToolCall,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { maxCost: 1_000 },
+    );
+
+    expect(result.costExceeded).toBeUndefined();
+    expect(call).toHaveBeenCalledTimes(MAX_TOOL_ITERATIONS);
   });
 });

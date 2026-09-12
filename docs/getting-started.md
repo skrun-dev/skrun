@@ -178,7 +178,7 @@ Click a run to see its **Run detail** — tokens, cost, model, duration, full in
 
 ![Settings](./assets/dashboard/settings.png)
 
-**Settings** — your profile (username, namespace, email, plan) and API keys (`sk_live_*` for production) with one-shot reveal, revocation, and last-used timestamps.
+**Settings** — your profile (username, namespace, email, plan) and API keys (`sk_live_*` for production) with one-shot reveal, revocation, and last-used timestamps. Creating a key offers an expiration (90 days preselected, "No expiration" as an explicit choice) and the list shows when each key expires. A key minted by `skrun login` instead takes the instance's own default lifetime — 90 days unless the operator changed it.
 
 ---
 

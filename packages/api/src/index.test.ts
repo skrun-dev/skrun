@@ -440,3 +440,64 @@ describe("createApp — pre-warm pool startup", () => {
     ).not.toThrow();
   });
 });
+
+describe("proxy trust wiring (#116)", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("VT-8: the shipped compose sets SKRUN_TRUST_PROXY on the api service", async () => {
+    // infra/docker-compose.yml is in .sync-allowlist, so this test can read it
+    // in the public mirror too. It pins the shipped mount, not the middleware.
+    const { readFileSync } = await import("node:fs");
+    const compose = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../../../infra/docker-compose.yml"),
+      "utf-8",
+    );
+    // Anchored: inside the api service's environment block, not anywhere else.
+    const api = compose.split(/\r?\n/);
+    let inApi = false;
+    let inEnv = false;
+    let found = false;
+    for (const line of api) {
+      if (/^ {2}api:\s*$/.test(line)) {
+        inApi = true;
+        continue;
+      }
+      if (inApi && /^ {2}\S/.test(line)) break;
+      if (inApi && /^ {4}environment:\s*$/.test(line)) {
+        inEnv = true;
+        continue;
+      }
+      if (inEnv && /^ {4}\S/.test(line)) inEnv = false;
+      if (inEnv && /^ {6}SKRUN_TRUST_PROXY:/.test(line)) found = true;
+    }
+    expect(found).toBe(true);
+  });
+
+  it("VT-6: two callers behind one gateway get two counters on the real push route", async () => {
+    // trustProxy is captured when the middleware mounts — the stub must be in
+    // place BEFORE createApp.
+    vi.stubEnv("SKRUN_TRUST_PROXY", "1");
+    const app = createApp(new MemoryStorage(), new MemoryDb());
+    const push = (ip: string, version: string) =>
+      app.request(`/api/agents/dev/vt6-agent/push?version=${version}`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer dev-token",
+          "Content-Type": "application/octet-stream",
+          "X-Forwarded-For": ip,
+        },
+        body: Buffer.from(`b-${version}`),
+      });
+    // Caller A exhausts ITS window…
+    for (let i = 1; i <= 10; i++) {
+      expect((await push("10.0.0.1", `1.0.${i}`)).status).toBe(200);
+    }
+    expect((await push("10.0.0.1", "1.0.11")).status).toBe(429);
+    // …caller B is untouched: its own counter, not a shared one.
+    const b = await push("10.0.0.2", "2.0.0");
+    expect(b.status).toBe(200);
+    expect(b.headers.get("X-RateLimit-Remaining")).toBe("9");
+  });
+});

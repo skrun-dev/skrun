@@ -102,6 +102,16 @@ const InitBodySchema = z.object({
   tools: z.array(ToolConfigSchema).default([]),
   mcpServers: z.array(McpServerSchema).default([]),
   allowedHosts: z.array(z.string()).default([]),
+  // Hex sha256 the downloaded bundle must match before anything is extracted.
+  // Optional on purpose: a bundle published before checksums were recorded has
+  // none, and this image is versioned separately from the harness, so a newer
+  // harness will be talking to an older image during a rollout. This schema
+  // ignores fields it does not know, which is what makes that direction safe —
+  // requiring the field would make the reverse direction fatal instead.
+  bundleSha256: z
+    .string()
+    .regex(/^[0-9a-f]{64}$/)
+    .optional(),
 });
 
 const ToolBodySchema = z.object({
@@ -265,6 +275,7 @@ app.post("/init", async (c) => {
       // biome-ignore lint/suspicious/noExplicitAny: zod-validated loose objects relayed to runtime providers
       mcpServers: parsed.data.mcpServers as any,
       allowedHosts: parsed.data.allowedHosts,
+      bundleSha256: parsed.data.bundleSha256,
     });
     // Typed against the shared runtime contract so the runner and the harness
     // cannot drift on the /init response shape. `boot` carries the cold-start

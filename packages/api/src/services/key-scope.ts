@@ -78,10 +78,12 @@ export function isMasterCredential(user: UserContext): boolean {
   const key = user.key;
   if (key == null) return true; // session / dev-token
   if (key.scope_kind !== "account") return false; // delegated
-  return (
-    key.operations.length === FULL_OPERATION_SET.size &&
-    key.operations.every((op) => FULL_OPERATION_SET.has(op))
-  );
+  // Compare SETS, not list lengths: a list can reach the full length by
+  // repeating one operation while omitting another, and every element would
+  // still be a member — so a length check accepts a key that is missing a
+  // permission. De-duplicate first, then compare size and membership.
+  const ops = new Set(key.operations);
+  return ops.size === FULL_OPERATION_SET.size && [...ops].every((op) => FULL_OPERATION_SET.has(op));
 }
 
 /** R1 — the key must permit `op` AND be allowed to act on `agent`. */

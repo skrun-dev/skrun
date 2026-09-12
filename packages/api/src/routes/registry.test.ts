@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateApiKey } from "../auth/api-key.js";
 import { MemoryDb } from "../db/memory.js";
 import { createApp } from "../index.js";
@@ -1678,5 +1678,123 @@ describe("verify — API-key scope (#65)", () => {
       body: JSON.stringify({ visibility: "private" }),
     });
     expect(vis.status).toBe(403);
+  });
+});
+
+describe("push rate limiting (#116)", () => {
+  let app: ReturnType<typeof createApp>;
+  let db: MemoryDb;
+  let storage: MemoryStorage;
+
+  beforeEach(() => {
+    storage = new MemoryStorage();
+    db = new MemoryDb();
+    app = createApp(storage, db);
+  });
+
+  const authHeader = { Authorization: "Bearer dev-token" };
+
+  function pushReq(version: string, name = "rl-agent") {
+    return app.request(`/api/agents/dev/${name}/push?version=${version}`, {
+      method: "POST",
+      headers: { ...authHeader, "Content-Type": "application/octet-stream" },
+      body: Buffer.from(`bundle-${version}`),
+    });
+  }
+
+  it("VT-1 + RT-3: the real two-segment push route traverses the limiter, metadata unchanged", async () => {
+    const res = await pushReq("1.0.0");
+    // The limiter is on the path: every response carries the X-RateLimit contract.
+    expect(res.headers.get("X-RateLimit-Limit")).toBe("10");
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe("9");
+    expect(res.headers.get("X-RateLimit-Reset")).toBeTruthy();
+    // RT-3 — the nominal push still returns the same metadata shape.
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.name).toBe("rl-agent");
+    expect(body.namespace).toBe("dev");
+    expect(body.latest_version).toBe("1.0.0");
+  });
+
+  it("VT-2: the 11th push in the window is refused 429 RATE_LIMITED", async () => {
+    for (let i = 1; i <= 10; i++) {
+      expect((await pushReq(`1.0.${i}`)).status).toBe(200);
+    }
+    const res = await pushReq("1.0.11");
+    expect(res.status).toBe(429);
+    const body = await res.json();
+    expect(body.error.code).toBe("RATE_LIMITED");
+  });
+
+  it("VT-22: the local-directory push path shares the push counter", async () => {
+    // The scan push route matches the same mount pattern (`:namespace` binds to
+    // the literal "scan"), so it shares this window's counter. The handler's
+    // own SKRUN_AGENTS_DIR gate is irrelevant here: the limiter runs first,
+    // which is exactly what this test pins down.
+    for (let i = 1; i <= 10; i++) {
+      expect((await pushReq(`1.0.${i}`)).status).toBe(200);
+    }
+    const res = await app.request("/api/agents/scan/rl-agent/push", {
+      method: "POST",
+      headers: authHeader,
+    });
+    expect(res.status).toBe(429);
+    expect((await res.json()).error.code).toBe("RATE_LIMITED");
+  });
+});
+
+describe("push body cap (#116)", () => {
+  let app: ReturnType<typeof createApp>;
+
+  beforeEach(() => {
+    vi.stubEnv("SKRUN_PUSH_MAX_BODY_MB", "0.001"); // ~1 KB cap for the tests
+    app = createApp(new MemoryStorage(), new MemoryDb());
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  const authHeader = { Authorization: "Bearer dev-token" };
+
+  function pushBody(body: Buffer, extraHeaders: Record<string, string> = {}) {
+    return app.request("/api/agents/dev/cap-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: { ...authHeader, "Content-Type": "application/octet-stream", ...extraHeaders },
+      body,
+    });
+  }
+
+  it("VT-4: an oversized push is refused 413 without the body being buffered (slow path)", async () => {
+    // `new Request(url, { body })` never sets content-length, so this exercises
+    // bodyLimit's stream-counting path — the one self-made clients hit.
+    const spy = vi.spyOn(Request.prototype, "arrayBuffer");
+    const res = await pushBody(Buffer.alloc(64 * 1024, 1));
+    expect(res.status).toBe(413);
+    expect((await res.json()).error.code).toBe("BUNDLE_TOO_LARGE");
+    // The proof that the cap ran BEFORE buffering: the handler's arrayBuffer()
+    // was never reached.
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("VT-4b: an oversized push is refused 413 on the Content-Length fast path", async () => {
+    // In production @hono/node-server forwards the real Content-Length, so the
+    // fast path (header short-circuit, body never read) is the one actually
+    // taken — it must be exercised explicitly, since the test client strips it.
+    const spy = vi.spyOn(Request.prototype, "arrayBuffer");
+    const res = await pushBody(Buffer.alloc(64 * 1024, 1), {
+      "Content-Length": String(64 * 1024),
+    });
+    expect(res.status).toBe(413);
+    expect((await res.json()).error.code).toBe("BUNDLE_TOO_LARGE");
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("VT-5: a body just under the cap passes, path unchanged", async () => {
+    const res = await pushBody(Buffer.alloc(512, 1)); // under the ~1 KB cap
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.latest_version).toBe("1.0.0");
   });
 });

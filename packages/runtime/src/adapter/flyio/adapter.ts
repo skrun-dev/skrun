@@ -446,6 +446,11 @@ export class FlyioAdapter implements RuntimeAdapter {
         tools: request.agentConfig.tools ?? [],
         mcpServers: request.agentConfig.mcp_servers ?? [],
         allowedHosts,
+        // The URL above and this checksum belong together: the runner downloads
+        // its own copy of the bundle, and this is what it checks that copy
+        // against before extracting. Undefined for a bundle with nothing on
+        // record — the runner then extracts and says so.
+        bundleSha256: request.bundleSha256,
       },
       rpcToken,
     );
@@ -676,6 +681,11 @@ export class FlyioAdapter implements RuntimeAdapter {
         tools: request.agentConfig.tools ?? [],
         mcpServers: request.agentConfig.mcp_servers ?? [],
         allowedHosts,
+        // Same as the cold-spawn path above, and it has to be here too: a warm
+        // machine is the faster path, so it is the one most runs take once the
+        // pool is on. Omitting it here would leave the check covering only the
+        // path nobody hits.
+        bundleSha256: request.bundleSha256,
       },
       rpcToken,
     );
@@ -812,6 +822,7 @@ export class FlyioAdapter implements RuntimeAdapter {
       tools: unknown[];
       mcpServers: unknown[];
       allowedHosts: string[];
+      bundleSha256?: string;
     },
     rpcToken: string,
   ): Promise<{

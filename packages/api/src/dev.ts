@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { serve } from "@hono/node-server";
 import { isOAuthConfigured } from "./auth/github-oauth.js";
+import { startSessionSweep } from "./auth/session.js";
 import type { DbAdapter } from "./db/adapter.js";
 import { createApp } from "./index.js";
 import type { StorageAdapter } from "./storage/adapter.js";
@@ -42,6 +43,11 @@ if (process.env.DATABASE_URL) {
 }
 
 const app = createApp(storage, db);
+
+// One call covers both branches above — they converge on the same adapter. As
+// in server.ts, this belongs to running a server, not to building an app.
+startSessionSweep(db);
+
 const port = Number(process.env.PORT ?? 4000);
 
 serve({ fetch: app.fetch, port }, () => {

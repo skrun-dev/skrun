@@ -1,6 +1,7 @@
 import { getModelCapabilities, type ModelConfig, type ModelProvider } from "@skrun-dev/schema";
 import type { Logger } from "../logger.js";
 import { createLogger } from "../logger.js";
+import { checkCost } from "../security/cost-checker.js";
 import { isPrivateHost } from "../security/network.js";
 import { createGuardedFetch } from "../security/safe-fetch.js";
 import { redactSecretsFromString } from "../utils/redact.js";
@@ -91,9 +92,44 @@ export interface LLMRouterResponse {
   provider: string;
   model: string;
   durationMs: number;
+  /**
+   * Set when the tool loop stopped early because `maxCost` was already passed.
+   * Optional, so it is additive for every existing consumer: absent means the
+   * loop ran to its natural end.
+   *
+   * The flag makes the early stop OBSERVABLE; it is not itself a terminus. The
+   * caller keeps its own cost check on `estimatedCost` and emits the run error
+   * it already owns — this response carries the very number that check reads.
+   */
+  costExceeded?: boolean;
 }
 
 export type ToolCallHandler = (call: ToolCallRequest) => Promise<ToolCallResult>;
+
+/**
+ * Everything one tool-loop pass needs. An options object rather than a
+ * positional list: the loop already threads a dozen mostly-optional values, and
+ * at that width the call sites stop being readable — a misplaced `undefined`
+ * silently becomes another parameter's value.
+ */
+interface ToolLoopOptions {
+  provider: string;
+  model: string;
+  systemPrompt: string;
+  userContent: SkrunPart[];
+  tools?: ToolDefinitionForLLM[];
+  onToolCall?: ToolCallHandler;
+  temperature?: number;
+  callerKeys?: Record<string, string>;
+  baseUrl?: string;
+  fileCache?: ProviderFileCache;
+  toolChoice?: ResolvedToolChoice;
+  parallelTools?: boolean;
+  cacheKey?: string;
+  creatorKeys?: Record<string, string>;
+  /** Spend ceiling for this pass, in USD. Undefined leaves the loop bounded only by its iteration count. */
+  maxCost?: number;
+}
 
 /**
  * Agent identity passed to the router for prompt-cache routing.
@@ -210,6 +246,12 @@ export class LLMRouter {
     parallelTools?: boolean,
     agentContext?: AgentContext,
     creatorKeys?: Record<string, string>,
+    /**
+     * Terminal options bag rather than one more positional slot — the list above
+     * is already at the width where a misplaced `undefined` lands in the wrong
+     * parameter.
+     */
+    opts?: { maxCost?: number },
   ): Promise<LLMRouterResponse> {
     const start = Date.now();
     let totalPromptTokens = 0;
@@ -238,22 +280,23 @@ export class LLMRouter {
       // failover timeout so a hanging primary switches to the fallback fast
       // (instead of blocking on the provider SDK's ~180s timeout). The timeout
       // rejection is handled by the catch → fallback path below.
-      const primaryCall = this.callWithToolLoop(
-        modelConfig.provider,
-        modelConfig.name,
+      const primaryCall = this.callWithToolLoop({
+        provider: modelConfig.provider,
+        model: modelConfig.name,
         systemPrompt,
-        parts,
+        userContent: parts,
         tools,
         onToolCall,
-        temperature ?? modelConfig.temperature,
+        temperature: temperature ?? modelConfig.temperature,
         callerKeys,
-        modelConfig.base_url,
+        baseUrl: modelConfig.base_url,
         fileCache,
         toolChoice,
         parallelTools,
         cacheKey,
         creatorKeys,
-      );
+        maxCost: opts?.maxCost,
+      });
       const result = modelConfig.fallback
         ? await racePrimaryWithFailover(primaryCall, PRIMARY_FAILOVER_TIMEOUT_MS)
         : await primaryCall;
@@ -271,6 +314,7 @@ export class LLMRouter {
         start,
         totalCacheReadTokens,
         totalCacheWriteTokens,
+        result.costExceeded,
       );
     } catch (primaryError) {
       // Try fallback
@@ -291,22 +335,23 @@ export class LLMRouter {
           "Primary LLM failed, trying fallback",
         );
 
-        const result = await this.callWithToolLoop(
-          modelConfig.fallback.provider,
-          modelConfig.fallback.name,
+        const result = await this.callWithToolLoop({
+          provider: modelConfig.fallback.provider,
+          model: modelConfig.fallback.name,
           systemPrompt,
-          parts,
+          userContent: parts,
           tools,
           onToolCall,
-          temperature ?? modelConfig.temperature,
+          temperature: temperature ?? modelConfig.temperature,
           callerKeys,
-          undefined,
+          baseUrl: undefined,
           fileCache,
           toolChoice,
           parallelTools,
           cacheKey,
           creatorKeys,
-        );
+          maxCost: opts?.maxCost,
+        });
         totalPromptTokens += result.usage.promptTokens;
         totalCompletionTokens += result.usage.completionTokens;
         totalCacheReadTokens += result.usage.cacheReadTokens ?? 0;
@@ -321,28 +366,14 @@ export class LLMRouter {
           start,
           totalCacheReadTokens,
           totalCacheWriteTokens,
+          result.costExceeded,
         );
       }
       throw primaryError;
     }
   }
 
-  private async callWithToolLoop(
-    provider: string,
-    model: string,
-    systemPrompt: string,
-    userContent: SkrunPart[],
-    tools?: ToolDefinitionForLLM[],
-    onToolCall?: ToolCallHandler,
-    temperature?: number,
-    callerKeys?: Record<string, string>,
-    baseUrl?: string,
-    fileCache?: ProviderFileCache,
-    toolChoice?: ResolvedToolChoice,
-    parallelTools?: boolean,
-    cacheKey?: string,
-    creatorKeys?: Record<string, string>,
-  ): Promise<{
+  private async callWithToolLoop(opts: ToolLoopOptions): Promise<{
     content: string;
     usage: {
       promptTokens: number;
@@ -350,7 +381,25 @@ export class LLMRouter {
       cacheReadTokens?: number;
       cacheWriteTokens?: number;
     };
+    costExceeded?: boolean;
   }> {
+    const {
+      provider,
+      model,
+      systemPrompt,
+      userContent,
+      tools,
+      onToolCall,
+      temperature,
+      callerKeys,
+      baseUrl,
+      fileCache,
+      toolChoice,
+      parallelTools,
+      cacheKey,
+      creatorKeys,
+      maxCost,
+    } = opts;
     const llmProvider = this.resolveProvider(provider, callerKeys, baseUrl, creatorKeys);
 
     let totalPromptTokens = 0;
@@ -399,6 +448,52 @@ export class LLMRouter {
       totalCompletionTokens += response.usage.completionTokens;
       totalCacheReadTokens += response.usage.cacheReadTokens ?? 0;
       totalCacheWriteTokens += response.usage.cacheWriteTokens ?? 0;
+
+      // Every iteration accumulates spend, so every iteration is where the
+      // ceiling has to be read: checking it only once the loop is over means
+      // the loop has already bought everything it was meant to prevent.
+      //
+      // The overage is reported BY RETURN VALUE, never by throwing. The agent
+      // loop awaits this call inside a `try` that has only a `finally`, and the
+      // adapters above it turn any thrown error into a generic execution
+      // failure — a thrown ceiling would lose its identity on the way out and
+      // the run would end on the wrong terminus. Returning the flag keeps the
+      // stop where it belongs and leaves the adapters untouched.
+      //
+      // The number below is produced by the SAME estimator and the SAME
+      // comparison the caller applies to the response it receives, over the
+      // same accumulators — so the caller's own ceiling check reads exactly
+      // this value and emits the cost error it already owns.
+      const spentSoFar = estimateCost(
+        model,
+        totalPromptTokens,
+        totalCompletionTokens,
+        totalCacheReadTokens || undefined,
+        totalCacheWriteTokens || undefined,
+      );
+      if (checkCost(spentSoFar, maxCost).exceeded) {
+        this.logger.warn(
+          {
+            event: "tool_loop_cost_exceeded",
+            provider,
+            model,
+            iteration: i,
+            estimatedCost: spentSoFar,
+            maxCost,
+          },
+          "Tool loop stopped mid-run — accumulated cost passed max_cost",
+        );
+        return {
+          content: response.content,
+          usage: {
+            promptTokens: totalPromptTokens,
+            completionTokens: totalCompletionTokens,
+            ...(totalCacheReadTokens > 0 && { cacheReadTokens: totalCacheReadTokens }),
+            ...(totalCacheWriteTokens > 0 && { cacheWriteTokens: totalCacheWriteTokens }),
+          },
+          costExceeded: true,
+        };
+      }
 
       // If no tool calls, return the content
       if (!response.toolCalls?.length || !onToolCall) {
@@ -560,6 +655,7 @@ export class LLMRouter {
     startTime: number,
     cacheReadTokens = 0,
     cacheWriteTokens = 0,
+    costExceeded = false,
   ): LLMRouterResponse {
     return {
       content,
@@ -582,6 +678,9 @@ export class LLMRouter {
       provider,
       model,
       durationMs: Date.now() - startTime,
+      // Emitted only when true, like the cache fields above: a response that ran
+      // to its natural end carries no flag at all.
+      ...(costExceeded && { costExceeded: true }),
     };
   }
 }

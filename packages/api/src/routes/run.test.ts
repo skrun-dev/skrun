@@ -2,6 +2,7 @@ import { packAgentTar } from "@skrun-dev/schema";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { generateApiKey } from "../auth/api-key.js";
 import { MemoryDb } from "../db/memory.js";
+import { API_KEY_DEFAULT_SCOPES } from "../db/schema.js";
 import { createApp } from "../index.js";
 import { RegistryService } from "../services/registry.js";
 import type { VerificationPolicy } from "../services/verification-policy.js";
@@ -283,8 +284,18 @@ describe("POST /run — version pinning", () => {
   });
 
   it("404 available list is bounded to 10 most recent", async () => {
+    // Seed through the DB, not HTTP push: 12 pushes in one window would trip the
+    // (now actually mounted) push rate limiter, and this test is about the 404
+    // available list — the bundle content never matters on that path.
+    await pushBundle("test-agent", "1.0.0");
+    const agent = await db.getAgent("dev", "test-agent");
+    if (!agent) throw new Error("seed agent missing");
     for (let i = 1; i <= 12; i++) {
-      await pushBundle("test-agent", `1.0.${i}`);
+      await db.createVersion(agent.id, {
+        version: `1.0.${i}`,
+        size: 10,
+        bundle_key: `dev/test-agent/1.0.${i}.agent`,
+      });
     }
     const res = await runWithBody({ input: { text: "x" }, version: "9.9.9" });
     expect(res.status).toBe(404);
@@ -540,6 +551,73 @@ describe("POST /run — run-authorization + env-override (#81)", () => {
     const alice = await makeUser("alice");
     await pushVerified(alice.key, "alice", "agent1");
     const res = await runAs(alice.key, "alice", "agent1", {
+      environment: { networking: { allowed_hosts: ["api.example.com"] } },
+    });
+    const body = (await res.json()) as { error?: { code?: string } };
+    expect(body?.error?.code).not.toBe("ENV_OVERRIDE_FORBIDDEN");
+  });
+
+  /**
+   * Mint a delegated key for `ownerId`, scoped to one agent and to `agent:run`
+   * only. This is the credential shape the override gate could not tell apart:
+   * it carries its minter's user id, so an ownership-only test sees the owner.
+   */
+  async function makeDelegatedKey(ownerId: string, agentId: string): Promise<string> {
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: ownerId,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "delegated-run-key",
+      scopes: ["agent:run"],
+      scope_kind: "agents",
+      agents: [agentId],
+    });
+    return key;
+  }
+
+  it("VT-10: a delegated key minted by the owner cannot override the environment → 403", async () => {
+    const alice = await makeUser("alice");
+    await pushVerified(alice.key, "alice", "agent1");
+    const agent = await db.getAgent("alice", "agent1");
+    expect(agent).not.toBeNull();
+    const delegated = await makeDelegatedKey(alice.id, (agent as { id: string }).id);
+    // The key runs this very agent, so it is past the scope gate; what it may
+    // not do is widen the environment the creator declared.
+    const res = await runAs(delegated, "alice", "agent1", {
+      environment: { networking: { allowed_hosts: ["evil.example.com"] } },
+    });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe(
+      "ENV_OVERRIDE_FORBIDDEN",
+    );
+  });
+
+  it("VT-10b: the same delegated key still runs the agent without an override", async () => {
+    const alice = await makeUser("alice");
+    await pushVerified(alice.key, "alice", "agent1");
+    const agent = await db.getAgent("alice", "agent1");
+    const delegated = await makeDelegatedKey(alice.id, (agent as { id: string }).id);
+    const res = await runAs(delegated, "alice", "agent1");
+    // Proves the 403 above comes from the override, not from the credential
+    // being unable to reach the route at all.
+    expect(res.status).not.toBe(403);
+    expect(res.status).not.toBe(404);
+  });
+
+  it("VT-11: the owner's account-wide full key is not refused an override", async () => {
+    const alice = await makeUser("alice");
+    await pushVerified(alice.key, "alice", "agent1");
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: alice.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "account-full-key",
+      scopes: [...API_KEY_DEFAULT_SCOPES],
+      scope_kind: "account",
+    });
+    const res = await runAs(key, "alice", "agent1", {
       environment: { networking: { allowed_hosts: ["api.example.com"] } },
     });
     const body = (await res.json()) as { error?: { code?: string } };
@@ -1091,5 +1169,41 @@ describe("POST /run — caller base-URL gate (SEC-001 layer 3, audit/006)", () =
       expect(res.status).toBe(400);
       expect(body.error?.code).toBe("INVALID_LLM_BASE_URL_HEADER");
     }
+  });
+});
+
+describe("run rate limiting (#116)", () => {
+  let app: ReturnType<typeof createApp>;
+
+  beforeEach(() => {
+    app = createApp(new MemoryStorage(), new MemoryDb());
+  });
+
+  function runReq() {
+    return app.request("/api/agents/dev/rl-agent/run", {
+      method: "POST",
+      headers: { Authorization: "Bearer dev-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ input: { text: "x" } }),
+    });
+  }
+
+  it("RT-2: the real two-segment run route traverses the limiter (headers present)", async () => {
+    // The nominal run path itself is pinned unchanged by the rest of this file;
+    // what was never asserted anywhere is that the limiter sits on THIS route.
+    const res = await runReq();
+    expect(res.headers.get("X-RateLimit-Limit")).toBe("60");
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe("59");
+    expect(res.status).not.toBe(429);
+  });
+
+  it("VT-3: the 61st run in the window is refused 429 RATE_LIMITED", async () => {
+    // The agent does not exist: each request 404s in the handler but still
+    // counts in the limiter, which runs first — that keeps the burst cheap.
+    for (let i = 0; i < 60; i++) {
+      expect((await runReq()).status).toBe(404);
+    }
+    const res = await runReq();
+    expect(res.status).toBe(429);
+    expect((await res.json()).error.code).toBe("RATE_LIMITED");
   });
 });

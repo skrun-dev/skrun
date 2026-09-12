@@ -38,19 +38,24 @@ built_here=0
 cleanup() {
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   if [[ "$built_here" == 1 ]]; then
-    rm -f "$IMG_CTX"/skrun-dev-runtime.tgz
+    rm -f "$IMG_CTX"/skrun-dev-runtime.tgz "$IMG_CTX"/skrun-dev-schema.tgz
   fi
 }
 trap cleanup EXIT
 
 if [[ -z "${SMOKE_IMAGE:-}" ]]; then
   built_here=1
-  echo "SMOKE: packing the runtime tarball into the build context (runner target only)..."
+  echo "SMOKE: packing the schema + runtime tarballs into the build context..."
   ( cd "$REPO_ROOT" \
+    && pnpm --filter @skrun-dev/schema pack --pack-destination "$IMG_CTX" >/dev/null \
     && pnpm --filter @skrun-dev/runtime pack --pack-destination "$IMG_CTX" >/dev/null )
-  # pnpm writes <name>-<version>.tgz; the Dockerfile ARG defaults to the
-  # unversioned name, so normalise. The `runner` target needs ONLY the runtime
-  # tarball (no schema/api — schema resolves from npm, api is api-server-only).
+  # pnpm writes <name>-<version>.tgz; the Dockerfile ARGs default to the
+  # unversioned names, so normalise. The `runner` target needs schema AND runtime
+  # (api is api-server-only): `pnpm pack` rewrites runtime's `workspace:*` dep on
+  # schema to a concrete version, and resolving THAT from the registry made the
+  # image build depend on npm publish having already happened — which is how the
+  # v1.0.0 tag build died. Schema now comes from the tarball beside it.
+  mv "$IMG_CTX"/skrun-dev-schema-*.tgz "$IMG_CTX/skrun-dev-schema.tgz"
   mv "$IMG_CTX"/skrun-dev-runtime-*.tgz "$IMG_CTX/skrun-dev-runtime.tgz"
   echo "SMOKE: building the runner target (runs the runner tsc)..."
   docker build --target runner -t "$TAG" "$IMG_CTX" >/dev/null

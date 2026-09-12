@@ -13,6 +13,7 @@ import {
   type Environment,
   type Run,
   type RunStatus,
+  type Session,
   type User,
 } from "./schema.js";
 
@@ -30,6 +31,8 @@ export class MemoryDb implements DbAdapter {
   private agentLlmKeys = new Map<string, (AgentLlmKeyRecord & { updated_at: string })[]>();
   /** device_code_hash -> in-flight CLI device-login code (RFC 8628). */
   private deviceCodes = new Map<string, DeviceCode>();
+  /** id_hash -> browser session row. The raw id lives only in the cookie. */
+  private sessions = new Map<string, Session>();
   private runs = new Map<string, Run>();
   private environments = new Map<string, Environment>();
 
@@ -451,6 +454,40 @@ export class MemoryDb implements DbAdapter {
     }
   }
 
+  // --- Sessions (the browser session cookie store) ---
+
+  async createSession(data: {
+    id_hash: string;
+    user_id: string;
+    expires_at: string;
+  }): Promise<void> {
+    this.sessions.set(data.id_hash, {
+      id_hash: data.id_hash,
+      user_id: data.user_id,
+      created_at: new Date().toISOString(),
+      expires_at: data.expires_at,
+    });
+  }
+
+  /**
+   * The row or null. Does NOT filter on expiry: validateSession decides that
+   * once, for all three backends, and deletes the row it found expired.
+   */
+  async getSession(idHash: string): Promise<Session | null> {
+    return this.sessions.get(idHash) ?? null;
+  }
+
+  async deleteSession(idHash: string): Promise<void> {
+    this.sessions.delete(idHash);
+  }
+
+  async purgeExpiredSessions(): Promise<void> {
+    const now = Date.now();
+    for (const [hash, s] of this.sessions) {
+      if (new Date(s.expires_at).getTime() < now) this.sessions.delete(hash);
+    }
+  }
+
   // --- Agent LLM keys (creator-attached, encrypted) ---
 
   async setAgentLlmKey(
@@ -855,6 +892,7 @@ export class MemoryDb implements DbAdapter {
     this.apiKeysByHash.clear();
     this.agentLlmKeys.clear();
     this.deviceCodes.clear();
+    this.sessions.clear();
     this.runs.clear();
     this.environments.clear();
   }

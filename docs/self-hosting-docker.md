@@ -228,7 +228,7 @@ need an in-place migration.
 |---------|-------|------|---------|
 | `api` | `ghcr.io/skrun-dev/skrun-runtime` | `4000` (internal) | The Hono server. Receives `POST /run`, drives the LLM loop, persists results. |
 | `postgres` | `postgres:16-alpine` | `5432` (internal) | Source-of-truth for agents, runs, users, API keys. |
-| `minio` | `minio/minio` | `9000` + `9001` (internal) | S3-compatible blob storage for agent bundles + run outputs. |
+| `minio` | `ghcr.io/skrun-dev/minio` (a byte-for-byte mirror of the pinned MinIO release — Docker Hub no longer serves it) | `9000` + `9001` (internal) | S3-compatible blob storage for agent bundles + run outputs. |
 | `redis` | `redis:7-alpine` | `6379` (internal) | Caching layer (MCP connections, deps resolutions in a future release). |
 | `caddy` | `caddy:2-alpine` | `80` + `443` (host) | TLS termination + reverse-proxy with SSE-safe flush. |
 

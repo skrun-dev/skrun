@@ -52,6 +52,7 @@ import { run as runApiKeyScopes } from "./e2e/live/23-api-key-scopes.js";
 import { run as runCreatorLlmKey } from "./e2e/live/24-creator-llm-key.js";
 import { run as runDeviceLogin } from "./e2e/live/25-device-login.js";
 import { run as runBaseUrlGuard } from "./e2e/live/26-base-url-guard.js";
+import { run as runRunBoundary } from "./e2e/live/27-run-boundary.js";
 
 // Phases 18 (Fly Machines API smoke) + 19 (deployed-cloud E2E) are NOT run
 // here. They exercise live external infra (Fly.io / a DEPLOYED api-server),
@@ -149,6 +150,9 @@ await runDeviceLogin();
 //     sent to an endpoint the agent's author chose. Driven with a REAL delegated
 //     sk_live key, because a dev-token is a master credential and would be exempt. ---
 await runBaseUrlGuard();
+
+// --- Phase 27: run boundary - rate-limit headers on the real routes, key expiry ---
+await runRunBoundary();
 
 // --- Summary ---
 console.log(`\n${"=".repeat(70)}`);

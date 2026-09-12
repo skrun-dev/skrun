@@ -31,6 +31,7 @@ import { isGithubUserAllowed } from "../auth/signup-allowlist.js";
 import type { DbAdapter } from "../db/adapter.js";
 import { API_KEY_DEFAULT_SCOPES } from "../db/schema.js";
 import { getUser } from "../middleware/auth.js";
+import { resolveDefaultKeyExpiry } from "../services/key-expiry.js";
 import type { VerificationPolicy } from "../services/verification-policy.js";
 import { externalBaseUrl } from "../utils/external-url.js";
 import { requireMasterCredential } from "./_helpers.js";
@@ -266,7 +267,7 @@ export function createAuthRoutes(
       }
 
       // Web flow: create session cookie
-      const sessionId = createSession(user.id);
+      const sessionId = await createSession(db, user.id);
       const cookieOpts = getSessionCookieOptions();
       setCookie(c, SESSION_COOKIE_NAME, sessionId, cookieOpts);
 
@@ -464,6 +465,10 @@ export function createAuthRoutes(
       key_hash: keyHash,
       key_prefix: keyPrefix,
       name: "CLI login",
+      // A login-minted key expires by default: re-running the login command
+      // costs one command, so a bounded lifetime is cheap here. See
+      // `services/key-expiry.ts` for the window and how to widen or disable it.
+      expires_at: resolveDefaultKeyExpiry(new Date()),
     });
     await db.consumeDeviceCode(hash);
     return c.json({ token: key, username: user.username });
@@ -583,10 +588,10 @@ export function createAuthRoutes(
   // ==================== Logout ====================
 
   // POST /auth/logout — clear session
-  router.post("/auth/logout", (c) => {
+  router.post("/auth/logout", async (c) => {
     const sessionId = getCookie(c, SESSION_COOKIE_NAME);
     if (sessionId) {
-      destroySession(sessionId);
+      await destroySession(db, sessionId);
     }
     setCookie(c, SESSION_COOKIE_NAME, "", { maxAge: 0, path: "/" });
     return c.json({ ok: true });
@@ -631,6 +636,7 @@ export function createAuthRoutes(
       scopes?: string[];
       scope_kind?: string;
       agents?: string[];
+      expires_at?: string;
     };
     try {
       body = await c.req.json();
@@ -703,6 +709,41 @@ export function createAuthRoutes(
       }
     }
 
+    // Expiry: accepted, never imposed. Unlike a key minted by the login flow,
+    // a key minted here is typically handed to a client or wired into someone
+    // else's integration — a default lifetime would break it on the day it ran
+    // out, with nothing on the caller's side to explain why. Omitted means no
+    // expiry; a value must be a parseable instant in the future, because a past
+    // one would mint a credential that is dead on arrival.
+    const expiresAtRaw = body.expires_at?.trim();
+    let expiresAt: string | undefined;
+    if (expiresAtRaw) {
+      const parsed = new Date(expiresAtRaw);
+      if (Number.isNaN(parsed.getTime())) {
+        return c.json(
+          {
+            error: {
+              code: "INVALID_REQUEST",
+              message: "expires_at must be an ISO-8601 date-time.",
+            },
+          },
+          400,
+        );
+      }
+      if (parsed.getTime() <= Date.now()) {
+        return c.json(
+          {
+            error: {
+              code: "INVALID_REQUEST",
+              message: "expires_at must be in the future.",
+            },
+          },
+          400,
+        );
+      }
+      expiresAt = parsed.toISOString();
+    }
+
     const { key, keyHash, keyPrefix } = generateApiKey();
     const apiKey = await db.createApiKey({
       user_id: user.id,
@@ -712,6 +753,7 @@ export function createAuthRoutes(
       scopes,
       scope_kind: scopeKind,
       agents: agentIds,
+      expires_at: expiresAt,
     });
 
     // Return the raw key only here — it cannot be retrieved again
@@ -724,6 +766,7 @@ export function createAuthRoutes(
         scopes: apiKey.scopes,
         scope_kind: apiKey.scope_kind,
         agents: scopeKind === "agents" ? agentRefs : [],
+        expires_at: apiKey.expires_at,
         created_at: apiKey.created_at,
       },
       201,
@@ -745,6 +788,7 @@ export function createAuthRoutes(
         scopes: k.scopes,
         scope_kind: k.scope_kind,
         last_used_at: k.last_used_at,
+        expires_at: k.expires_at,
         created_at: k.created_at,
       })),
     );

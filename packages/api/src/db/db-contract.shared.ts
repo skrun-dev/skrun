@@ -592,6 +592,39 @@ export function runDbContractTests(label: string, makeDb: () => Promise<DbAdapte
         expect(await db.listApiKeys(user.id)).toHaveLength(0);
       });
 
+      // The expiry must round-trip identically on every backend. The auth
+      // middleware refuses a key whose expiry has passed, so a backend that
+      // dropped, truncated or shifted the value would silently either keep a
+      // dead credential alive or kill a live one — and no other case in this
+      // contract passes `expires_at` at all.
+      it("round-trips expires_at unchanged, and treats its absence as null", async () => {
+        const user = await db.createUser({ github_id: "ak-exp", username: "ak-exp-u" });
+        const expiresAt = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
+        const key = await db.createApiKey({
+          user_id: user.id,
+          key_hash: "hash-expiring",
+          key_prefix: "sk_live_exp",
+          name: "expiring key",
+          expires_at: expiresAt,
+        });
+        expect(key.expires_at).toBe(expiresAt);
+
+        const found = await db.getApiKeyByHash("hash-expiring");
+        expect(found?.expires_at).toBe(expiresAt);
+        const listed = await db.listApiKeys(user.id);
+        expect(listed.find((k) => k.id === key.id)?.expires_at).toBe(expiresAt);
+
+        // Omitted → null, never a defaulted instant: expiry is not retroactive.
+        const open = await db.createApiKey({
+          user_id: user.id,
+          key_hash: "hash-open",
+          key_prefix: "sk_live_open",
+          name: "open key",
+        });
+        expect(open.expires_at).toBeNull();
+        expect((await db.getApiKeyByHash("hash-open"))?.expires_at).toBeNull();
+      });
+
       it("returns false for deleteApiKey on nonexistent id", async () => {
         expect(await db.deleteApiKey(fx("nonexistent-key"))).toBe(false);
       });
@@ -886,6 +919,62 @@ export function runDbContractTests(label: string, makeDb: () => Promise<DbAdapte
         await db.purgeExpiredDeviceCodes();
         expect(await db.getDeviceCodeByDeviceHash("dch-old")).toBeNull();
         expect(await db.getDeviceCodeByDeviceHash("dch-fresh")).not.toBeNull();
+      });
+    });
+
+    // ── Sessions (the browser session cookie store) ─────────────────────
+
+    describe("sessions", () => {
+      const future = () => new Date(Date.now() + 600_000).toISOString();
+      // A real uuid: sessions.user_id is a uuid column on Postgres, which
+      // rejects an arbitrary string (see the uuid-safety note at the top).
+      const userId = () => fx("user-1");
+
+      it("creates, reads, deletes a session", async () => {
+        const expires = future();
+        await db.createSession({ id_hash: "sess-1", user_id: userId(), expires_at: expires });
+
+        const row = await db.getSession("sess-1");
+        expect(row?.id_hash).toBe("sess-1");
+        expect(row?.user_id).toBe(userId());
+        expect(row?.expires_at).toBe(expires);
+
+        await db.deleteSession("sess-1");
+        expect(await db.getSession("sess-1")).toBeNull();
+      });
+
+      it("returns null for an unknown session id, without throwing", async () => {
+        expect(await db.getSession("sess-nope")).toBeNull();
+      });
+
+      it("reads timestamps back as ISO strings, equal to what was written", async () => {
+        // The postgres driver hands back Date objects where this contract says
+        // string. Without this assertion the suite stays green with the defect
+        // present — which is exactly how it went unnoticed on device_codes.
+        const expires = future();
+        await db.createSession({ id_hash: "sess-iso", user_id: userId(), expires_at: expires });
+
+        const row = await db.getSession("sess-iso");
+        expect(typeof row?.expires_at).toBe("string");
+        expect(typeof row?.created_at).toBe("string");
+        expect(row?.expires_at).toBe(expires);
+      });
+
+      it("purges expired sessions and keeps fresh ones", async () => {
+        await db.createSession({
+          id_hash: "sess-old",
+          user_id: userId(),
+          expires_at: new Date(Date.now() - 10_000).toISOString(),
+        });
+        await db.createSession({
+          id_hash: "sess-fresh",
+          user_id: userId(),
+          expires_at: future(),
+        });
+
+        await db.purgeExpiredSessions();
+        expect(await db.getSession("sess-old")).toBeNull();
+        expect(await db.getSession("sess-fresh")).not.toBeNull();
       });
     });
 

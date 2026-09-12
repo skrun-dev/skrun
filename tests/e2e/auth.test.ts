@@ -4,7 +4,7 @@
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import { generateApiKey } from "../../packages/api/src/auth/api-key.js";
-import { clearSessions, createSession } from "../../packages/api/src/auth/session.js";
+import { createSession } from "../../packages/api/src/auth/session.js";
 import { createTestApp, DEV_TOKEN, pushAgent, verifyVersion } from "./setup.js";
 
 describe("E2E: Auth", () => {
@@ -15,7 +15,6 @@ describe("E2E: Auth", () => {
     const ctx = createTestApp();
     app = ctx.app;
     db = ctx.db;
-    clearSessions();
   });
 
   // --- Dev-token flow (RT-1) ---
@@ -145,7 +144,7 @@ describe("E2E: Auth", () => {
 
   it("session auth: list and revoke API keys", async () => {
     const user = await db.createUser({ github_id: "gh-mgmt", username: "keymgr" });
-    const sessionId = createSession(user.id);
+    const sessionId = await createSession(db, user.id);
     const cookieHeader = `skrun_session=${sessionId}`;
 
     // Create 2 keys

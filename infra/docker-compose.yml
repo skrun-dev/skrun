@@ -50,6 +50,11 @@ services:
       SKRUN_CONTAINER_MODE: api-server
       NODE_ENV: production
       PORT: "4000"
+      # The api is only reachable through the caddy gateway in this composition
+      # (no published port — `expose` only), and the shipped Caddyfile
+      # overwrites X-Forwarded-For with the address it saw. Trusting the header
+      # is therefore always correct here — deliberately not made configurable.
+      SKRUN_TRUST_PROXY: "1"
       # LLM keys — operator brings their own .env.
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -157,7 +162,7 @@ services:
     restart: unless-stopped
 
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: ghcr.io/skrun-dev/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: skrun-minio
     command: server /data --console-address ":9001"
     environment:

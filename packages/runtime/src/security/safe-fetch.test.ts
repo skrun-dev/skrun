@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import { gzipSync } from "node:zlib";
 import { describe, expect, it, vi } from "vitest";
 import {
   createGuardedFetch,
@@ -107,5 +108,95 @@ describe("safeFetch — SSRF guard", () => {
   it("createGuardedFetch (the MCP-injected fetch) blocks a private-resolving host", async () => {
     const guarded = createGuardedFetch({ resolver: resolvesTo("169.254.169.254") });
     await expectSsrfBlocked(() => guarded("http://metadata.test/"));
+  });
+});
+
+// The guard wraps undici's fetch with a validating dispatcher. Everything else
+// about the request and the response must pass through untouched: an LLM SDK
+// injected with `createGuardedFetch` (the `base_url` path) builds its headers as
+// a `Headers` instance and reads gzip-encoded JSON bodies. Neither was covered,
+// and a public report claimed both were broken — they are not, and these cases
+// keep it that way. The third case pins the one behaviour that DOES lose the
+// bearer, so the doc sentence about it stays true.
+describe("safeFetch — request/response fidelity on the base_url path", () => {
+  async function startInspectingServer(opts: { gzip: boolean }) {
+    const server: Server = createServer((req, res) => {
+      const seen = JSON.stringify({
+        authorization: req.headers.authorization ?? null,
+        "x-custom": req.headers["x-custom"] ?? null,
+      });
+      if (opts.gzip) {
+        res.writeHead(200, { "content-type": "application/json", "content-encoding": "gzip" });
+        res.end(gzipSync(seen));
+      } else {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(seen);
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+    return { port, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+  }
+
+  const local = { resolver: resolvesTo("127.0.0.1"), allowPrivateHosts: true, timeoutMs: 3000 };
+
+  it("passes a `Headers` instance through — the Authorization header reaches the server", async () => {
+    const server = await startInspectingServer({ gzip: false });
+    try {
+      const headers = new Headers({ authorization: "Bearer sk-test", "x-custom": "yes" });
+      const res = await safeFetch(
+        `http://127.0.0.1:${server.port}/v1/chat/completions`,
+        { method: "POST", headers, body: "{}" },
+        local,
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ authorization: "Bearer sk-test", "x-custom": "yes" });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("decodes a gzip-encoded JSON response — `json()` parses it", async () => {
+    const server = await startInspectingServer({ gzip: true });
+    try {
+      const res = await safeFetch(
+        `http://127.0.0.1:${server.port}/v1/chat/completions`,
+        { headers: { authorization: "Bearer sk-test" } },
+        local,
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ authorization: "Bearer sk-test", "x-custom": null });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("drops the Authorization header on a cross-origin redirect (fetch standard) — the documented base_url trap", async () => {
+    // Two servers on two ports are two origins. The first redirects to the
+    // second; per the fetch standard the bearer must not follow. This is what a
+    // `base_url` that redirects (http -> https, another host) looks like from the
+    // provider's side: a request with no key, hence 401 — docs/agent-yaml.md says so.
+    const target = await startInspectingServer({ gzip: false });
+    const front: Server = createServer((req, res) => {
+      res.writeHead(307, { location: `http://127.0.0.1:${target.port}${req.url ?? "/"}` });
+      res.end();
+    });
+    await new Promise<void>((resolve) => front.listen(0, "127.0.0.1", () => resolve()));
+    const frontAddr = front.address();
+    const frontPort = typeof frontAddr === "object" && frontAddr ? frontAddr.port : 0;
+    try {
+      const res = await safeFetch(
+        `http://127.0.0.1:${frontPort}/v1/chat/completions`,
+        { method: "POST", headers: { authorization: "Bearer sk-test" }, body: "{}" },
+        local,
+      );
+      expect(res.status).toBe(200);
+      expect(res.redirected).toBe(true);
+      expect(await res.json()).toEqual({ authorization: null, "x-custom": null });
+    } finally {
+      await new Promise<void>((resolve) => front.close(() => resolve()));
+      await target.close();
+    }
   });
 });

@@ -208,6 +208,8 @@ skrun login --token sk_live_...     # production API key (non-interactive)
 
 Tokens are saved to `~/.skrun/config.json`. Use `skrun logout` to clear.
 
+**The key the interactive flow mints expires.** Its lifetime is the instance's `SKRUN_API_KEY_TTL_DAYS` — 90 days unless the operator changed it, or none if they set `0`. Past it, commands fail with `401` ("API key has expired"); run `skrun login` again to get a fresh key. A key you pass yourself with `--token` is unaffected: a key created through the API or the dashboard expires only if it was given an expiry, and `dev-token` never expires.
+
 **Which registry the CLI talks to** — resolved in this order: `SKRUN_REGISTRY_URL` (env), then `registry_url` in `~/.skrun/config.json` (written at login), then `http://localhost:4000`. The env var wins, which is the switch to use in CI or when driving several instances from one machine — it changes the target without touching the stored config. Note the token is **not** resolved the same way: it comes from the config file only, so pointing the env var at a different registry does not carry credentials over to it.
 
 ## skrun logout

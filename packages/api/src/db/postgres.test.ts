@@ -118,6 +118,27 @@ describeIfPg("PostgresDb postgres-specific", () => {
     }
   });
 
+  it("VT-8 (#124): deleting a user cascades to their sessions", async () => {
+    const userId = "33333333-3333-3333-3333-333333333333";
+    await db
+      .getPool()
+      .query("INSERT INTO users (id, github_id, username) VALUES ($1, 'sess-casc', 'sess-casc')", [
+        userId,
+      ]);
+    await db.createSession({
+      id_hash: "sess-cascade",
+      user_id: userId,
+      expires_at: new Date(Date.now() + 600_000).toISOString(),
+    });
+    expect(await db.getSession("sess-cascade")).not.toBeNull();
+
+    // Delete the user via the raw connection: the adapter exposes no
+    // deleteUser, so the ON DELETE CASCADE declaration is what is under test.
+    await db.getPool().query("DELETE FROM users WHERE id = $1", [userId]);
+
+    expect(await db.getSession("sess-cascade")).toBeNull();
+  });
+
   /**
    * VT-12 (SC-12): `listAgents` MUST use a single LEFT JOIN, NOT N+1.
    * Wrap `pool.query` via a spy, populate fixtures, call listAgents

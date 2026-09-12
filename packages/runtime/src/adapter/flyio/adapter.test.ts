@@ -628,3 +628,50 @@ describe("FlyioAdapter — telling a real resume from a silent cold boot", () =>
     expect(spawn.phases.pool_hit).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The bundle checksum reaching the runner
+// ---------------------------------------------------------------------------
+
+/** The parsed body of the single `/init` POST the harness made. */
+function initBody(fetchImpl: typeof fetch): Record<string, unknown> {
+  const call = (fetchImpl as unknown as { mock: { calls: unknown[][] } }).mock.calls.find((c) =>
+    String(c[0]).endsWith("/init"),
+  );
+  return JSON.parse(String((call?.[1] as { body?: unknown })?.body));
+}
+
+describe("FlyioAdapter — the bundle checksum reaches the runner", () => {
+  const checksum = "a".repeat(64);
+
+  // There are two ways a runner is obtained, and each builds its own `/init`
+  // body. A checksum on one of them only is a check that does not apply to the
+  // other, which is the point of asserting both rather than one.
+  it("puts it in the init body when the machine is created for this run", async () => {
+    const { flyApi, calls, fetchImpl } = poolHarness();
+    await makeAdapter(flyApi, fetchImpl).acquire(createRunRequest({ bundleSha256: checksum }));
+
+    expect(calls).toContain("create");
+    expect(initBody(fetchImpl).bundleSha256).toBe(checksum);
+  });
+
+  it("puts it in the init body when the machine comes from the pool", async () => {
+    const { flyApi, pool, calls, fetchImpl } = poolHarness();
+    await makeAdapter(flyApi, fetchImpl, pool).acquire(
+      createRunRequest({ bundleSha256: checksum }),
+    );
+
+    expect(calls).toContain("claim");
+    expect(calls).not.toContain("create");
+    expect(initBody(fetchImpl).bundleSha256).toBe(checksum);
+  });
+
+  // A bundle published before checksums were kept has none. The field is simply
+  // absent from the body, and the runner treats that as "extract, and say so".
+  it("leaves the field out when the bundle has no checksum on record", async () => {
+    const { flyApi, pool, fetchImpl } = poolHarness();
+    await makeAdapter(flyApi, fetchImpl, pool).acquire(createRunRequest());
+
+    expect(initBody(fetchImpl)).not.toHaveProperty("bundleSha256");
+  });
+});

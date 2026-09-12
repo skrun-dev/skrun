@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { estimateCost } from "../llm/cost.js";
 import type { LLMProvider } from "../llm/providers/types.js";
 import { LLMRouter } from "../llm/router.js";
 import { createLogger } from "../logger.js";
@@ -194,6 +195,116 @@ describe("runAgentLoop max_cost (LLM08)", () => {
       expect(last.error.code).toBe("COST_EXCEEDED");
     }
     expect(events.some((e) => e.type === "run_complete")).toBe(false);
+  });
+});
+
+describe("runAgentLoop max_cost inside the tool loop (#116)", () => {
+  /**
+   * Mirrors `MAX_TOOL_ITERATIONS` in llm/router.ts. It is the whole point of
+   * these two cases: an over-budget run ended on the same cost error before and
+   * after this change — what tells the two apart is HOW MANY provider calls it
+   * paid for on the way there.
+   */
+  const MAX_TOOL_ITERATIONS = 10;
+  const PROMPT_TOKENS = 1_000;
+  const COMPLETION_TOKENS = 200;
+  const MODEL = "claude-sonnet-4-6";
+
+  /** A provider that asks for a tool on EVERY iteration, so only a bound can stop the loop. */
+  function alwaysAsksForATool() {
+    const call = vi.fn(async () => ({
+      content: "",
+      toolCalls: [{ name: "search", args: {}, id: "call-1" }],
+      usage: { promptTokens: PROMPT_TOKENS, completionTokens: COMPLETION_TOKENS },
+    }));
+    const provider: LLMProvider = { name: "mock", call };
+    return { provider, call };
+  }
+
+  /** A tool registry whose single tool counts its own dispatches. */
+  async function registryCountingDispatches(counter: { n: number }): Promise<ToolRegistry> {
+    const provider: ToolProvider = {
+      listTools: async (): Promise<ToolDefinition[]> => [
+        { name: "search", description: "search", parameters: {} },
+      ],
+      callTool: async (): Promise<ToolResult> => {
+        counter.n += 1;
+        return { content: "results", isError: false };
+      },
+      disconnect: async () => {},
+    };
+    const tools = new ToolRegistry();
+    await tools.addProvider(provider);
+    return tools;
+  }
+
+  it("VT-12 (#116): an over-budget tool loop stops inside the loop and ends on COST_EXCEEDED", async () => {
+    const { provider, call } = alwaysAsksForATool();
+    const router = new LLMRouter();
+    router.registerProvider("mock", provider);
+    const dispatches = { n: 0 };
+    const tools = await registryCountingDispatches(dispatches);
+
+    const req = createRunRequest();
+    req.agentConfig.model = { provider: "mock", name: MODEL };
+    // Ceiling between the 2nd and 3rd iteration's cumulative spend, derived from
+    // the price table so a repricing moves the scenario rather than voiding it.
+    req.agentConfig.environment.max_cost =
+      estimateCost(MODEL, PROMPT_TOKENS, COMPLETION_TOKENS) * 2.5;
+
+    const events = await collect(
+      runAgentLoop({
+        request: req,
+        router,
+        tools,
+        logger: createLogger("test"),
+        startMs: Date.now(),
+      }),
+    );
+
+    // Same terminus as before this change: same code, same event shape, same
+    // message template — the run error the loop already owned.
+    const last = events[events.length - 1];
+    expect(last.type).toBe("run_error");
+    if (last.type === "run_error") {
+      expect(last.error.code).toBe("COST_EXCEEDED");
+      expect(last.error.message).toMatch(/exceeded the configured max_cost/);
+      expect(last.run_id).toBe("test-run-id");
+    }
+    expect(events.some((e) => e.type === "run_complete")).toBe(false);
+
+    // The load-bearing assertion: it stopped WHILE looping, not after.
+    expect(call.mock.calls.length).toBeLessThan(MAX_TOOL_ITERATIONS);
+    expect(call).toHaveBeenCalledTimes(3);
+    // And no tool was dispatched for the iteration that tipped over.
+    expect(dispatches.n).toBe(2);
+  });
+
+  it("RT-9 (#116): with no max_cost the tool loop is bounded only by its iteration count", async () => {
+    const { provider, call } = alwaysAsksForATool();
+    const router = new LLMRouter();
+    router.registerProvider("mock", provider);
+    const dispatches = { n: 0 };
+    const tools = await registryCountingDispatches(dispatches);
+
+    const req = createRunRequest();
+    req.agentConfig.model = { provider: "mock", name: MODEL };
+    req.agentConfig.environment.max_cost = undefined;
+
+    const events = await collect(
+      runAgentLoop({
+        request: req,
+        router,
+        tools,
+        logger: createLogger("test"),
+        startMs: Date.now(),
+      }),
+    );
+
+    expect(call).toHaveBeenCalledTimes(MAX_TOOL_ITERATIONS);
+    expect(dispatches.n).toBe(MAX_TOOL_ITERATIONS);
+    expect(events.some((e) => e.type === "run_error")).toBe(false);
+    expect(events.some((e) => e.type === "run_complete")).toBe(true);
   });
 });
 

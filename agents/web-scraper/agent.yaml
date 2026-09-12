@@ -38,7 +38,9 @@ outputs:
 environment:
   networking:
     allowed_hosts:
-      - "*"
+      - "example.com"
+      - "kickstarter.com"
+      - "www.kickstarter.com"
   filesystem: read-only
   secrets: []
   timeout: 120s

@@ -271,6 +271,30 @@ describe("SqliteDb FOREIGN KEY migration (CODE-110)", () => {
     expect(() => new SqliteDb(dbPath)).toThrow(/orphan rows found.*before upgrading/);
   });
 
+  it("VT-8 (#124): deleting a user cascades to their sessions", async () => {
+    const db = new SqliteDb(dbPath);
+    try {
+      const user = await db.createUser({ github_id: "gh-sess-cascade", username: "sess-cascade" });
+      await db.createSession({
+        id_hash: "sess-cascade",
+        user_id: user.id,
+        expires_at: new Date(Date.now() + 600_000).toISOString(),
+      });
+      expect(await db.getSession("sess-cascade")).not.toBeNull();
+
+      // Delete the user via the raw connection: the adapter exposes no
+      // deleteUser, and going through one would tell us nothing about the SQL
+      // — it is the ON DELETE CASCADE declaration that is under test here.
+      (db as unknown as { db: { prepare: (s: string) => { run: (a: string) => void } } }).db
+        .prepare("DELETE FROM users WHERE id = ?")
+        .run(user.id);
+
+      expect(await db.getSession("sess-cascade")).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
   // VT-19 (CODE-111)
   it("VT-19: agent_versions enforces UNIQUE(agent_id, version)", async () => {
     const db = new SqliteDb(dbPath);

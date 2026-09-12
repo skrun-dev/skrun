@@ -132,6 +132,17 @@ describe("key-scope: isMasterCredential", () => {
     };
     expect(isMasterCredential(user(reordered))).toBe(true);
   });
+  it("VT-19: a duplicated operation does not stand in for a missing one", () => {
+    // Three entries, every one of them a member of the full set — a length
+    // check would call this master. It is not: `agent:verify` is absent.
+    const duplicated: KeyContext = {
+      id: "d",
+      scope_kind: "account",
+      operations: ["agent:run", "agent:run", "agent:push"],
+      agent_ids: [],
+    };
+    expect(isMasterCredential(user(duplicated))).toBe(false);
+  });
   it("an account key with an unknown/extra op is not master", () => {
     const extra: KeyContext = {
       id: "x",

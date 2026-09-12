@@ -57,7 +57,7 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data --console-address ":9001"
+            ghcr.io/skrun-dev/minio:RELEASE.2025-09-07T16-13-09Z server /data --console-address ":9001"
           echo "Waiting for MinIO to become healthy..."
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then
@@ -75,7 +75,7 @@ jobs:
           # MC_HOST_<alias> env var (no shell wrapper needed) and call `mc mb`.
           docker run --rm --network host \
             -e MC_HOST_local=http://minioadmin:minioadmin@localhost:9000 \
-            minio/mc:RELEASE.2025-08-13T08-35-41Z mb local/skrun-test --ignore-existing
+            ghcr.io/skrun-dev/mc:RELEASE.2025-08-13T08-35-41Z mb local/skrun-test --ignore-existing
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm build

@@ -12,6 +12,13 @@ const logger = createLogger("ratelimit-redis");
  * rotate instances to multiply the effective limit. Uses Upstash's sliding-window
  * algorithm (HTTP/REST — works on Node today and Cloudflare Workers later).
  *
+ * One key namespace PER MOUNT. Upstash keys its counter on
+ * `<prefix>:<identifier>:<window>` — the limit (`max`) is an argument of the
+ * Lua script, not part of the key — so two mounts with the same window and the
+ * same prefix would share ONE counter per client, whatever limit each announces.
+ * With a single prefix, ten runs used up the push allowance (measured, 2026-09-11).
+ * The mount's `name` is what keeps its counter apart.
+ *
  * Resilience: on ANY Redis runtime error (Upstash outage / network
  * partition) it falls back to an in-memory limiter (degraded to per-instance) —
  * never fail-open (no limiting) and never fail-closed (429-all). A Redis outage
@@ -22,12 +29,12 @@ export class RedisRateLimiter implements RateLimiterAdapter {
   private readonly ratelimit: Ratelimit;
   private readonly fallback: MemoryRateLimiter;
 
-  constructor(windowMs: number, max: number, redis: Redis) {
+  constructor(windowMs: number, max: number, redis: Redis, name: string) {
     this.ratelimit = new Ratelimit({
       redis,
       limiter: Ratelimit.slidingWindow(max, `${windowMs} ms`),
       analytics: false,
-      prefix: "skrun:rl",
+      prefix: `skrun:rl:${name}`,
     });
     this.fallback = new MemoryRateLimiter(windowMs, max);
   }

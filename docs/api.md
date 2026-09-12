@@ -124,6 +124,13 @@ API keys use the `sk_live_` prefix followed by 32 hex characters. They are store
 
 Default scopes: `agent:push`, `agent:run`, `agent:verify` (all granted).
 
+**Expiry.** The two ways of minting a key expire differently, on purpose:
+
+- A key minted by `skrun login` gets the lifetime the operator sets — `SKRUN_API_KEY_TTL_DAYS` days from creation, default `90`; `0` means the login flow mints keys that never expire. Re-running `skrun login` issues a fresh one.
+- A key created through `POST /api/keys` gets **no** default. Omit `expires_at` and the key never expires; pass an ISO-8601 instant **in the future** and the key stops working after it (a malformed or past value is refused with `400 INVALID_REQUEST`). Such a key is typically handed to a client or wired into someone else's integration, so a lifetime is never imposed on it.
+
+An expired key is refused with `401 UNAUTHORIZED` ("API key has expired"), the same way a revoked one is. `GET /api/keys` returns `expires_at` for every key — `null` when it does not expire. Keys that existed before expiry shipped have no `expires_at`, and are **not** expired retroactively.
+
 ### Auth middleware priority
 
 When a request arrives, the middleware checks authentication in this order:
@@ -142,8 +149,8 @@ When a request arrives, the middleware checks authentication in this order:
 | `/auth/github/callback` | GET | No | Handles OAuth callback — creates user, sets session cookie |
 | `/auth/logout` | POST | No | Clears session cookie, redirects to `/` |
 | `/api/me` | GET | Yes | Returns current user info (`id`, `username`, `namespace`, `email`, `plan`) |
-| `/api/keys` | POST | Yes | Create API key — returns `sk_live_...` key (shown once) |
-| `/api/keys` | GET | Yes | List your API keys (prefix only, never the full key) |
+| `/api/keys` | POST | Yes | Create API key — returns `sk_live_...` key (shown once). Optional `expires_at` (ISO-8601, must be in the future); omitted = never expires |
+| `/api/keys` | GET | Yes | List your API keys (prefix only, never the full key) — includes `expires_at` (`null` = no expiry) |
 | `/api/keys/:id` | DELETE | Yes | Revoke an API key — takes effect immediately |
 
 ---
@@ -280,7 +287,7 @@ Example 404:
 }
 ```
 
-**Rate limit**: 60 requests per minute per IP.
+**Rate limit**: 60 requests per minute per client address, in a 60-second window. Every response — including the successful ones — carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`; the 61st request in the window is refused with `429` and `RATE_LIMITED` before the agent runs. See [Rate limiting](#rate-limiting) for how the client address is determined behind a proxy.
 
 ---
 
@@ -509,7 +516,7 @@ Upload an agent bundle to the registry.
 | `Content-Type` | Yes | `application/octet-stream` |
 | `X-Skrun-Version-Notes` | No | Optional note attached to this version. Percent-encoded UTF-8, max 500 characters, plain text only. Used to describe what changed (like a commit message). The CLI `-m` / `--message` flag sets this header. |
 
-**Body**: raw `.agent` bundle (tar.gz created by `skrun build`).
+**Body**: raw `.agent` bundle (tar.gz created by `skrun build`), capped at `SKRUN_PUSH_MAX_BODY_MB` (default 50 MB).
 
 **Query params**
 
@@ -541,8 +548,10 @@ Upload an agent bundle to the registry.
 | `400` | `INVALID_NOTES` | `X-Skrun-Version-Notes` is > 500 chars, contains null bytes, or is malformed percent-encoding |
 | `403` | `FORBIDDEN` | Pushing outside your namespace |
 | `409` | `VERSION_EXISTS` | Same version already pushed (bump `version` in `agent.yaml`) |
+| `413` | `BUNDLE_TOO_LARGE` | The request body — the **compressed** bundle — exceeds `SKRUN_PUSH_MAX_BODY_MB` (default 50 MB). Refused before the body is buffered. This is a different ceiling from `BUNDLE_MAX_DECOMPRESSED_MB`, which bounds what the archive expands to once it has been accepted. `skrun build` already refuses to produce a bundle over 50 MB, so a CLI user normally never reaches this. |
+| `429` | `RATE_LIMITED` | More than 10 pushes from the same client address inside the 60-second window |
 
-**Rate limit**: 10 requests per minute per IP.
+**Rate limit**: 10 requests per minute per client address, in a 60-second window. Every response carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`; the 11th push in the window is refused with `429` and `RATE_LIMITED`. `POST /api/agents/scan/:name/push` (the push-from-a-local-directory path) is counted against the same limit.
 
 **Note**: you can only push to your own namespace. `dev-token` grants access to the `dev` namespace.
 
@@ -1094,7 +1103,8 @@ All errors follow the same format:
 | `MISSING_VERSION` | 400 | Version query param missing on push |
 | `NOT_FOUND` | 404 | Agent not found in registry |
 | `CONFLICT` | 409 | Version already exists |
-| `RATE_LIMITED` | 429 | Too many requests |
+| `RATE_LIMITED` | 429 | Too many requests — see [Rate limiting](#rate-limiting) for the per-endpoint limits |
+| `BUNDLE_TOO_LARGE` | 413 | Push request body (compressed bundle) over `SKRUN_PUSH_MAX_BODY_MB` (default 50 MB) |
 | `BUNDLE_CORRUPT` | 500 | Failed to extract agent bundle |
 | `BUNDLE_INTEGRITY_FAILED` | 500 | Bundle checksum (SHA-256) did not match — the stored bundle was modified; the registry refuses to serve it |
 | `MISSING_CONFIG` | 500 | agent.yaml not found in bundle |
@@ -1471,7 +1481,7 @@ Agents without file output get `files: []` in the response (backward compatible)
 
 ## Rate limiting
 
-Rate limits are per IP address. Response headers indicate current status:
+Rate limits are per client address, counted in a 60-second window (a fixed window on the in-memory limiter, a sliding one on the shared Redis store). Every response on a limited endpoint carries these headers — the refusals as well as the successes:
 
 | Header | Description |
 |--------|-------------|
@@ -1483,3 +1493,7 @@ Rate limits are per IP address. Response headers indicate current status:
 |----------|-------|
 | `POST /api/agents/:ns/:name/run` | 60/min |
 | `POST /api/agents/:ns/:name/push` | 10/min |
+
+Over the limit, the request is refused with `429` and `RATE_LIMITED` — before the agent runs, and before a push body is stored. `POST /api/agents/scan/:name/push` is counted against the `push` limit.
+
+**Behind a proxy.** The address is taken from the socket unless `SKRUN_TRUST_PROXY` is set, because a forwarded header is otherwise chosen by the caller. Setting it is not enough on its own: the gateway must supply an address the caller cannot dictate. Either it **overwrites** `X-Forwarded-For` with the connecting address (what the shipped `Caddyfile.example` does), or — if it appends to that header instead, leaving the caller's value in first position — it writes the address into a header of its own, and you name that header in `SKRUN_TRUST_PROXY_HEADER`. A gateway that only appends, trusted on `X-Forwarded-For`, lets one caller mint a fresh counter per request by varying the value it sends: the limit is then bypassable. See [Self-hosting](./self-hosting.md) for both variables, and for the shared-counter setup a multi-instance deployment needs.

@@ -156,7 +156,19 @@ skrun.db-*
 .skrun/
 
 # Local tool config
-.claude/
+# Exclude the CONTENTS, not the directory — git does not descend into an excluded
+# directory, so a negation below would never be reached otherwise.
+.claude/*
+# …except the skills. They are project procedure (the release + sync runbooks), and
+# leaving them untracked is how the sync-public skill and specs/_meta/RELEASE.md
+# drifted apart for three months with nobody able to see it. Private either way:
+# .claude/ is not in .sync-allowlist, so it never reaches the public repo.
+!.claude/skills/
+# …and the agents, for the same reason. `kb-reviewer` carries the mandate that
+# `specs/_meta/rules/reviewer-rules.md` § KB pattern declares mandatory — the review
+# that caught 37 false or contradictory assertions across the KB. Leaving it on one
+# machine means the rule survives while the thing that executes it does not.
+!.claude/agents/
 .playwright-mcp/
 .mcp.json
 
@@ -166,3 +178,10 @@ scripts/_TMP_*
 
 # Per-worktree local journal (multi-session dev workflow)
 specs/_meta/JOURNAL-worktree.md
+
+# Obsidian vault state — per-machine UI state (open panes, recent files), rewritten
+# on every open. Tracked by accident on 2026-09-06 through a blanket `git add -A`,
+# where it also broke `pnpm lint`. Matched anywhere rather than at one path, so no
+# private directory is named in a file that syncs to the public mirror.
+# Excluded from biome the same way (biome.json does not read this file).
+**/.obsidian/

@@ -26,8 +26,29 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
     // --- 1. Session cookie ---
     const sessionId = getCookie(c, SESSION_COOKIE_NAME);
     if (sessionId) {
-      const userId = validateSession(sessionId);
+      let userId: string | null;
+      try {
+        userId = await validateSession(db, sessionId);
+      } catch (err) {
+        // A database failure is NOT an absent session. Treating it as one would
+        // log every signed-in user out in silence the day the sessions table is
+        // missing — a fault whose only symptom is behaviour that looks correct.
+        // A bare throw is not enough either: this app registers no global error
+        // handler, so it would produce a 500 without the one line that tells
+        // "the store is down" apart from "nobody is signed in".
+        logger.error(
+          {
+            event: "session_lookup_failed",
+            error: err instanceof Error ? err.message : String(err),
+          },
+          "Session lookup failed",
+        );
+        return c.json({ error: { code: "INTERNAL_ERROR", message: "Session lookup failed" } }, 500);
+      }
       if (userId) {
+        // Outside the try on purpose: this call already propagates its errors
+        // and must keep doing so. Widening the block would change the behaviour
+        // of a path this element does not own.
         const user = await db.getUserById(userId);
         if (user) {
           const ctx: UserContext = {

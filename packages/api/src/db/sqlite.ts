@@ -15,6 +15,7 @@ import {
   type Environment,
   type Run,
   type RunStatus,
+  type Session,
   type User,
 } from "./schema.js";
 
@@ -129,6 +130,22 @@ CREATE TABLE IF NOT EXISTS device_codes (
   expires_at TEXT NOT NULL,
   last_polled_at TEXT
 );
+
+-- Browser session store — the SQLite mirror of migration 017_sessions.sql
+-- (that file is the Postgres path; this const is the SQLite one, and SQLite
+-- replays no migration). id_hash is the SHA-256 of the raw session id, which
+-- lives only in the cookie. The FK is inline and targets the users table, which
+-- migrateForeignKeys() never rebuilds, so there is no FK-rebuild collision.
+-- Timestamps are TEXT (ISO strings) like every other table here.
+CREATE TABLE IF NOT EXISTS sessions (
+  id_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+-- The only non-primary-key column any session query reads: the hourly sweep.
+CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions (expires_at);
 `;
 
 export class SqliteDb implements DbAdapter {
@@ -1116,6 +1133,48 @@ export class SqliteDb implements DbAdapter {
 
   async purgeExpiredDeviceCodes(): Promise<void> {
     this.db.prepare("DELETE FROM device_codes WHERE expires_at < ?").run(new Date().toISOString());
+  }
+
+  // ── Sessions (the browser session cookie store) ───────────────────────
+
+  private toSession(row: Record<string, unknown>): Session {
+    return {
+      id_hash: row.id_hash as string,
+      user_id: row.user_id as string,
+      created_at: row.created_at as string,
+      expires_at: row.expires_at as string,
+    };
+  }
+
+  async createSession(data: {
+    id_hash: string;
+    user_id: string;
+    expires_at: string;
+  }): Promise<void> {
+    this.db
+      .prepare(
+        "INSERT INTO sessions (id_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+      )
+      .run(data.id_hash, data.user_id, new Date().toISOString(), data.expires_at);
+  }
+
+  /**
+   * The row or null. Does NOT filter on expiry: validateSession decides that
+   * once, for all three backends, and deletes the row it found expired.
+   */
+  async getSession(idHash: string): Promise<Session | null> {
+    const row = this.db.prepare("SELECT * FROM sessions WHERE id_hash = ?").get(idHash) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? this.toSession(row) : null;
+  }
+
+  async deleteSession(idHash: string): Promise<void> {
+    this.db.prepare("DELETE FROM sessions WHERE id_hash = ?").run(idHash);
+  }
+
+  async purgeExpiredSessions(): Promise<void> {
+    this.db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(new Date().toISOString());
   }
 
   // ── Agent LLM keys (creator-attached, encrypted) ──────────────────────

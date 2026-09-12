@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Pool } from "pg";
@@ -186,26 +186,102 @@ describe("migrations-runner: lintMigration", () => {
 // local PG. Operators can spin up the docker-compose `postgres` service
 // + export `DATABASE_URL=postgres://skrun:skrun-dev-only@localhost:5432/skrun`
 // to activate.
+//
+// This block runs against its OWN database, created here and dropped here
+// — never the one `DATABASE_URL` points at. Reason, measured rather than
+// assumed: this file and `postgres.test.ts` both do
+// `DROP SCHEMA public CASCADE` for a clean slate, vitest runs test files
+// in parallel, and nothing serialises them. Sharing one database means one
+// file destroys the schema while the other is mid-test, and the pooled
+// connections of the second point at relations that no longer exist. The
+// failures that produces are real but look random, and they land on tests
+// that have nothing to do with the change being made. Running the whole
+// `@skrun-dev/api` suite with `DATABASE_URL` set showed it directly: the
+// shared-database arrangement failed, the dedicated-database one did not.
+//
+// Assumption: the `DATABASE_URL` role may create and drop a database. True
+// for the `postgres` superuser used in CI and in the local throwaway
+// container. A role without that right will see this block fail loudly at
+// setup, which is the right outcome — silently falling back to the shared
+// database would restore the race.
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const HAS_PG_INTEGRATION = !!DATABASE_URL && /^postgres(ql)?:\/\//.test(DATABASE_URL);
 const describeIfPg = HAS_PG_INTEGRATION ? describe : describe.skip;
 
+const MIGRATIONS_DIR = join(import.meta.dirname, "migrations");
+const SESSIONS_MIGRATION = "017_sessions.sql";
+
+/** Quote a Postgres identifier — database names cannot be bound as parameters. */
+function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Derive this block's own database from `DATABASE_URL`: same server, same
+ * credentials, a `_migrations` suffix on the database name. The maintenance
+ * URL points at `postgres`, because `CREATE DATABASE` cannot run from inside
+ * the database it creates.
+ */
+function deriveDatabases(url: string): {
+  ownName: string;
+  ownUrl: string;
+  maintenanceUrl: string;
+} {
+  const parsed = new URL(url);
+  const base = decodeURIComponent(parsed.pathname.replace(/^\//, "")) || "postgres";
+  const ownName = `${base}_migrations`;
+
+  const own = new URL(url);
+  own.pathname = `/${encodeURIComponent(ownName)}`;
+
+  const maintenance = new URL(url);
+  maintenance.pathname = "/postgres";
+
+  return { ownName, ownUrl: own.toString(), maintenanceUrl: maintenance.toString() };
+}
+
 describeIfPg("migrations-runner integration: runMigrations against real PG", () => {
   let pool: Pool;
+  let ownName: string;
+  let maintenanceUrl: string;
 
-  beforeAll(() => {
-    pool = new Pool({ connectionString: DATABASE_URL });
+  beforeAll(async () => {
+    const derived = deriveDatabases(DATABASE_URL as string);
+    ownName = derived.ownName;
+    maintenanceUrl = derived.maintenanceUrl;
+
+    const admin = new Pool({ connectionString: maintenanceUrl });
+    try {
+      await admin.query(`CREATE DATABASE ${quoteIdent(ownName)}`);
+    } catch (err) {
+      // 42P04 = duplicate_database: a previous run was interrupted before
+      // its afterAll could drop it. Reusing it is safe — every test here
+      // starts by wiping the public schema.
+      if ((err as { code?: string }).code !== "42P04") throw err;
+    } finally {
+      await admin.end();
+    }
+
+    pool = new Pool({ connectionString: derived.ownUrl });
   });
 
   afterAll(async () => {
     await pool.end();
+    const admin = new Pool({ connectionString: maintenanceUrl });
+    try {
+      // WITH (FORCE) terminates any connection left behind, so the drop
+      // cannot hang waiting on one (Postgres 13+; CI and local are 16).
+      await admin.query(`DROP DATABASE IF EXISTS ${quoteIdent(ownName)} WITH (FORCE)`);
+    } finally {
+      await admin.end();
+    }
   });
 
   beforeEach(async () => {
-    // Wipe public schema for a clean slate. Trade-off: this test suite
-    // ASSUMES the target DB is a throwaway/test database — never run
-    // against a populated production DB.
+    // Wipe public schema for a clean slate. Safe by construction: the
+    // database this pool points at was created by `beforeAll` above and is
+    // dropped by `afterAll` — it never holds anything else.
     await pool.query("DROP SCHEMA IF EXISTS public CASCADE");
     await pool.query("CREATE SCHEMA public");
   });
@@ -273,5 +349,87 @@ describeIfPg("migrations-runner integration: runMigrations against real PG", () 
       "SELECT COUNT(*)::text AS count FROM _skrun_migrations",
     );
     expect(Number(r.rows[0].count)).toBeGreaterThanOrEqual(9);
+  });
+
+  // ── The sessions migration ──────────────────────────────────────────
+  //
+  // These three assert on the SHAPE the migration leaves behind, not merely
+  // that it ran. In particular they name the index: an absent index breaks
+  // nothing at all — it only makes the hourly sweep grow with the user
+  // count — so nothing but a named assertion would ever report it missing.
+
+  async function publicTables(): Promise<string[]> {
+    const r = await pool.query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+        ORDER BY table_name`,
+    );
+    return r.rows.map((row) => row.table_name);
+  }
+
+  it("VT-1 (#124): a fresh DB gets the sessions table, its 4 columns and its index", async () => {
+    await runMigrations(pool, MIGRATIONS_DIR);
+
+    const cols = await pool.query<{ column_name: string; is_nullable: string }>(
+      `SELECT column_name, is_nullable FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'sessions'
+        ORDER BY column_name`,
+    );
+    expect(cols.rows.map((r) => r.column_name)).toEqual([
+      "created_at",
+      "expires_at",
+      "id_hash",
+      "user_id",
+    ]);
+    expect(cols.rows.every((r) => r.is_nullable === "NO")).toBe(true);
+
+    const idx = await pool.query<{ indexname: string }>(
+      "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'sessions'",
+    );
+    expect(idx.rows.map((r) => r.indexname)).toContain("sessions_expires_at_idx");
+  });
+
+  it("VT-2 (#124): a DB carrying every earlier migration applies exactly one more", async () => {
+    // Build the "everything but the sessions migration" state from a temp
+    // directory, so the second run has exactly one file left to do — which
+    // is the state every already-deployed instance will boot from.
+    const partialDir = mkdtempSync(join(tmpdir(), "skrun-migrations-partial-"));
+    try {
+      const earlier = readdirSync(MIGRATIONS_DIR).filter(
+        (f) => f.endsWith(".sql") && f !== SESSIONS_MIGRATION,
+      );
+      for (const f of earlier) {
+        copyFileSync(join(MIGRATIONS_DIR, f), join(partialDir, f));
+      }
+
+      const before = await runMigrations(pool, partialDir);
+      expect(before.applied).toBe(earlier.length);
+      const tablesBefore = await publicTables();
+      expect(tablesBefore).not.toContain("sessions");
+
+      const result = await runMigrations(pool, MIGRATIONS_DIR);
+      expect(result.applied).toBe(1);
+      expect(result.backfilled).toBe(0);
+      expect(result.skipped).toBe(earlier.length);
+
+      // No existing table was touched: the set gained `sessions`, nothing else.
+      expect(await publicTables()).toEqual([...tablesBefore, "sessions"].sort());
+    } finally {
+      rmSync(partialDir, { recursive: true, force: true });
+    }
+  });
+
+  it("VT-3 (#124): a second run after the sessions migration applies nothing", async () => {
+    await runMigrations(pool, MIGRATIONS_DIR);
+    const second = await runMigrations(pool, MIGRATIONS_DIR);
+    expect(second.applied).toBe(0);
+    expect(second.backfilled).toBe(0);
+
+    // Recorded exactly once — a re-apply would have thrown before reaching here.
+    const r = await pool.query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM _skrun_migrations WHERE name = $1",
+      [SESSIONS_MIGRATION],
+    );
+    expect(Number(r.rows[0].count)).toBe(1);
   });
 });

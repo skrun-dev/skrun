@@ -15,6 +15,7 @@ const mockKeys = [
     scope_kind: "account",
     created_at: "2026-04-20T00:00:00Z",
     last_used_at: "2026-04-21T10:00:00Z",
+    expires_at: "2026-07-19T00:00:00Z",
   },
   {
     id: "key-2",
@@ -24,8 +25,13 @@ const mockKeys = [
     scope_kind: "agents",
     created_at: "2026-04-21T00:00:00Z",
     last_used_at: null,
+    // A key with no expiry — the list must say so rather than leave a blank.
+    expires_at: null,
   },
 ];
+
+/** Bodies the mint endpoint actually received — asserted, not inferred. */
+const mintedBodies: Array<{ name: string; scope_kind?: string; expires_at?: string }> = [];
 
 const server = setupServer(
   // The dashboard's AuthProvider fetches /api/me on mount; return a real user so the
@@ -51,7 +57,12 @@ const server = setupServer(
     }),
   ),
   http.post("/api/keys", async ({ request }) => {
-    const body = (await request.json()) as { name: string; scope_kind?: string };
+    const body = (await request.json()) as {
+      name: string;
+      scope_kind?: string;
+      expires_at?: string;
+    };
+    mintedBodies.push(body);
     return HttpResponse.json({
       id: "key-3",
       key: "sk_live_full_key_shown_once_abc123def456",
@@ -62,13 +73,17 @@ const server = setupServer(
       agents: [],
       created_at: new Date().toISOString(),
       last_used_at: null,
+      expires_at: body.expires_at ?? null,
     });
   }),
   http.delete("/api/keys/:id", () => new HttpResponse(null, { status: 204 })),
 );
 
 beforeAll(() => server.listen());
-afterEach(() => server.resetHandlers());
+afterEach(() => {
+  server.resetHandlers();
+  mintedBodies.length = 0;
+});
 afterAll(() => server.close());
 
 describe("SettingsPage", () => {
@@ -125,6 +140,63 @@ describe("SettingsPage", () => {
     // Picking "One agent" reveals the agent dropdown (fed by /api/agents).
     await user.click(screen.getByText("One agent"));
     await waitFor(() => expect(screen.getByLabelText("Agent")).toBeInTheDocument());
+  });
+
+  it("VT-21: the list shows each key's expiry, and an em-dash when there is none", async () => {
+    renderWithProviders(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("CI pipeline")).toBeInTheDocument());
+    expect(screen.getByText("Expires")).toBeInTheDocument();
+
+    // Assert inside each key's own row: the em-dash is also used elsewhere on
+    // the page, so a page-wide query would prove nothing about this column.
+    const rowOf = (keyName: string): HTMLElement => {
+      const row = screen.getByText(keyName).closest('[class*="grid-cols-"]');
+      if (!(row instanceof HTMLElement)) throw new Error(`No row for ${keyName}`);
+      return row;
+    };
+    const expiryOfKey1 = new Date("2026-07-19T00:00:00Z").toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    });
+    expect(rowOf("CI pipeline").textContent).toContain(expiryOfKey1);
+    expect(rowOf("Dashboard key").textContent).toContain("—");
+  });
+
+  it("VT-21: creating a key sends the preselected duration, and 'No expiration' sends none", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("API Keys")).toBeInTheDocument());
+
+    const openDialog = async () => {
+      const buttons = screen.getAllByText("Create Key");
+      const first = buttons[0];
+      if (!first) throw new Error("Expected at least one Create Key button");
+      await user.click(first);
+    };
+
+    await openDialog();
+    const selector = screen.getByLabelText("Expiration");
+    // 90 days is preselected — the choice a creator gets by doing nothing.
+    expect((selector as HTMLSelectElement).value).toBe("90");
+    await user.click(screen.getByText("Create"));
+
+    await waitFor(() => expect(mintedBodies).toHaveLength(1));
+    const sent = mintedBodies[0]?.expires_at;
+    expect(sent).toBeTruthy();
+    const days = (new Date(sent as string).getTime() - Date.now()) / (24 * 60 * 60 * 1000);
+    expect(days).toBeGreaterThan(89);
+    expect(days).toBeLessThan(91);
+
+    // Now the explicit gesture: "No expiration" must send no field at all,
+    // because the endpoint imposes no default of its own.
+    await user.click(screen.getByText("Done"));
+    await openDialog();
+    await user.selectOptions(screen.getByLabelText("Expiration"), "never");
+    await user.click(screen.getByText("Create"));
+
+    await waitFor(() => expect(mintedBodies).toHaveLength(2));
+    expect(mintedBodies[1]).not.toHaveProperty("expires_at");
   });
 
   it("EC-1: shows empty state when no keys", async () => {

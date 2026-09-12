@@ -102,7 +102,7 @@ export class RegistryService {
     name: string,
     version?: string,
     opts?: { preloadedAgent?: Agent },
-  ): Promise<{ buffer: Buffer; version: string; verified: boolean }> {
+  ): Promise<{ buffer: Buffer; version: string; verified: boolean; sha256: string | null }> {
     // Route layer (#80 multi-tenant gate) may pass `preloadedAgent` to skip
     // the redundant `db.getAgent` call after it has already done one for
     // the ownership check. Keeps `service.pull` testable in isolation while
@@ -182,7 +182,13 @@ export class RegistryService {
       );
     }
 
-    return { buffer, version: resolvedVersion, verified: resolvedVerified };
+    // The checksum leaves with the bytes. It is the very value compared just
+    // above, and a caller that hands the bundle to a sandbox needs it: the
+    // sandbox fetches the object again for itself, so the check above covers
+    // this process's copy and no other. `null` means nothing is on record for
+    // this version (a legacy bundle) — the caller keeps serving it, as the
+    // warning branch above already says.
+    return { buffer, version: resolvedVersion, verified: resolvedVerified, sha256: resolvedSha256 };
   }
 
   async list(

@@ -31,6 +31,8 @@ The `agent.yaml` file is Skrun's extension to the Agent Skills standard. It decl
 
 **Custom endpoints**: set `base_url` to use any OpenAI-compatible API. Works with self-hosted models, Chinese providers, and inference platforms.
 
+> **Use the final URL — one that does not redirect.** If your `base_url` answers with a redirect to another origin (`http://` → `https://`, another port, another host), the `Authorization` header is dropped on the redirected request, as the fetch standard requires, and the provider answers `401` even though your key is right. Check with `curl -sI <base_url>/chat/completions`: a `301`/`302`/`307` there means you should write the target URL in `base_url` instead.
+
 ```yaml
 # Self-hosted (Ollama, vLLM, LocalAI)
 # Needs SKRUN_ALLOW_LOCAL_MODEL_HOSTS=true on the server — see below.

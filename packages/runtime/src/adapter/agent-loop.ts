@@ -195,6 +195,7 @@ export async function* runAgentLoop(opts: AgentLoopOptions): AsyncGenerator<RunE
       config.parallel_tools,
       agentContext,
       request.creatorKeys,
+      { maxCost: config.environment.max_cost },
     );
   } finally {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -264,9 +265,17 @@ export async function* runAgentLoop(opts: AgentLoopOptions): AsyncGenerator<RunE
 
   // LLM08: enforce max_cost at each cost-accumulation point (here, after the
   // main call; and after the repair retry below) — NOT post-loop — so an
-  // over-budget run aborts before more work. SSE/webhook carry the terminus as
-  // a run_error event (an HTTP 402 is only reachable on the sync path, which
-  // the FlyioAdapter does not implement).
+  // over-budget run aborts before more work. The ceiling is also handed to the
+  // router, which reads it after every tool-loop iteration and returns early:
+  // the intention this comment has always stated now holds for the iterations
+  // too, not just for the calls that bracket them.
+  //
+  // This remains the ONLY place the run stops for cost. The router reports its
+  // early stop by return value and never throws, so the terminus below — the
+  // same code, the same event shape — is reached whether the loop ran out of
+  // iterations or ran out of budget. SSE/webhook carry it as a run_error event
+  // (an HTTP 402 is only reachable on the sync path, which the FlyioAdapter
+  // does not implement).
   if (checkCost(aggCost, config.environment.max_cost).exceeded) {
     logger.warn(
       {
@@ -347,6 +356,11 @@ Re-emit the output as a single JSON object matching this schema. Output only the
           undefined,
           agentContext,
           request.creatorKeys,
+          // Passed for consistency with the main call, not to close a gap: this
+          // retry hands the router no tools and no dispatch handler, so its loop
+          // returns on the first iteration and the check below already covers
+          // its single provider call.
+          { maxCost: config.environment.max_cost },
         );
       } finally {
         clearInterval(retryHeartbeat);

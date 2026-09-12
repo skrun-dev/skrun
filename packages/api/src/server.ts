@@ -17,8 +17,8 @@
  *
  * Required env (the api-server refuses to boot if any missing):
  *   DATABASE_URL          Standard `postgres://user:pass@host:port/db`
- *                         connection string. In cloud, use Supabase's
- *                         pooler URL on port 6543 (transaction mode).
+ *                         connection string. On Supabase use the SESSION
+ *                         pooler on port 5432, not transaction mode.
  *   S3_BUCKET             R2 (or MinIO) bucket holding bundles + outputs
  *   S3_ACCESS_KEY_ID      R2 / MinIO credentials
  *   S3_SECRET_ACCESS_KEY  R2 / MinIO credentials
@@ -42,6 +42,7 @@
 
 import { join } from "node:path";
 import { serve } from "@hono/node-server";
+import { startSessionSweep } from "./auth/session.js";
 import { backfillBundleHashes } from "./db/backfill-bundle-hashes.js";
 import { runMigrations } from "./db/migrations-runner.js";
 import { PostgresDb } from "./db/postgres.js";
@@ -58,7 +59,8 @@ if (!dbUrl) {
   fail(
     "DATABASE_URL is required in api-server mode. " +
       "Use a standard `postgres://user:pass@host:port/db` connection string " +
-      "(e.g. Supabase pooler URL on port 6543). " +
+      "(on Supabase: the SESSION pooler on port 5432 — transaction mode on 6543 " +
+      "breaks the advisory lock the migrations runner takes at boot). " +
       "For self-host single-tenant without Postgres, run `pnpm dev:registry` from the source tree.",
   );
 }
@@ -106,6 +108,13 @@ const storage = new R2Storage({
 await backfillBundleHashes(db, storage);
 
 const app = createApp(storage, db);
+
+// Expired sessions are swept on a fixed interval, on every instance. Started
+// here rather than inside createApp, which every test also calls: a timer per
+// built app would be a timer nothing asked for, and nothing would make it a
+// no-op by default.
+startSessionSweep(db);
+
 const port = Number(process.env.PORT ?? 4000);
 
 serve({ fetch: app.fetch, port }, () => {

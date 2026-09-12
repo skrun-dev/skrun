@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { apiReference } from "@scalar/hono-api-reference";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { secureHeaders } from "hono/secure-headers";
 import { isDevAuthEnabled } from "./auth/dev-auth.js";
@@ -166,14 +167,74 @@ export function createApp(
   // Rate limiting — per-IP on mutating endpoints. The backend (in-memory for
   // self-host single-instance, Upstash Redis for multi-instance cloud)
   // is env-selected once here and shared across both routes.
+  //
+  // The mount patterns are the EXPLICIT route shapes, deliberately:
+  // - A mid-path `*` in Hono matches exactly ONE segment, so `/api/agents/*/push`
+  //   never matches the real two-segment route `/:namespace/:name/push` — the
+  //   limiter would exist without ever running (measured on hono 4.13.5).
+  // - A trailing star (`/api/agents/*`) would run, but it is anchored to nothing:
+  //   it would drag read-only GETs and any future route under /api/agents/ into
+  //   thresholds sized for writes.
+  // These patterns also match `POST /api/agents/scan/:name/push` (`:namespace`
+  // binds to the literal "scan") — intended: it is a push, same threshold. The
+  // middleware is matched by path pattern, independently of router order
+  // (measured: it runs with the scan router mounted before OR after the
+  // registry router). What router order does decide is WHICH handler answers a
+  // scan push — the registry router would swallow it if mounted first.
+  // Each mount names its counter: on the shared store the name is the key
+  // namespace; without it, every mount with the same window shares one counter.
   const makeRateLimiter = createRateLimiterFactory();
-  app.use("/api/agents/*/push", rateLimiter({ windowMs: 60_000, max: 10, make: makeRateLimiter }));
-  app.use("/api/agents/*/run", rateLimiter({ windowMs: 60_000, max: 60, make: makeRateLimiter }));
+  app.use(
+    "/api/agents/:namespace/:name/push",
+    rateLimiter({ name: "push", windowMs: 60_000, max: 10, make: makeRateLimiter }),
+  );
+  app.use(
+    "/api/agents/:namespace/:name/run",
+    rateLimiter({ name: "run", windowMs: 60_000, max: 60, make: makeRateLimiter }),
+  );
+  // Push body cap — server-side, applied BEFORE the handler reads the body into
+  // memory (registry.ts buffers with arrayBuffer()). This bounds the COMPRESSED
+  // request body; the 50 MB decompression cap in utils/bundle.ts bounds the
+  // EXPANDED archive and runs after buffering — they coexist, neither replaces
+  // the other. Mounted after the rate limiter: the counter is the cheaper check.
+  // Same pattern as the limiter, so the local-directory push path shares it.
+  const pushMaxBodyMbRaw = process.env.SKRUN_PUSH_MAX_BODY_MB ?? "50";
+  const pushMaxBodyMb = Number(pushMaxBodyMbRaw);
+  if (!Number.isFinite(pushMaxBodyMb) || pushMaxBodyMb <= 0) {
+    throw new Error(
+      `SKRUN_PUSH_MAX_BODY_MB must be a positive number (got "${pushMaxBodyMbRaw}"). ` +
+        "Unset it to use the 50 MB default.",
+    );
+  }
+  app.use(
+    "/api/agents/:namespace/:name/push",
+    bodyLimit({
+      maxSize: pushMaxBodyMb * 1024 * 1024,
+      onError: (c) =>
+        c.json(
+          {
+            error: {
+              code: "BUNDLE_TOO_LARGE",
+              message:
+                `Bundle exceeds the ${pushMaxBodyMb} MB request-body cap (compressed). ` +
+                "Set SKRUN_PUSH_MAX_BODY_MB to adjust.",
+            },
+          },
+          413,
+        ),
+    }),
+  );
   // Device-login endpoints — per-IP. The poll is hit frequently by design
   // (interval ~5s) so a generous cap; the consent page + code mint get a tighter
   // one. Covers all of /auth/device/* plus the /device consent page.
-  app.use("/auth/device/*", rateLimiter({ windowMs: 60_000, max: 120, make: makeRateLimiter }));
-  app.use("/device", rateLimiter({ windowMs: 60_000, max: 30, make: makeRateLimiter }));
+  app.use(
+    "/auth/device/*",
+    rateLimiter({ name: "device-auth", windowMs: 60_000, max: 120, make: makeRateLimiter }),
+  );
+  app.use(
+    "/device",
+    rateLimiter({ name: "device-consent", windowMs: 60_000, max: 30, make: makeRateLimiter }),
+  );
 
   app.get("/health", (c) => c.json({ status: "ok" }));
 

@@ -64,8 +64,8 @@ describe("rate limiter backends (SEC-018)", () => {
 
   it("VT-2: two RedisRateLimiter over one shared store enforce jointly (multi-instance)", async () => {
     const redis = new FakeRedis() as unknown as Redis;
-    const a = new RedisRateLimiter(60_000, 3, redis);
-    const b = new RedisRateLimiter(60_000, 3, redis);
+    const a = new RedisRateLimiter(60_000, 3, redis, "x");
+    const b = new RedisRateLimiter(60_000, 3, redis, "x");
     expect((await a.check("ip")).success).toBe(true); // joint count 1
     expect((await b.check("ip")).success).toBe(true); // 2
     expect((await a.check("ip")).success).toBe(true); // 3
@@ -73,8 +73,30 @@ describe("rate limiter backends (SEC-018)", () => {
     expect((await b.check("ip")).success).toBe(false);
   });
 
+  it("VT-2b: two mounts over one shared store keep separate counters — the limit is not part of the key", async () => {
+    // Same client, same window, two mounts with DIFFERENT limits (the real
+    // push/run pair). Upstash keys on `<prefix>:<identifier>:<window>`; the
+    // limit is a script argument. Without a per-mount prefix, ten runs would
+    // spend the push allowance and the first push would be refused with
+    // `remaining: 0` announced to a client that pushed zero times.
+    const store = new FakeRedis();
+    const redis = store as unknown as Redis;
+    const run = new RedisRateLimiter(60_000, 60, redis, "run");
+    const push = new RedisRateLimiter(60_000, 10, redis, "push");
+    for (let i = 0; i < 10; i++) expect((await run.check("ip")).success).toBe(true);
+    const firstPush = await push.check("ip");
+    expect(firstPush.success).toBe(true);
+    expect(firstPush.remaining).toBe(9);
+    expect(firstPush.limit).toBe(10);
+    // One namespace per mount in the store — not one shared counter.
+    const namespaces = new Set(
+      [...store.store.keys()].map((k) => k.split(":").slice(0, 3).join(":")),
+    );
+    expect(namespaces).toEqual(new Set(["skrun:rl:run", "skrun:rl:push"]));
+  });
+
   it("VT-6: RedisRateLimiter falls back to in-memory on a Redis error (no throw, still limits)", async () => {
-    const limiter = new RedisRateLimiter(60_000, 2, new ThrowingRedis() as unknown as Redis);
+    const limiter = new RedisRateLimiter(60_000, 2, new ThrowingRedis() as unknown as Redis, "x");
     expect((await limiter.check("ip")).success).toBe(true); // fallback memory: 1
     expect((await limiter.check("ip")).success).toBe(true); // 2
     expect((await limiter.check("ip")).success).toBe(false); // 3 > 2 — fallback limits, never threw
@@ -85,9 +107,9 @@ describe("rate limiter backends (SEC-018)", () => {
       UPSTASH_REDIS_REST_URL: "https://example.upstash.io",
       UPSTASH_REDIS_REST_TOKEN: "tok",
     } as NodeJS.ProcessEnv);
-    expect(redisFactory({ windowMs: 1000, max: 1 })).toBeInstanceOf(RedisRateLimiter);
+    expect(redisFactory({ name: "x", windowMs: 1000, max: 1 })).toBeInstanceOf(RedisRateLimiter);
 
     const memFactory = createRateLimiterFactory({} as NodeJS.ProcessEnv);
-    expect(memFactory({ windowMs: 1000, max: 1 })).toBeInstanceOf(MemoryRateLimiter);
+    expect(memFactory({ name: "x", windowMs: 1000, max: 1 })).toBeInstanceOf(MemoryRateLimiter);
   });
 });

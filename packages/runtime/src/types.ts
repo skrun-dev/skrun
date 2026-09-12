@@ -64,6 +64,22 @@ export interface RunRequest {
    */
   bundleKey?: string;
   /**
+   * Hex sha256 of the bundle archive named by `bundleKey`, as recorded when
+   * the version was published. Handed to the sandbox so it can check the copy
+   * it downloads for itself before extracting it.
+   *
+   * Why it has to travel: `agentConfig` and `skillContent` above come from the
+   * copy this process fetched and verified, but **the scripts that actually
+   * run come from a second read**, performed inside the sandbox against a
+   * presigned URL. Without this value that second read is never checked
+   * against anything.
+   *
+   * Undefined for a bundle published before checksums were recorded. The
+   * sandbox then extracts as before and says so in its log — an old bundle
+   * stays runnable.
+   */
+  bundleSha256?: string;
+  /**
    * Optional `AbortSignal` to interrupt a running execution. The cloud
    * `FlyioAdapter` listens for abort to guarantee the spawned machine is
    * destroyed even when the caller closes the SSE stream / the harness
@@ -262,7 +278,11 @@ export interface SpawnPhases {
    * so start-up work is attributed rather than inferred by subtraction.
    */
   module_load_ms?: number;
-  /** In-VM /init: agent bundle download. */
+  /**
+   * In-VM /init: agent bundle download, plus the checksum comparison when the
+   * run carries one. Both belong to the same phase — the time to obtain a
+   * bundle worth extracting — which keeps init_extract_ms the tar alone.
+   */
   init_bundle_ms?: number;
   /** In-VM /init: bundle extract. */
   init_extract_ms?: number;

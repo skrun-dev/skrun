@@ -148,24 +148,34 @@ WORKDIR /mnt/agent
 # leaking its lockfile into the public OSS repo via `pnpm-lock.yaml`. Its sole
 # dependency on `@skrun-dev/runtime` is injected at build time as RUNTIME_TGZ.
 #
-# `pnpm pack` REWRITES `@skrun-dev/schema: workspace:*` to a concrete published
-# version, so `npm install <runtime tgz>` resolves @skrun-dev/schema from the
-# public npm registry — NO schema tarball is needed for the runner. The runner's
-# deps (Hono + MCP SDK) are pure-JS → no build-essential needed for this install.
+# `pnpm pack` REWRITES `@skrun-dev/schema: workspace:*` to a CONCRETE version, so
+# the runtime tarball asks for `@skrun-dev/schema@<this release>`. That version is
+# only on the public registry AFTER npm publish — so resolving it from there made
+# the image build depend on the publish having already happened. It held for every
+# `-dev` build (the packages stayed at the last published version) and broke the
+# first time a release bumped them: v1.0.0 died on
+# `notarget No matching version found for @skrun-dev/schema@1.0.0`.
+#
+# The schema tarball is installed alongside the runtime one instead, exactly as the
+# api-server target below already does. Same package, same size, no registry lookup.
+# The runner's deps (Hono + MCP SDK) are pure-JS → no build-essential needed here.
 #
 # Build uses `npm` (not pnpm): the runner has no workspace links. `npm run build`
 # runs tsc (devDeps must be present — hence NODE_ENV is set per-target LATER, not
 # here, so this install keeps devDependencies).
+ARG SCHEMA_TGZ=skrun-dev-schema.tgz
 ARG RUNTIME_TGZ=skrun-dev-runtime.tgz
 
 COPY runner/ /opt/skrun-runner/
+COPY ${SCHEMA_TGZ} /opt/skrun-runner/${SCHEMA_TGZ}
 COPY ${RUNTIME_TGZ} /opt/skrun-runner/${RUNTIME_TGZ}
 
 RUN cd /opt/skrun-runner \
     && npm install --no-audit --no-fund \
-    && npm install --no-audit --no-fund /opt/skrun-runner/${RUNTIME_TGZ} \
+    && npm install --no-audit --no-fund \
+        /opt/skrun-runner/${SCHEMA_TGZ} /opt/skrun-runner/${RUNTIME_TGZ} \
     && npm run build \
-    && rm -f /opt/skrun-runner/${RUNTIME_TGZ}
+    && rm -f /opt/skrun-runner/*.tgz
 # NOTE — `npm prune --omit=dev` removed 2026-05-25 (Unit 2/3 H1 fix). Suspected of
 # stripping a transitive prod dep of @skrun-dev/runtime whose absence crashed the
 # runner at module-load. The ~50MB saving wasn't worth the foot-gun.

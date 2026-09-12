@@ -7,7 +7,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
     openapi: "3.1.0",
     info: {
       title: "Skrun API",
-      version: "1.0.0",
+      version: "1.1.0",
       description:
         "Deploy any Agent Skill as an API. Multi-model, stateful, multimodal, open source.",
       license: { name: "MIT", url: "https://github.com/skrun-dev/skrun/blob/main/LICENSE" },
@@ -640,6 +640,20 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
             },
             "409": {
               description: "Version already exists",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "413": {
+              description:
+                "BUNDLE_TOO_LARGE — the request body (the compressed bundle) exceeds the server cap set by SKRUN_PUSH_MAX_BODY_MB (default 50 MB). Refused before the body is buffered. A different ceiling from BUNDLE_MAX_DECOMPRESSED_MB, which bounds what the archive expands to.",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "429": {
+              description:
+                "RATE_LIMITED — more than 10 pushes from the same client address in the 60-second window. X-RateLimit-Limit / -Remaining / -Reset are on every response.",
               content: {
                 "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
@@ -1426,6 +1440,13 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                         "When scope_kind=agents: the namespace/name agents (which you must own) the key may act on.",
                       example: ["dev/my-agent"],
                     },
+                    expires_at: {
+                      type: "string",
+                      format: "date-time",
+                      description:
+                        "Optional expiry, ISO-8601, must be in the future. No default: omit it and the key never expires (a key minted here is typically wired into someone else's integration, so a lifetime is never imposed). A malformed or past value is refused with 400 INVALID_REQUEST. Keys minted by the CLI login flow are the other case — they carry the operator's SKRUN_API_KEY_TTL_DAYS lifetime, default 90 days.",
+                      example: "2027-01-31T23:59:59.000Z",
+                    },
                   },
                   required: ["name"],
                 },
@@ -1447,11 +1468,24 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                       scopes: { type: "array", items: { type: "string" } },
                       scope_kind: { type: "string", enum: ["account", "agents"] },
                       agents: { type: "array", items: { type: "string" } },
+                      expires_at: {
+                        type: "string",
+                        format: "date-time",
+                        nullable: true,
+                        description: "null when the key does not expire.",
+                      },
                       created_at: { type: "string", format: "date-time" },
                     },
                     required: ["id", "key", "name", "key_prefix", "scopes", "scope_kind"],
                   },
                 },
+              },
+            },
+            "400": {
+              description:
+                "INVALID_REQUEST — malformed JSON, missing name, an unknown scope, or an expires_at that is not a parseable ISO-8601 instant in the future.",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
             },
             "401": {
@@ -1490,6 +1524,13 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
                         scopes: { type: "array", items: { type: "string" } },
                         scope_kind: { type: "string", enum: ["account", "agents"] },
                         last_used_at: { type: "string", format: "date-time", nullable: true },
+                        expires_at: {
+                          type: "string",
+                          format: "date-time",
+                          nullable: true,
+                          description:
+                            "When the key stops authenticating; null when it does not expire. A key past this instant is refused with 401 UNAUTHORIZED, like a revoked one.",
+                        },
                         created_at: { type: "string", format: "date-time" },
                       },
                     },

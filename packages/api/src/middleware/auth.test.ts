@@ -1,15 +1,40 @@
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateApiKey } from "../auth/api-key.js";
-import { clearSessions, createSession } from "../auth/session.js";
+import { createSession } from "../auth/session.js";
 import { MemoryDb } from "../db/memory.js";
 import { createAuthMiddleware, getUser } from "./auth.js";
+
+// RT-3 asserts the structured log that goes with the 500. pino writes to fd 1
+// directly (bypassing process.stdout.write), so the only way to observe the line
+// is to replace createLogger. vi.mock is hoisted above the import of ./auth.js,
+// and so runs before that module builds its logger at import time; vi.hoisted
+// declares the spy in lock-step. Only createLogger is replaced — the rest of
+// @skrun-dev/runtime is left intact.
+const { logErrorSpy } = vi.hoisted(() => ({ logErrorSpy: vi.fn() }));
+vi.mock("@skrun-dev/runtime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@skrun-dev/runtime")>();
+  return {
+    ...actual,
+    createLogger: () => ({
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: logErrorSpy,
+      debug: vi.fn(),
+      trace: vi.fn(),
+      fatal: vi.fn(),
+      level: "info",
+      child: () => ({ info: vi.fn(), error: logErrorSpy }),
+    }),
+  };
+});
 
 describe("Auth Middleware (createAuthMiddleware)", () => {
   let db: MemoryDb;
   let app: Hono;
 
   beforeEach(() => {
+    logErrorSpy.mockClear();
     db = new MemoryDb();
     app = new Hono();
     const authMw = createAuthMiddleware(db);
@@ -18,7 +43,6 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
       const user = getUser(c);
       return c.json(user);
     });
-    clearSessions();
   });
 
   afterEach(() => {
@@ -27,7 +51,7 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
 
   it("authenticates via session cookie", async () => {
     const user = await db.createUser({ github_id: "gh-1", username: "alice" });
-    const sessionId = createSession(user.id);
+    const sessionId = await createSession(db, user.id);
 
     const res = await app.request("/protected/me", {
       headers: { Cookie: `skrun_session=${sessionId}` },
@@ -73,7 +97,7 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
   // SEC-005 part B (4.3): role loading + dev-token=admin
   it("loads user.role from DB on session-cookie auth (default user)", async () => {
     const user = await db.createUser({ github_id: "gh-role-1", username: "carol" });
-    const sessionId = createSession(user.id);
+    const sessionId = await createSession(db, user.id);
 
     const res = await app.request("/protected/me", {
       headers: { Cookie: `skrun_session=${sessionId}` },
@@ -107,7 +131,7 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
     const stored = internal.get(user.id);
     if (!stored) throw new Error("seed user missing");
     stored.role = "admin";
-    const sessionId = createSession(user.id);
+    const sessionId = await createSession(db, user.id);
 
     const res = await app.request("/protected/me", {
       headers: { Cookie: `skrun_session=${sessionId}` },
@@ -240,9 +264,75 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
     expect(spy).toHaveBeenCalledWith(apiKey.id);
   });
 
+  // RT-2 (#124): an unknown session cookie is a non-event, not a rejection.
+  // The cookie is checked first, and when it matches nothing the request must
+  // carry on to the other credentials. Moving the store from memory to the
+  // database changed where "matches nothing" is decided — this asserts the
+  // answer did not change with it.
+  it("RT-2 (#124): an unknown session cookie falls through to a valid API key", async () => {
+    const user = await db.createUser({ github_id: "gh-rt2", username: "fallthrough" });
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: user.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "fallthrough key",
+    });
+
+    const res = await app.request("/protected/me", {
+      headers: {
+        Cookie: "skrun_session=00000000-0000-4000-8000-000000000000",
+        Authorization: `Bearer ${key}`,
+      },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.username).toBe("fallthrough");
+    // The key is what got them in — a session would have carried no key at all.
+    expect(body.key).not.toBeNull();
+  });
+
+  // RT-3 (#124): the twin of the case above, and the reason the two sit side by
+  // side — it was their confusion that made this decision necessary. Same
+  // request, same valid key; the difference is that here the store itself
+  // fails. An unknown cookie falls through. A broken store must not: were it
+  // treated as "no session", the valid key would answer 200 and a sessions
+  // table that had never been created would sign everyone out with nothing in
+  // the logs to say why.
+  it("RT-3 (#124): a failing session lookup answers 500 and logs it", async () => {
+    const user = await db.createUser({ github_id: "gh-rt3", username: "loud" });
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: user.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "rt3 key",
+    });
+    vi.spyOn(db, "getSession").mockRejectedValue(new Error("connection terminated unexpectedly"));
+
+    const res = await app.request("/protected/me", {
+      headers: {
+        Cookie: "skrun_session=00000000-0000-4000-8000-000000000000",
+        Authorization: `Bearer ${key}`,
+      },
+    });
+
+    // Neither a 401 nor a silent fall-through — the 200 the key alone would
+    // have produced is exactly what must not happen here.
+    expect(res.status).toBe(500);
+    expect(res.status).not.toBe(401);
+    expect(await res.json()).toEqual({
+      error: { code: "INTERNAL_ERROR", message: "Session lookup failed" },
+    });
+
+    // And it is loud: one error line, naming the event.
+    expect(logErrorSpy).toHaveBeenCalledTimes(1);
+    expect(logErrorSpy.mock.calls[0][0]).toMatchObject({ event: "session_lookup_failed" });
+  });
+
   it("VT-6: session + dev-token carry no key (master credential)", async () => {
     const user = await db.createUser({ github_id: "gh-sc-3", username: "scsess" });
-    const sessionId = createSession(user.id);
+    const sessionId = await createSession(db, user.id);
     const sres = await app.request("/protected/me", {
       headers: { Cookie: `skrun_session=${sessionId}` },
     });
@@ -273,7 +363,6 @@ describe("Auth Middleware — dev-auth gate OFF (SKRUN_DEV_AUTH unset)", () => {
     app = new Hono();
     app.use("/protected/*", createAuthMiddleware(db));
     app.get("/protected/me", (c) => c.json(getUser(c)));
-    clearSessions();
   });
 
   afterEach(() => {
