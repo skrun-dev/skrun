@@ -10,6 +10,11 @@ import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { loadLiveEnv } from "./env-file.js";
+
+// Before anything reads process.env: the suite's `.env` may live in the main
+// checkout when this runs from a worktree.
+loadLiveEnv();
 
 export const ROOT = resolve(import.meta.dirname, "..", "..", "..");
 

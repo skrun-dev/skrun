@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { serve } from "@hono/node-server";
 import { isOAuthConfigured } from "./auth/github-oauth.js";
 import { startSessionSweep } from "./auth/session.js";
+import { startFileCacheSweep } from "./cache/file-cache-sweep.js";
 import type { DbAdapter } from "./db/adapter.js";
 import { createApp } from "./index.js";
 import type { StorageAdapter } from "./storage/adapter.js";
@@ -47,6 +48,9 @@ const app = createApp(storage, db);
 // One call covers both branches above — they converge on the same adapter. As
 // in server.ts, this belongs to running a server, not to building an app.
 startSessionSweep(db);
+// Same reasoning for the file caches: expired run files are deleted on a
+// schedule, and what a previous process left behind is removed once, at boot.
+startFileCacheSweep();
 
 const port = Number(process.env.PORT ?? 4000);
 

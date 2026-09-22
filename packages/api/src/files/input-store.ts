@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { SkrunError } from "@skrun-dev/schema";
 
 const DEFAULT_MAX_SIZE_MB = 25;
-const INPUT_DIR_NAME = "skrun-inputs";
+export const INPUT_DIR_NAME = "skrun-inputs";
 
 function readEnvInt(name: string, fallback: number): number {
   const raw = process.env[name];

@@ -7,7 +7,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
     openapi: "3.1.0",
     info: {
       title: "Skrun API",
-      version: "1.1.0",
+      version: "1.2.0",
       description:
         "Deploy any Agent Skill as an API. Multi-model, stateful, multimodal, open source.",
       license: { name: "MIT", url: "https://github.com/skrun-dev/skrun/blob/main/LICENSE" },
@@ -1318,15 +1318,48 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
           operationId: "authGithubCallback",
           security: [],
           description:
-            "Handles the GitHub OAuth callback. Exchanges code for token, creates/updates user, sets session cookie, redirects to dashboard.",
+            "Handles the GitHub OAuth callback: exchanges the code for a token, creates or " +
+            "updates the user, and sets the session cookie. Where the browser goes next is " +
+            "decided by this server's configuration and never by a request parameter — the " +
+            "dashboard by default, or the root of the configured site origin when a session " +
+            "cookie domain is set. A login that does not complete comes back to that same " +
+            "destination carrying an opaque `login` marker: `failed` for any problem with the " +
+            "handshake or the token exchange (the causes are deliberately indistinguishable), " +
+            "`denied` when the account is not allowed on this instance. Neither marker names " +
+            "the account or the cause. With no destination configured, those cases keep the " +
+            "JSON and HTML responses below instead. `code` and `state` are present on the " +
+            "nominal return only: a user who cancels at GitHub comes back without them, and " +
+            "that request takes the failure exit.",
           parameters: [
-            { name: "code", in: "query", required: true, schema: { type: "string" } },
-            { name: "state", in: "query", required: true, schema: { type: "string" } },
+            { name: "code", in: "query", required: false, schema: { type: "string" } },
+            { name: "state", in: "query", required: false, schema: { type: "string" } },
           ],
           responses: {
-            "302": { description: "Redirect to dashboard with session cookie set" },
+            "302": {
+              description:
+                "Redirect to the configured destination, or to the dashboard when none is " +
+                "configured. A successful login adds no query parameter; a failed or refused " +
+                "one adds `login=failed` or `login=denied`.",
+            },
             "400": {
-              description: "Invalid OAuth state",
+              description:
+                "Invalid or missing OAuth state — only when no return destination is configured",
+              content: {
+                "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
+              },
+            },
+            "403": {
+              description:
+                "The GitHub account is not allowed to sign in on this instance. A generic HTML " +
+                "page that never echoes the account — only when no return destination is " +
+                "configured.",
+              content: { "text/html": { schema: { type: "string" } } },
+            },
+            "500": {
+              description:
+                "OAUTH_FAILED — the token exchange or profile fetch failed. The message is " +
+                "generic; the detail goes to the server's logs. Only when no return destination " +
+                "is configured.",
               content: {
                 "application/json": { schema: { $ref: "#/components/schemas/ErrorResponse" } },
               },
@@ -1354,9 +1387,24 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
           summary: "Logout",
           operationId: "authLogout",
           security: [],
-          description: "Clears the session cookie and redirects to /.",
+          description:
+            "Signs the browser out. Destroys the session server-side and clears the session " +
+            "cookie on every scope it may hold — both the host-only cookie and, where a cookie " +
+            "domain is configured, the domain-scoped one, under each name still in play. " +
+            "Answers with a JSON body; it does not redirect.",
           responses: {
-            "302": { description: "Redirect to /" },
+            "200": {
+              description: "Signed out",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: { ok: { type: "boolean" } },
+                    required: ["ok"],
+                  },
+                },
+              },
+            },
           },
         },
       },

@@ -25,7 +25,7 @@
     "build:web": "pnpm --filter @skrun-dev/web build",
     "dev:registry": "pnpm --filter @skrun-dev/api dev",
     "test:e2e": "vitest run --config vitest.config.e2e.ts",
-    "test:e2e:live": "node --use-system-ca --env-file=.env --import tsx tests/e2e.ts",
+    "test:e2e:live": "node --use-system-ca --import tsx tests/e2e.ts",
     "bench:cold-start": "node --use-system-ca --env-file=.env --import tsx scripts/run-cold-start-bench.ts",
     "cloud:e2e:smoke": "node --use-system-ca --env-file=.env --import tsx scripts/run-flyio-cloud-e2e.ts",
     "fly:smoke": "node --use-system-ca --env-file=.env --import tsx scripts/run-fly-smoke.ts"

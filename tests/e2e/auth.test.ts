@@ -4,7 +4,7 @@
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import { generateApiKey } from "../../packages/api/src/auth/api-key.js";
-import { createSession } from "../../packages/api/src/auth/session.js";
+import { createSession, sessionCookieName } from "../../packages/api/src/auth/session.js";
 import { createTestApp, DEV_TOKEN, pushAgent, verifyVersion } from "./setup.js";
 
 describe("E2E: Auth", () => {
@@ -145,7 +145,7 @@ describe("E2E: Auth", () => {
   it("session auth: list and revoke API keys", async () => {
     const user = await db.createUser({ github_id: "gh-mgmt", username: "keymgr" });
     const sessionId = await createSession(db, user.id);
-    const cookieHeader = `skrun_session=${sessionId}`;
+    const cookieHeader = `${sessionCookieName()}=${sessionId}`;
 
     // Create 2 keys
     await app.request("/api/keys", {
@@ -170,7 +170,10 @@ describe("E2E: Auth", () => {
     // Revoke first
     const deleteRes = await app.request(`/api/keys/${keys[0].id}`, {
       method: "DELETE",
-      headers: { Cookie: cookieHeader },
+      // A cookie-borne DELETE with no Content-Type is the shape the CSRF guard
+      // refuses; a browser sends Sec-Fetch-Site with it, and the dashboard's own
+      // delete depends on that header alone. The request reproduces the browser.
+      headers: { Cookie: cookieHeader, "Sec-Fetch-Site": "same-origin" },
     });
     expect(deleteRes.status).toBe(204);
 

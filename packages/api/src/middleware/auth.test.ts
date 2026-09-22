@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateApiKey } from "../auth/api-key.js";
-import { createSession } from "../auth/session.js";
+import { createSession, sessionCookieName } from "../auth/session.js";
 import { MemoryDb } from "../db/memory.js";
 import { createAuthMiddleware, getUser } from "./auth.js";
 
@@ -11,20 +11,23 @@ import { createAuthMiddleware, getUser } from "./auth.js";
 // and so runs before that module builds its logger at import time; vi.hoisted
 // declares the spy in lock-step. Only createLogger is replaced — the rest of
 // @skrun-dev/runtime is left intact.
-const { logErrorSpy } = vi.hoisted(() => ({ logErrorSpy: vi.fn() }));
+const { logErrorSpy, logWarnSpy } = vi.hoisted(() => ({
+  logErrorSpy: vi.fn(),
+  logWarnSpy: vi.fn(),
+}));
 vi.mock("@skrun-dev/runtime", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@skrun-dev/runtime")>();
   return {
     ...actual,
     createLogger: () => ({
       info: vi.fn(),
-      warn: vi.fn(),
+      warn: logWarnSpy,
       error: logErrorSpy,
       debug: vi.fn(),
       trace: vi.fn(),
       fatal: vi.fn(),
       level: "info",
-      child: () => ({ info: vi.fn(), error: logErrorSpy }),
+      child: () => ({ info: vi.fn(), warn: logWarnSpy, error: logErrorSpy }),
     }),
   };
 });
@@ -54,7 +57,7 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
     const sessionId = await createSession(db, user.id);
 
     const res = await app.request("/protected/me", {
-      headers: { Cookie: `skrun_session=${sessionId}` },
+      headers: { Cookie: `${sessionCookieName()}=${sessionId}` },
     });
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -100,7 +103,7 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
     const sessionId = await createSession(db, user.id);
 
     const res = await app.request("/protected/me", {
-      headers: { Cookie: `skrun_session=${sessionId}` },
+      headers: { Cookie: `${sessionCookieName()}=${sessionId}` },
     });
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -134,7 +137,7 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
     const sessionId = await createSession(db, user.id);
 
     const res = await app.request("/protected/me", {
-      headers: { Cookie: `skrun_session=${sessionId}` },
+      headers: { Cookie: `${sessionCookieName()}=${sessionId}` },
     });
     const body = await res.json();
     expect(body.role).toBe("admin");
@@ -205,7 +208,7 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
 
   it("returns 401 for invalid session cookie", async () => {
     const res = await app.request("/protected/me", {
-      headers: { Cookie: "skrun_session=nonexistent-session-id" },
+      headers: { Cookie: `${sessionCookieName()}=nonexistent-session-id` },
     });
     // Falls through to check Bearer token, which is missing → 401
     expect(res.status).toBe(401);
@@ -281,7 +284,7 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
 
     const res = await app.request("/protected/me", {
       headers: {
-        Cookie: "skrun_session=00000000-0000-4000-8000-000000000000",
+        Cookie: `${sessionCookieName()}=00000000-0000-4000-8000-000000000000`,
         Authorization: `Bearer ${key}`,
       },
     });
@@ -312,7 +315,7 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
 
     const res = await app.request("/protected/me", {
       headers: {
-        Cookie: "skrun_session=00000000-0000-4000-8000-000000000000",
+        Cookie: `${sessionCookieName()}=00000000-0000-4000-8000-000000000000`,
         Authorization: `Bearer ${key}`,
       },
     });
@@ -334,7 +337,7 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
     const user = await db.createUser({ github_id: "gh-sc-3", username: "scsess" });
     const sessionId = await createSession(db, user.id);
     const sres = await app.request("/protected/me", {
-      headers: { Cookie: `skrun_session=${sessionId}` },
+      headers: { Cookie: `${sessionCookieName()}=${sessionId}` },
     });
     expect((await sres.json()).key).toBeNull();
 
@@ -386,5 +389,114 @@ describe("Auth Middleware — dev-auth gate OFF (SKRUN_DEV_AUTH unset)", () => {
       headers: { Authorization: "Bearer arbitrary-xyz" },
     });
     expect(res.status).toBe(401);
+  });
+});
+
+// The duplicated session cookie — the one applicative control against cookie
+// tossing from a sibling host of a shared domain.
+//
+// This file builds its OWN small app rather than calling createApp, so the CSRF
+// guard is not mounted here. That is exactly what these cases want: what is under
+// test is the middleware, not the chain. Anyone tempted later to "fix" this file
+// by mounting the guard would be changing what it measures — and the requests
+// below are GETs anyway, which the guard lets through untouched.
+describe("Auth Middleware — a duplicated session cookie (#123)", () => {
+  const KEYS = ["NODE_ENV", "SKRUN_SESSION_COOKIE_DOMAIN"] as const;
+  const snapshot: Record<string, string | undefined> = {};
+
+  let db: MemoryDb;
+  let app: Hono;
+
+  beforeEach(() => {
+    for (const key of KEYS) snapshot[key] = process.env[key];
+    logWarnSpy.mockClear();
+    db = new MemoryDb();
+    app = new Hono();
+    app.use("/protected/*", createAuthMiddleware(db));
+    app.get("/protected/me", (c) => c.json(getUser(c)));
+  });
+
+  afterEach(() => {
+    for (const key of KEYS) {
+      if (snapshot[key] === undefined) delete process.env[key];
+      else process.env[key] = snapshot[key];
+    }
+  });
+
+  // The prefix is on, so the two cookies cannot be the transition pair: one of
+  // them was planted. The valid one is sent FIRST, which is the attacker's
+  // disadvantage — and the case still has to refuse, because the ordering is the
+  // attacker's to choose and refusing only the bad ordering would be refusing
+  // only the attacks that failed anyway.
+  it("VT-34: a duplicated prefixed cookie authenticates nobody, is logged, and is erased on both scopes", async () => {
+    process.env.NODE_ENV = "production";
+    process.env.SKRUN_SESSION_COOKIE_DOMAIN = "example.com";
+
+    const victim = await db.createUser({ github_id: "gh-victim", username: "victim" });
+    const valid = await createSession(db, victim.id);
+    const name = sessionCookieName();
+    expect(name).toBe("__Secure-skrun_session");
+    const duplicated = `${name}=${valid}; ${name}=planted-by-a-sibling-host`;
+
+    const res = await app.request("/protected/me", { headers: { Cookie: duplicated } });
+    expect(res.status).toBe(401);
+
+    expect(logWarnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "session_cookie_duplicate" }),
+      expect.any(String),
+    );
+    // The name only — one of the two values is a live credential.
+    expect(JSON.stringify(logWarnSpy.mock.calls)).not.toContain(valid);
+
+    // Both scopes of the prefixed name are erased. The shared erasure factory
+    // also covers the pre-domain name, so there are four headers and not two:
+    // that is the factory doing its job, not this case overreaching.
+    const cookies = res.headers.getSetCookie();
+    expect(cookies).toHaveLength(4);
+    expect(cookies).toContain(`${name}=; Max-Age=0; Path=/; Secure`);
+    expect(cookies).toContain(`${name}=; Max-Age=0; Domain=example.com; Path=/; Secure`);
+
+    // The other half, and the one that matters most: with an API key also
+    // presented, the request SUCCEEDS through the key — the detection refuses
+    // cookie auth, it does not refuse the caller. And the erasure headers written
+    // before next() survive the route handler's own response, which is measured
+    // here rather than assumed.
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    await db.createApiKey({
+      user_id: victim.id,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "fallback",
+      scopes: ["read", "write", "admin"],
+    });
+
+    const withKey = await app.request("/protected/me", {
+      headers: { Cookie: duplicated, Authorization: `Bearer ${key}` },
+    });
+    expect(withKey.status).toBe(200);
+    expect((await withKey.json()).username).toBe("victim");
+    expect(withKey.headers.getSetCookie()).toHaveLength(4);
+  });
+
+  // The transition, and it must NOT be touched. With no domain configured the two
+  // cookies legitimately share a name — the old host-only one and the new
+  // domain-scoped one — so refusing here would sign out every user of a
+  // deployment on the day it turns the domain on. Today's behaviour is kept: the
+  // parser's first occurrence wins, nothing is logged, nothing is erased.
+  it("VT-35: an unprefixed duplicate is the transition pair and is left alone", async () => {
+    delete process.env.SKRUN_SESSION_COOKIE_DOMAIN;
+
+    const user = await db.createUser({ github_id: "gh-transition", username: "transition" });
+    const valid = await createSession(db, user.id);
+    const name = sessionCookieName();
+    expect(name).toBe("skrun_session");
+
+    const res = await app.request("/protected/me", {
+      headers: { Cookie: `${name}=${valid}; ${name}=some-other-value` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).username).toBe("transition");
+    expect(logWarnSpy).not.toHaveBeenCalled();
+    expect(res.headers.getSetCookie()).toHaveLength(0);
   });
 });

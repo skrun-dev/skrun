@@ -10,8 +10,10 @@ import {
   destroySession,
   getSessionCookieOptions,
   hashSessionId,
-  SESSION_COOKIE_NAME,
   SESSION_SWEEP_INTERVAL_MS,
+  sessionCookieDomain,
+  sessionCookieErasures,
+  sessionCookieName,
   startSessionSweep,
   validateSession,
 } from "./session.js";
@@ -65,37 +67,56 @@ describe("Session Management", () => {
     await destroySession(db, "nonexistent-id");
   });
 
-  it("SESSION_COOKIE_NAME is skrun_session", () => {
-    expect(SESSION_COOKIE_NAME).toBe("skrun_session");
+  // The constant of #124 became a function here, so the guard follows it rather
+  // than disappearing with it: with nothing configured — the self-host default —
+  // the name is still the literal that every doc, every browser session and
+  // every existing test knows.
+  it("the session cookie name is skrun_session when nothing is configured", () => {
+    expect(sessionCookieName()).toBe("skrun_session");
   });
 
   // RT-4 (#124): the cookie options themselves did not change — only the value
-  // maxAge derives from. The last two assertions are the boundary with the
-  // cross-subdomain handoff that comes next: no domain attribute, and a plain
-  // cookie name with no __Host-/__Secure- prefix. A boundary no test guards is
-  // not a boundary, and both of those would be silent to change.
-  it("RT-4 (#124): the cookie options are unchanged, carry no domain and no name prefix", () => {
-    const opts = getSessionCookieOptions();
-    expect(opts.httpOnly).toBe(true);
-    expect(opts.sameSite).toBe("Lax");
-    expect(opts.path).toBe("/");
-    expect(opts.maxAge).toBe(604800);
-
-    // secure is conditional, and stays conditional.
+  // maxAge derives from. The last assertions were the boundary with this
+  // cross-subdomain handoff: no domain attribute, and a plain cookie name with no
+  // __Host-/__Secure- prefix. That boundary is now crossed, so the guard is
+  // rewritten rather than removed — a frontier whose sentry is deleted along with
+  // it is a frontier everyone still believes in. It now guards BOTH sides: the
+  // unconfigured deployment keeps every value #124 pinned, and the configured one
+  // is the only one that gains a domain and a prefix.
+  it("RT-4 (#124): unconfigured, the cookie options and name are unchanged — configured, they are not", () => {
     const previousEnv = process.env.NODE_ENV;
+    const previousDomain = process.env.SKRUN_SESSION_COOKIE_DOMAIN;
     try {
+      delete process.env.SKRUN_SESSION_COOKIE_DOMAIN;
+
+      const opts = getSessionCookieOptions();
+      expect(opts.httpOnly).toBe(true);
+      expect(opts.sameSite).toBe("Lax");
+      expect(opts.path).toBe("/");
+      expect(opts.maxAge).toBe(604800);
+
+      // secure is conditional, and stays conditional.
       process.env.NODE_ENV = "development";
       expect(getSessionCookieOptions().secure).toBe(false);
       process.env.NODE_ENV = "production";
       expect(getSessionCookieOptions().secure).toBe(true);
+
+      // Still true in production with nothing configured — the self-host promise.
+      expect(getSessionCookieOptions()).not.toHaveProperty("domain");
+      expect(sessionCookieName()).toBe("skrun_session");
+      expect(sessionCookieName().startsWith("__")).toBe(false);
+
+      // And the crossing itself, so the guard says where the frontier moved to:
+      // the domain is what puts a prefix on the name and a Domain on the cookie.
+      process.env.SKRUN_SESSION_COOKIE_DOMAIN = "example.com";
+      expect(getSessionCookieOptions()).toHaveProperty("domain", "example.com");
+      expect(sessionCookieName()).toBe("__Secure-skrun_session");
     } finally {
       if (previousEnv === undefined) delete process.env.NODE_ENV;
       else process.env.NODE_ENV = previousEnv;
+      if (previousDomain === undefined) delete process.env.SKRUN_SESSION_COOKIE_DOMAIN;
+      else process.env.SKRUN_SESSION_COOKIE_DOMAIN = previousDomain;
     }
-
-    expect(opts).not.toHaveProperty("domain");
-    expect(SESSION_COOKIE_NAME).toBe("skrun_session");
-    expect(SESSION_COOKIE_NAME.startsWith("__")).toBe(false);
   });
 
   // VT-10 (#124): what reaches the table is the hash, never the cookie value.
@@ -153,6 +174,121 @@ describe("Session Management", () => {
       if (previous === undefined) delete process.env.SESSION_TTL_S;
       else process.env.SESSION_TTL_S = previous;
     }
+  });
+});
+
+// The name and the Domain attribute are decided by two independent settings —
+// the environment and the configured domain — so the interesting thing is the
+// GRID, not any one cell. Three of its four cells must leave the cookie exactly
+// as it was before this element, and only the fourth may change anything.
+//
+// Note on the fixtures: only SKRUN_SESSION_COOKIE_DOMAIN is read by the two
+// functions under test. SKRUN_PUBLIC_URL is set alongside it because the two
+// always travel together in a real deployment (the startup interlock refuses one
+// without the other), and a fixture that could not exist in production is a
+// fixture that proves less than it looks.
+describe("the session cookie name and domain across the configuration grid (#123)", () => {
+  const KEYS = ["NODE_ENV", "SKRUN_PUBLIC_URL", "SKRUN_SESSION_COOKIE_DOMAIN"] as const;
+  const snapshot: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const key of KEYS) snapshot[key] = process.env[key];
+    delete process.env.SKRUN_PUBLIC_URL;
+    delete process.env.SKRUN_SESSION_COOKIE_DOMAIN;
+  });
+
+  afterEach(() => {
+    for (const key of KEYS) {
+      if (snapshot[key] === undefined) delete process.env[key];
+      else process.env[key] = snapshot[key];
+    }
+  });
+
+  // VT-1 — nothing configured. The whole "self-host is untouched" promise lives
+  // in this case, and it has to hold in PRODUCTION too: the published image runs
+  // with NODE_ENV=production, so a prefix that followed the Secure flag alone
+  // would rename the cookie of every self-hoster who configured nothing and log
+  // them all out once.
+  it("VT-1: with no domain configured the cookie is unchanged, in development AND in production", () => {
+    for (const env of ["development", "production"]) {
+      process.env.NODE_ENV = env;
+      expect(sessionCookieName(), env).toBe("skrun_session");
+      expect(getSessionCookieOptions(), env).not.toHaveProperty("domain");
+    }
+  });
+
+  // VT-2 — the one cell that changes: a domain in production.
+  it("VT-2: a configured domain in production carries the Domain attribute and the __Secure- prefix", () => {
+    process.env.NODE_ENV = "production";
+    process.env.SKRUN_PUBLIC_URL = "https://api.example.com";
+    process.env.SKRUN_SESSION_COOKIE_DOMAIN = "Example.COM";
+
+    const opts = getSessionCookieOptions();
+    expect(opts.domain).toBe("example.com");
+    expect(opts.secure).toBe(true);
+    expect(sessionCookieName()).toBe("__Secure-skrun_session");
+  });
+
+  // VT-3 — a domain OUTSIDE production. The prefix must stay off: a browser
+  // rejects a __Secure- cookie that arrives without the Secure flag, and over
+  // plain http the flag cannot be set. A prefix that followed the domain alone
+  // would break the sign-in of every contributor running the stack locally —
+  // and break it silently, since nothing throws.
+  it("VT-3: a configured domain outside production keeps the Domain but not the prefix", () => {
+    process.env.NODE_ENV = "development";
+    process.env.SKRUN_PUBLIC_URL = "http://api.example.com";
+    process.env.SKRUN_SESSION_COOKIE_DOMAIN = "example.com";
+
+    const opts = getSessionCookieOptions();
+    expect(opts.domain).toBe("example.com");
+    expect(opts.secure).toBe(false);
+    expect(sessionCookieName()).toBe("skrun_session");
+  });
+
+  // VT-4 — the leading dot. Older guides teach ".example.com"; the cookie spec
+  // ignores the dot (RFC 6265 §5.2.3), so it is dropped rather than refused, and
+  // the cookie still covers the subdomains.
+  it("VT-4: a leading dot is normalised away", () => {
+    process.env.NODE_ENV = "production";
+    process.env.SKRUN_PUBLIC_URL = "https://api.example.com";
+    process.env.SKRUN_SESSION_COOKIE_DOMAIN = ".example.com";
+
+    expect(getSessionCookieOptions().domain).toBe("example.com");
+    expect(sessionCookieDomain()).toBe("example.com");
+  });
+
+  // The erasure factory is what a sign-out loops over, and its SIZE is the whole
+  // point: it is bounded by what is configured, and every prefixed entry carries
+  // the Secure flag that makes the write legal. Getting this wrong throws at
+  // serialisation time, in production only — see the sign-out cases in
+  // routes/auth.test.ts, which exercise it through real setCookie calls.
+  it("the erasure list is one, two or four entries, and every one of them is legal", () => {
+    process.env.NODE_ENV = "production";
+    expect(sessionCookieErasures()).toEqual([
+      { name: "skrun_session", options: { maxAge: 0, path: "/", secure: true } },
+    ]);
+
+    process.env.SKRUN_PUBLIC_URL = "https://api.example.com";
+    process.env.SKRUN_SESSION_COOKIE_DOMAIN = "example.com";
+
+    process.env.NODE_ENV = "development";
+    const unprefixed = sessionCookieErasures();
+    expect(unprefixed).toHaveLength(2);
+    expect(unprefixed.every((e) => e.name === "skrun_session")).toBe(true);
+    expect(unprefixed.map((e) => e.options.domain)).toEqual([undefined, "example.com"]);
+
+    process.env.NODE_ENV = "production";
+    const prefixed = sessionCookieErasures();
+    expect(prefixed).toHaveLength(4);
+    expect(prefixed.map((e) => `${e.name}|${e.options.domain ?? "-"}`)).toEqual([
+      "skrun_session|-",
+      "skrun_session|example.com",
+      "__Secure-skrun_session|-",
+      "__Secure-skrun_session|example.com",
+    ]);
+    // The half that makes every one of these calls legal rather than lucky.
+    expect(prefixed.every((e) => e.options.secure === true)).toBe(true);
+    expect(prefixed.every((e) => e.options.maxAge === 0 && e.options.path === "/")).toBe(true);
   });
 });
 

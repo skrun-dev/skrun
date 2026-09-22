@@ -122,4 +122,20 @@ describe("TTLCache", () => {
     vi.advanceTimersByTime(5_100);
     expect(cache.get("b")).toBeUndefined();
   });
+
+  it("sweep removes expired entries without a read, calls onEvict, and reports the count", () => {
+    const onEvict = vi.fn();
+    const cache = new TTLCache<string, number>({ ttlMs: 100, maxEntries: 10, onEvict });
+    cache.set("old", 1);
+    vi.advanceTimersByTime(60);
+    cache.set("young", 2);
+    vi.advanceTimersByTime(60); // "old" is 120 ms old, "young" 60 ms
+
+    expect(cache.sweep()).toBe(1);
+    expect(onEvict).toHaveBeenCalledTimes(1);
+    expect(onEvict).toHaveBeenCalledWith("old", 1);
+    expect(cache.size).toBe(1);
+    expect(cache.get("young")).toBe(2);
+    expect(cache.sweep()).toBe(0);
+  });
 });

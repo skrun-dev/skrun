@@ -43,6 +43,7 @@
 import { join } from "node:path";
 import { serve } from "@hono/node-server";
 import { startSessionSweep } from "./auth/session.js";
+import { startFileCacheSweep } from "./cache/file-cache-sweep.js";
 import { backfillBundleHashes } from "./db/backfill-bundle-hashes.js";
 import { runMigrations } from "./db/migrations-runner.js";
 import { PostgresDb } from "./db/postgres.js";
@@ -114,6 +115,9 @@ const app = createApp(storage, db);
 // built app would be a timer nothing asked for, and nothing would make it a
 // no-op by default.
 startSessionSweep(db);
+// Same reasoning for the file caches: expired run files are deleted on a
+// schedule, and what a previous process left behind is removed once, at boot.
+startFileCacheSweep();
 
 const port = Number(process.env.PORT ?? 4000);
 

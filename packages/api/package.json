@@ -1,6 +1,6 @@
 {
   "name": "@skrun-dev/api",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "exports": {
     ".": {
@@ -23,14 +23,14 @@
     "@aws-sdk/client-s3": "^3.1053.0",
     "@aws-sdk/s3-request-presigner": "^3.1053.0",
     "@hono/node-server": "^2.1.1",
-    "@scalar/hono-api-reference": "^0.10.13",
     "@skrun-dev/runtime": "workspace:*",
     "@skrun-dev/schema": "workspace:*",
     "@upstash/ratelimit": "^2.0.8",
     "@upstash/redis": "^1.38.0",
     "better-sqlite3": "^12.9.0",
     "hono": "^4.13.4",
-    "pg": "^8.20.0"
+    "pg": "^8.20.0",
+    "tldts": "^7.4.12"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

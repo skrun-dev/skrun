@@ -4,7 +4,12 @@ import type { DbAdapter } from "../db/adapter.js";
 
 const logger = createLogger("session");
 
-export const SESSION_COOKIE_NAME = "skrun_session";
+/**
+ * The cookie name before any prefix. Not exported: a caller that reads this
+ * instead of `sessionCookieName()` would be right in exactly the configurations
+ * where the prefix is off, and silently wrong in the one where it is on.
+ */
+const BASE_SESSION_COOKIE_NAME = "skrun_session";
 
 const DEFAULT_SESSION_TTL_S = 604800; // 7 days
 
@@ -115,7 +120,59 @@ export function startSessionSweep(db: DbAdapter): NodeJS.Timeout {
 }
 
 /**
+ * Whether the cookie carries the `Secure` flag. One reader, so the name and the
+ * options can never disagree about it — and the name depends on it, because a
+ * browser rejects a `__Secure-` cookie that arrives without the flag.
+ */
+export function isSecureCookie(): boolean {
+  return process.env.NODE_ENV === "production";
+}
+
+/**
+ * The `Domain` attribute of the session cookie, normalised — or `undefined`
+ * when no domain is configured, which is the default and leaves the cookie
+ * host-only exactly as before.
+ *
+ * This is THE normalisation of `SKRUN_SESSION_COOKIE_DOMAIN`, and the startup
+ * interlock in `index.ts` validates the value it returns. That is the point: the
+ * value that is *validated* at boot and the value that is *written* on the
+ * cookie are the same string, so a `trim` on one side and not the other cannot
+ * let the interlock approve a domain the cookie will never use.
+ *
+ * A leading dot is what older guides teach and what the cookie spec ignores
+ * (RFC 6265 §5.2.3), so it is dropped rather than refused.
+ */
+export function sessionCookieDomain(): string | undefined {
+  const raw = process.env.SKRUN_SESSION_COOKIE_DOMAIN?.trim();
+  if (!raw) return undefined;
+  return raw.toLowerCase().replace(/^\.+/, "") || undefined;
+}
+
+/**
+ * The session cookie's name.
+ *
+ * `__Secure-` is added only when BOTH the `Secure` flag applies AND a domain is
+ * configured, and both halves are load-bearing:
+ *
+ *   - without `Secure`, a browser rejects the cookie outright, so a bare prefix
+ *     would break local http development for every contributor;
+ *   - without a configured domain, an unconfigured self-hoster running in
+ *     production would have their cookie renamed and their sessions invalidated
+ *     once, for a prefix that buys them nothing — the attack it stops (a network
+ *     attacker setting the cookie over http) needs a domain-scoped cookie to
+ *     begin with.
+ */
+export function sessionCookieName(): string {
+  return isSecureCookie() && sessionCookieDomain() !== undefined
+    ? `__Secure-${BASE_SESSION_COOKIE_NAME}`
+    : BASE_SESSION_COOKIE_NAME;
+}
+
+/**
  * Cookie options for the session cookie.
+ *
+ * `domain` is present only when one is configured — never `domain: undefined`,
+ * which serialises badly and which the boundary case in session.test.ts checks.
  */
 export function getSessionCookieOptions(): {
   httpOnly: boolean;
@@ -123,12 +180,63 @@ export function getSessionCookieOptions(): {
   sameSite: "Lax";
   path: string;
   maxAge: number;
+  domain?: string;
 } {
+  const domain = sessionCookieDomain();
   return {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
+    secure: isSecureCookie(),
     sameSite: "Lax",
     path: "/",
     maxAge: Math.floor(getTtlMs() / 1000),
+    ...(domain === undefined ? {} : { domain }),
   };
+}
+
+/**
+ * Every cookie a sign-out has to erase: each name still in play, on each scope
+ * still in play. One, two or four entries — bounded by what is configured.
+ *
+ * Two names, because a deployment that turns the domain on inherits browsers
+ * still carrying the host-only cookie under the OLD name: erasing only the new
+ * one leaves that cookie authenticating for the rest of its seven days. Two
+ * scopes, for the same reason on the `Domain` axis.
+ *
+ * `secure` is the same value the cookie was set with, so a prefixed name always
+ * carries the flag it requires — which is what makes every call below legal by
+ * construction rather than by everyone remembering. This is the one factory:
+ * a hand-written third variant is precisely the failure this shape exists to
+ * prevent, because `setCookie` THROWS on a `__Secure-` name without `secure`
+ * (hono `utils/cookie.js` `_serialize`) and a sign-out would answer 500 in the
+ * nominal case of a domain-configured deployment.
+ */
+export function sessionCookieErasures(): Array<{
+  name: string;
+  options: { maxAge: 0; path: "/"; secure: boolean; domain?: string };
+}> {
+  const secure = isSecureCookie();
+  const domain = sessionCookieDomain();
+  // A Set, so the unconfigured case yields one entry and not the same name twice.
+  const names = new Set([BASE_SESSION_COOKIE_NAME, sessionCookieName()]);
+  const scopes: Array<string | undefined> =
+    domain === undefined ? [undefined] : [undefined, domain];
+
+  const erasures: Array<{
+    name: string;
+    options: { maxAge: 0; path: "/"; secure: boolean; domain?: string };
+  }> = [];
+  for (const name of names) {
+    for (const scope of scopes) {
+      erasures.push({
+        name,
+        options: {
+          maxAge: 0,
+          path: "/",
+          secure,
+          ...(scope === undefined ? {} : { domain: scope }),
+        },
+      });
+    }
+  }
+  return erasures;
 }

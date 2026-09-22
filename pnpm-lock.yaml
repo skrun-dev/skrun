@@ -50,9 +50,6 @@ importers:
       '@hono/node-server':
         specifier: ^2.1.1
         version: 2.1.1(hono@4.13.5)
-      '@scalar/hono-api-reference':
-        specifier: ^0.10.13
-        version: 0.10.13(hono@4.13.5)
       '@skrun-dev/runtime':
         specifier: workspace:*
         version: link:../runtime
@@ -74,6 +71,9 @@ importers:
       pg:
         specifier: ^8.20.0
         version: 8.21.0
+      tldts:
+        specifier: ^7.4.12
+        version: 7.4.12
     devDependencies:
       '@types/better-sqlite3':
         specifier: ^7.6.13
@@ -918,24 +918,6 @@ packages:
 
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
-
-  '@scalar/client-side-rendering@0.1.6':
-    resolution: {integrity: sha512-ooc5RKyi83EvBuxB2N8H00ZE2CF4oKynuUToSCaoqxkjv+oJ6B3+OYsb0HVixznsyWhUDdtQZm4/xOb0kxBaaA==}
-    engines: {node: '>=22'}
-
-  '@scalar/helpers@0.5.5':
-    resolution: {integrity: sha512-TqbErkqGijJJW6Ad8lpswHFTmlJaYFt9oolaWF1/Nn9171xdkK9ZDAk3pCaOCWs8WpwvcbUSxIVD8JxdBg0MFg==}
-    engines: {node: '>=22'}
-
-  '@scalar/hono-api-reference@0.10.13':
-    resolution: {integrity: sha512-xYSN6GVdzsgt5i3OTt4wDpIcD/KpKTwb6Wiy65NucGIFW0WidM6ilb9Lf8EG9xescut5djLtGOOxO4Ze0w8qgQ==}
-    engines: {node: '>=22'}
-    peerDependencies:
-      hono: ^4.12.5
-
-  '@scalar/types@0.9.5':
-    resolution: {integrity: sha512-joen5nuqgmGzgXK5XIqkGs0JmCZ16djaw+pgC24sfb+p3sSPVfKQTNTil/RuvHMNsmA/dFcQ6GI0Y3HhTlUQrg==}
-    engines: {node: '>=22'}
 
   '@smithy/core@3.24.4':
     resolution: {integrity: sha512-3UNRKEyQyAgVgM0LGlerCLm+ChZWZ1GPfde+jBEW6bm6bSBGU1p0EbblaUV3unbhwvidjLA5Zs3sOs7mnZwvAw==}
@@ -1961,11 +1943,6 @@ packages:
     engines: {node: ^10 || ^12 || ^13.7 || ^14 || >=15.0.1}
     hasBin: true
 
-  nanoid@5.1.16:
-    resolution: {integrity: sha512-kVrnsrJqMR8+oLJnGEmSWw9BivK5mt7H3FZatVRjrc5wGqFYuBxX1yG7+A7Gi5AefkX6t/oCkizcQgpu0cY1dQ==}
-    engines: {node: ^18 || >=20}
-    hasBin: true
-
   napi-build-utils@2.0.0:
     resolution: {integrity: sha512-GEbrYkbfF7MoNaoh2iGG84Mnf/WZfB0GdGEsM8wz7Expx/LlWf5U8t9nvJKXSp3qr5IsEbK04cBGhol/KwOsWA==}
 
@@ -2422,8 +2399,15 @@ packages:
   tldts-core@7.0.28:
     resolution: {integrity: sha512-7W5Efjhsc3chVdFhqtaU0KtK32J37Zcr9RKtID54nG+tIpcY79CQK/veYPODxtD/LJ4Lue66jvrQzIX2Z2/pUQ==}
 
+  tldts-core@7.4.12:
+    resolution: {integrity: sha512-nYNzS2WRf4QJmjzFFgAxLOBjyBxAGRbCy9PVBPaglcYyYajh40VBn+v5Ngr96ZMc7oM0+aCJdtQnNejvdBnXMQ==}
+
   tldts@7.0.28:
     resolution: {integrity: sha512-+Zg3vWhRUv8B1maGSTFdev9mjoo8Etn2Ayfs4cnjlD3CsGkxXX4QyW3j2WJ0wdjYcYmy7Lx2RDsZMhgCWafKIw==}
+    hasBin: true
+
+  tldts@7.4.12:
+    resolution: {integrity: sha512-WylhSDKVeYnWXL3a+vKTaOxjnOeEGw938hImY8zoRWJjRRK/Jp1K+IihBzIONpUmW4e3WmXT6q5FW6vlESVZCA==}
     hasBin: true
 
   toidentifier@1.0.1:
@@ -3289,24 +3273,6 @@ snapshots:
   '@rolldown/pluginutils@1.0.0-rc.7': {}
 
   '@rolldown/pluginutils@1.0.1': {}
-
-  '@scalar/client-side-rendering@0.1.6':
-    dependencies:
-      '@scalar/types': 0.9.5
-
-  '@scalar/helpers@0.5.5': {}
-
-  '@scalar/hono-api-reference@0.10.13(hono@4.13.5)':
-    dependencies:
-      '@scalar/client-side-rendering': 0.1.6
-      hono: 4.13.5
-
-  '@scalar/types@0.9.5':
-    dependencies:
-      '@scalar/helpers': 0.5.5
-      nanoid: 5.1.16
-      type-fest: 5.5.0
-      zod: 4.4.1
 
   '@smithy/core@3.24.4':
     dependencies:
@@ -4288,8 +4254,6 @@ snapshots:
 
   nanoid@3.3.18: {}
 
-  nanoid@5.1.16: {}
-
   napi-build-utils@2.0.0: {}
 
   negotiator@1.0.0: {}
@@ -4767,9 +4731,15 @@ snapshots:
 
   tldts-core@7.0.28: {}
 
+  tldts-core@7.4.12: {}
+
   tldts@7.0.28:
     dependencies:
       tldts-core: 7.0.28
+
+  tldts@7.4.12:
+    dependencies:
+      tldts-core: 7.4.12
 
   toidentifier@1.0.1: {}
 

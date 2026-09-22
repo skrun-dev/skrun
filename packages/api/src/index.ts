@@ -1,15 +1,20 @@
 import { existsSync } from "node:fs";
+import { isIP } from "node:net";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { apiReference } from "@scalar/hono-api-reference";
+import { createLogger } from "@skrun-dev/runtime";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { secureHeaders } from "hono/secure-headers";
+import { getDomain } from "tldts";
 import { isDevAuthEnabled } from "./auth/dev-auth.js";
 import { isOAuthConfigured } from "./auth/github-oauth.js";
+import { sessionCookieDomain } from "./auth/session.js";
 import { resolveDashboardConfig, warnDashboardDirMissing } from "./dashboard.js";
 import type { DbAdapter } from "./db/adapter.js";
+import { renderDocsPage, SCALAR_BUNDLE_URL } from "./docs-page.js";
 import { createAuthMiddleware } from "./middleware/auth.js";
+import { createCsrfGuard } from "./middleware/csrf.js";
 import { rateLimiter } from "./middleware/rate-limit.js";
 import { getOpenAPISchema } from "./openapi.js";
 import { createRateLimiterFactory } from "./ratelimit/select.js";
@@ -30,7 +35,11 @@ import { RegistryService } from "./services/registry.js";
 import { getKeyProvider } from "./services/secrets/key-provider.js";
 import { readVerificationPolicy, type VerificationPolicy } from "./services/verification-policy.js";
 import type { StorageAdapter } from "./storage/adapter.js";
-import { externalBaseUrl } from "./utils/external-url.js";
+import { externalBaseUrl, parsePublicUrl } from "./utils/external-url.js";
+
+// "startup" and not "api": run.ts:48 already holds "api", and two modules logging
+// under one name make the filter useless for whoever is reading a boot log.
+const startupLogger = createLogger("startup");
 
 export function createApp(
   storage: StorageAdapter,
@@ -74,6 +83,100 @@ export function createApp(
   // unconfigured (creator-key attach is then refused, fail-closed).
   const keyProvider = getKeyProvider();
 
+  // Session-cookie handoff — the two operator settings, resolved and validated ONCE
+  // here, in the same fail-fast form as the four interlocks above.
+  //
+  // Why a boot interlock and not a request-time check: a cookie the browser refuses
+  // produces NO error. Nothing throws, nothing 500s — the user simply is not logged
+  // in, and on a mistyped shared domain the symptom is "I get signed out when I move
+  // between hosts", weeks later, with no trace. This block is the only thing that
+  // turns that silence into a message, so it must run on the path that cannot be
+  // skipped: createApp is both the server's startup and what every test builds.
+  //
+  // The five rules are ONE guard and ship together — shipping a subset would let
+  // through exactly the value the missing rule refuses. Their ORDER is chosen: it
+  // decides which message an operator reads first, and the most useful one is
+  // always the one naming the thing they can fix.
+  const publicUrlRaw = process.env.SKRUN_PUBLIC_URL?.trim();
+  // (1) Format. Throws by itself, naming the value and the expected shape.
+  const canonicalUrl = publicUrlRaw ? parsePublicUrl(publicUrlRaw) : undefined;
+  const canonicalOrigin = canonicalUrl?.origin;
+
+  // Read and normalised by session.ts — the module that actually puts the value on
+  // the cookie. Validating anything else here would mean validating a string the
+  // cookie never uses: two normalisations that differ by a trim would let this
+  // interlock approve a domain the browser then never sees. One normalisation, two
+  // readers. (A leading dot is dropped there, as the cookie spec ignores it.)
+  const cookieDomain = sessionCookieDomain();
+
+  if (cookieDomain) {
+    // (2) A domain with nothing to compare it against. The only other source for the
+    // canonical host would be the `Host` header — i.e. the caller — so we refuse
+    // rather than validate a domain against a value an attacker supplies.
+    if (!canonicalUrl) {
+      throw new Error(
+        `SKRUN_SESSION_COOKIE_DOMAIN is set to "${cookieDomain}" but SKRUN_PUBLIC_URL is not set. ` +
+          "The cookie domain is validated against the canonical public host, so that host must be " +
+          "configured — deriving it from the Host header would mean validating against the caller. " +
+          "Set SKRUN_PUBLIC_URL (e.g. https://api.example.com).",
+      );
+    }
+    // `new URL("https://[::1]").hostname` keeps the brackets; isIP() does not want them.
+    const canonicalHost = canonicalUrl.hostname.replace(/^\[/, "").replace(/\]$/, "");
+
+    // (3) A literal IP host. `Domain` has no meaning on an IP (RFC 6265 §5.1.3) and
+    // browsers disagree about what to do with it. Note the boundary: an IP host with
+    // NO domain configured boots fine and gets a host-only cookie — it is the domain
+    // that is refused here, never the URL.
+    if (isIP(canonicalHost) !== 0) {
+      throw new Error(
+        `SKRUN_SESSION_COOKIE_DOMAIN is set to "${cookieDomain}" but the canonical host ` +
+          `"${canonicalHost}" (from SKRUN_PUBLIC_URL) is a literal IP address. A cookie Domain ` +
+          "attribute has no meaning on an IP address. Use a hostname, or unset " +
+          "SKRUN_SESSION_COOKIE_DOMAIN to keep a host-only cookie.",
+      );
+    }
+    // (4a) At least one dot. Catches `localhost` and other single-label values, which
+    // a browser will not accept as a cookie domain.
+    if (!cookieDomain.includes(".")) {
+      throw new Error(
+        `SKRUN_SESSION_COOKIE_DOMAIN must contain at least one dot (got "${cookieDomain}"). ` +
+          "A single-label domain is not a valid cookie domain — use e.g. example.com.",
+      );
+    }
+    // (4b) A suffix at a LABEL boundary of the canonical host. A bare endsWith would
+    // accept "ample.com" for host "api.example.com", which is a different domain.
+    if (canonicalHost !== cookieDomain && !canonicalHost.endsWith(`.${cookieDomain}`)) {
+      throw new Error(
+        `SKRUN_SESSION_COOKIE_DOMAIN "${cookieDomain}" is not a suffix of the canonical host ` +
+          `"${canonicalHost}" (from SKRUN_PUBLIC_URL). A browser silently drops a cookie whose ` +
+          "Domain the sending host does not belong to. Expected the canonical host to be the " +
+          `domain itself or one of its subdomains (e.g. api.${cookieDomain}).`,
+      );
+    }
+    // (5) Not a public suffix. This is the rule no structural check reaches: "co.uk"
+    // IS a label-boundary suffix of "api.example.co.uk", and every browser refuses a
+    // cookie scoped to it. `allowPrivateDomains` is load-bearing and measured, not a
+    // default copied over: without it getDomain("fly.dev") returns "fly.dev", so a
+    // platform subdomain like *.fly.dev — which a browser treats exactly like a
+    // public suffix — would be accepted here and then silently dropped there.
+    if (getDomain(cookieDomain, { allowPrivateDomains: true }) === null) {
+      throw new Error(
+        `SKRUN_SESSION_COOKIE_DOMAIN "${cookieDomain}" is a public suffix — no registrable domain ` +
+          "sits under it. Browsers refuse a cookie scoped to a public suffix, so the session " +
+          "would silently never be sent. Use the registrable domain you own (e.g. example.co.uk, " +
+          "not co.uk).",
+      );
+    }
+
+    // Boot accepted, and the retained domain is named. Without this line a session
+    // broken by a domain the browser quietly rejects leaves no trace at all.
+    startupLogger.info(
+      { event: "session_cookie_domain", domain: cookieDomain, canonical_origin: canonicalOrigin },
+      `Session cookie scoped to domain "${cookieDomain}" (canonical origin ${canonicalOrigin})`,
+    );
+  }
+
   // Dashboard (packages/web SPA) — served at /dashboard/* in api-server mode.
   // Gated by SKRUN_DASHBOARD (default on); root resolved from SKRUN_DASHBOARD_DIR
   // (absolute in the published image; cwd-relative "../web/dist" in dev).
@@ -89,9 +192,9 @@ export function createApp(
   //   - HSTS: 2 years + preload (Cloudflare / browser-preload-list grade)
   //   - Cross-Origin-Resource-Policy: cross-origin so the dashboard can load
   //     /api/files/:id/content from a different host (cloud deployment).
-  //   - CSP is scoped to `/dashboard/*` below (the only HTML surface that
-  //     accepts user interaction). API JSON responses + `/docs` (Scalar,
-  //     external CDN-loaded JS) are intentionally left without CSP.
+  //   - CSP is scoped to the two HTML surfaces below: `/dashboard/*` (the SPA)
+  //     and `/docs` (the API docs page, which loads one pinned third-party
+  //     bundle). API JSON responses are intentionally left without CSP.
   app.use(
     "*",
     secureHeaders({
@@ -127,6 +230,31 @@ export function createApp(
     );
   }
 
+  // CSP on `/docs` — the page itself is ours and carries no inline script; the
+  // renderer is Scalar's browser bundle, the ONE remote script this policy allows,
+  // by exact URL (version-pinned; `docs-page.ts` also pins its integrity hash).
+  // `connect-src 'self'` keeps every "Try it" request — and the API key typed into
+  // it — on this origin: Scalar's default relay through proxy.scalar.com cannot be
+  // reached even if its configuration were changed. A bare CDN URL put back in the
+  // page would be blocked here and the page would blank — visibly.
+  app.use(
+    "/docs",
+    secureHeaders({
+      contentSecurityPolicy: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", SCALAR_BUNDLE_URL],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:"],
+        fontSrc: ["'self'", "data:"],
+        connectSrc: ["'self'"],
+        frameAncestors: ["'none'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'"],
+        objectSrc: ["'none'"],
+      },
+    }),
+  );
+
   // CORS — production-safe by default.
   //   - production: CORS_ORIGIN is REQUIRED (fail loud at startup if unset),
   //     no '*' wildcard allowed (per the CORS spec, '*' cannot be paired with
@@ -142,6 +270,26 @@ export function createApp(
     );
   }
   app.use("*", cors({ origin: corsOriginEnv ?? "*" }));
+
+  // CSRF on every cookie-authenticated mutation — mounted right after CORS and
+  // before the rate limiters, so it runs well ahead of the routers and of
+  // authMiddleware. The guard depends on no authentication decision: it only
+  // looks at the shape of the request.
+  //
+  // Mounted on `*` and not on a route list. The selectivity already lives in the
+  // guard's own predicate (no session cookie, or an Authorization header, and it
+  // steps aside), so widening the path costs nothing in false positives — while a
+  // list like `/api/*` + `/auth/logout` is a thing a new route silently fails to
+  // join. This repo has already shipped a middleware mounted on a pattern that
+  // matched no real route; a mount that cannot go stale is worth more here than
+  // one that looks narrow.
+  //
+  // `canonicalOrigin` is the value the startup interlock above already computed —
+  // createApp does not read the environment a second time.
+  //
+  // The OPTIONS preflight never reaches this: cors() answers it and does not call
+  // on. (csrf() treats OPTIONS as safe anyway.) That is asserted, not assumed.
+  app.use("*", createCsrfGuard({ canonicalOrigin }));
 
   // Dev-auth fail-secure interlock. SKRUN_DEV_AUTH lets any `Bearer dev-token`
   // caller act as admin, so it must never run in an untrusted context without
@@ -243,12 +391,8 @@ export function createApp(
     const baseUrl = externalBaseUrl(c);
     return c.json(getOpenAPISchema(baseUrl));
   });
-  app.get(
-    "/docs",
-    apiReference({
-      url: "/openapi.json",
-      pageTitle: "Skrun API — Interactive Docs",
-    }),
+  app.get("/docs", (c) =>
+    c.html(renderDocsPage({ specUrl: "/openapi.json", pageTitle: "Skrun API — Interactive Docs" })),
   );
 
   // Legacy playground redirect → dashboard (only when the dashboard is served)

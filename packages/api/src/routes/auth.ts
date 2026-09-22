@@ -25,7 +25,10 @@ import {
   createSession,
   destroySession,
   getSessionCookieOptions,
-  SESSION_COOKIE_NAME,
+  isSecureCookie,
+  sessionCookieDomain,
+  sessionCookieErasures,
+  sessionCookieName,
 } from "../auth/session.js";
 import { isGithubUserAllowed } from "../auth/signup-allowlist.js";
 import type { DbAdapter } from "../db/adapter.js";
@@ -33,7 +36,7 @@ import { API_KEY_DEFAULT_SCOPES } from "../db/schema.js";
 import { getUser } from "../middleware/auth.js";
 import { resolveDefaultKeyExpiry } from "../services/key-expiry.js";
 import type { VerificationPolicy } from "../services/verification-policy.js";
-import { externalBaseUrl } from "../utils/external-url.js";
+import { externalBaseUrl, publicOrigin } from "../utils/external-url.js";
 import { requireMasterCredential } from "./_helpers.js";
 
 const logger = createLogger("auth");
@@ -60,8 +63,35 @@ code{background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:13px;font-fa
 
 /** Marks an in-progress CLI device-login authorization (set by POST /device). */
 const DEVICE_USER_CODE_COOKIE = "skrun_device_user_code";
-/** CSRF double-submit cookie for the /device consent form. */
-const DEVICE_CSRF_COOKIE = "skrun_device_csrf";
+
+/**
+ * Whether the consent cookies carry the `Secure` flag.
+ *
+ * Also decides the CSRF cookie's name, because `__Host-` is refused by a browser
+ * — and raised on by hono's serialiser — without it.
+ */
+function deviceCookiesAreSecure(): boolean {
+  // The same flag as the session cookie's — one reader of the environment.
+  return isSecureCookie();
+}
+
+/**
+ * CSRF double-submit cookie for the /device consent form.
+ *
+ * `__Host-` wherever the Secure flag applies. The condition is DIFFERENT from the
+ * session cookie's, which also needs a configured domain, and the difference is
+ * deliberate: this cookie depends on no domain — it is set and read by the same
+ * origin seconds apart — so the prefix protects it everywhere it can be set. What
+ * the prefix buys is the one thing no other attribute does: a sibling host of the
+ * domain CANNOT set a `__Host-` cookie, so it cannot plant the value that the
+ * double-submit check compares against.
+ *
+ * The rename costs at most one consent in flight at deploy time, since the cookie
+ * lives only for the length of one.
+ */
+function deviceCsrfCookieName(): string {
+  return deviceCookiesAreSecure() ? "__Host-skrun_device_csrf" : "skrun_device_csrf";
+}
 
 function escapeHtml(s: string): string {
   return s
@@ -139,6 +169,38 @@ function notAuthorizedPage(): string {
 <p>This GitHub account is not authorized to access this instance. If you think this is a mistake, contact the instance operator.</p></div></body></html>`;
 }
 
+/**
+ * Where a finished browser login lands — decided by this server's configuration,
+ * never read from the request.
+ *
+ * `undefined` means "keep today's behaviour": `/dashboard` on success, and the
+ * JSON / HTML error responses this route has always given. The switch is
+ * `SKRUN_SESSION_COOKIE_DOMAIN` and not the canonical URL, because sending the
+ * browser to another host is only meaningful once the session cookie can follow
+ * it — an operator who pins their public origin without sharing a cookie across
+ * hosts must see no change at all.
+ *
+ * The scheme is the canonical origin's, not a hard-coded `https`: a domain may
+ * be configured outside production, where the site is served over http, and a
+ * literal `https` would point the browser at an origin that does not answer. The
+ * canonical URL is mandatory as soon as a domain is set (the startup interlock
+ * refuses to boot otherwise), so it is always there to read. The port is
+ * deliberately not carried over: the site sits at the apex of the cookie's
+ * domain, and nothing says it listens on the API's port.
+ *
+ * `undefined` is also the answer if the canonical origin is somehow unreadable.
+ * That cannot happen after a successful boot, and if it did the fallback is the
+ * behaviour of a deployment that configured nothing — never a redirect built
+ * from a value we could not validate.
+ */
+function loginReturnOrigin(): string | undefined {
+  const domain = sessionCookieDomain();
+  if (domain === undefined) return undefined;
+  const canonical = publicOrigin();
+  if (canonical === undefined) return undefined;
+  return `${new URL(canonical).protocol}//${domain}`;
+}
+
 export function createAuthRoutes(
   db: DbAdapter,
   authMiddleware: MiddlewareHandler,
@@ -177,7 +239,7 @@ export function createAuthRoutes(
     // Store state in a short-lived cookie for CSRF protection
     setCookie(c, OAUTH_STATE_COOKIE, state, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: isSecureCookie(),
       sameSite: "Lax",
       path: "/",
       maxAge: 300, // 5 minutes
@@ -196,11 +258,24 @@ export function createAuthRoutes(
       );
     }
 
+    // Read once, and note what is NOT read: no `return_to`, no `next`, no
+    // `redirect_uri`, in the query string or anywhere else. There is no allowlist
+    // to get wrong because there is no caller-supplied destination to validate —
+    // the open-redirect family is absent by construction, not guarded against.
+    const returnOrigin = loginReturnOrigin();
+
     const code = c.req.query("code");
     const state = c.req.query("state");
     const storedState = getCookie(c, OAUTH_STATE_COOKIE);
 
+    // Three of the four technical failures live here — a missing state, a state
+    // that does not match, and a cancellation at GitHub (which comes back with
+    // no `code`). They leave by the same door as the fourth, with the same
+    // opaque marker: telling them apart would tell an attacker probing the
+    // callback which half of the handshake they got wrong, and would tell a
+    // support reader nothing they could act on.
     if (!code || !state || state !== storedState) {
+      if (returnOrigin) return c.redirect(`${returnOrigin}/?login=failed`);
       return c.json(
         { error: { code: "INVALID_OAUTH_CALLBACK", message: "Invalid or missing OAuth state" } },
         400,
@@ -234,6 +309,14 @@ export function createAuthRoutes(
           if (dc) await db.consumeDeviceCode(dc.device_code_hash);
           setCookie(c, DEVICE_USER_CODE_COOKIE, "", { maxAge: 0, path: "/" });
         }
+        // The device work above happens on BOTH sides of this exit: the branch is
+        // shared by the web and device journeys, and the CLI learns of the refusal
+        // by polling (`expired_token`) whichever way the browser leaves.
+        //
+        // `denied` says that the account which just authenticated — the visitor's
+        // own — is not admitted. It names neither the account nor the mechanism,
+        // which is the same promise the generic page below already makes.
+        if (returnOrigin) return c.redirect(`${returnOrigin}/?login=denied`);
         return c.html(notAuthorizedPage(), 403);
       }
 
@@ -269,18 +352,28 @@ export function createAuthRoutes(
       // Web flow: create session cookie
       const sessionId = await createSession(db, user.id);
       const cookieOpts = getSessionCookieOptions();
-      setCookie(c, SESSION_COOKIE_NAME, sessionId, cookieOpts);
+      setCookie(c, sessionCookieName(), sessionId, cookieOpts);
 
-      // Redirect to dashboard
-      return c.redirect("/dashboard");
+      // Back to the site — the configured origin's root, or the dashboard this
+      // server serves itself. A success carries no query parameter at all, so
+      // "did a login just happen" is not something a page can be told by a link
+      // someone else wrote.
+      return c.redirect(returnOrigin ? `${returnOrigin}/` : "/dashboard");
     } catch (err) {
-      return c.json(
+      // The detail belongs in the operator's log, and only there. It used to be
+      // handed to the browser, where it is worth nothing to the visitor and where
+      // an exception message is one refactor away from carrying an internal URL
+      // or a provider response body.
+      logger.error(
         {
-          error: {
-            code: "OAUTH_FAILED",
-            message: err instanceof Error ? err.message : "OAuth authentication failed",
-          },
+          event: "oauth_exchange_failed",
+          error: err instanceof Error ? err.message : String(err),
         },
+        "GitHub OAuth exchange failed",
+      );
+      if (returnOrigin) return c.redirect(`${returnOrigin}/?login=failed`);
+      return c.json(
+        { error: { code: "OAUTH_FAILED", message: "OAuth authentication failed" } },
         500,
       );
     }
@@ -344,9 +437,12 @@ export function createAuthRoutes(
   router.get("/device", (c) => {
     const userCode = c.req.query("user_code") ?? "";
     const csrf = issueCsrfToken();
-    setCookie(c, DEVICE_CSRF_COOKIE, csrf, {
+    // No `domain` and `path: "/"` — already true, and both are what `__Host-`
+    // requires; hono raises rather than serialise a name whose attributes
+    // contradict its prefix.
+    setCookie(c, deviceCsrfCookieName(), csrf, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: deviceCookiesAreSecure(),
       sameSite: "Lax",
       path: "/",
       maxAge: 600,
@@ -359,13 +455,21 @@ export function createAuthRoutes(
     const body = await c.req.parseBody();
     // CSRF: a double-submit token — the form field must equal the cookie value,
     // which a cross-origin page can neither read (httpOnly + same-origin policy)
-    // nor set (host-only cookie). This is the complete CSRF defense. We do NOT
-    // also check the `Origin` header: for a top-level form-POST navigation its
-    // presence/value is browser- and proxy-dependent (it can be the origin,
-    // `null`, or absent), so gating the login critical path on it would reject
-    // legitimate submissions — a fragility surfaced by the cloud browser test.
+    // nor set. The second half used to be justified by the cookie being host-only,
+    // and that justification is FALSE under a shared site: a sibling host of the
+    // domain can set a cookie on the parent, and the browser would send it here.
+    // What makes the double-submit safe now is the `__Host-` prefix, which a
+    // subdomain cannot write, wherever the Secure flag applies.
+    //
+    // We do NOT also check the `Origin` header: for a top-level form-POST
+    // navigation its presence/value is browser- and proxy-dependent (it can be the
+    // origin, `null`, or absent), so gating the login critical path on it would
+    // reject legitimate submissions — a fragility surfaced by the cloud browser
+    // test. Note that the guard removed then read `if (origin && …)`, so an ABSENT
+    // Origin never reached it: whatever the observed value was, it was not the
+    // absent case, and the recorded reason cannot be the whole story.
     const formCsrf = typeof body.csrf === "string" ? body.csrf : undefined;
-    if (!verifyCsrfToken(getCookie(c, DEVICE_CSRF_COOKIE), formCsrf)) {
+    if (!verifyCsrfToken(getCookie(c, deviceCsrfCookieName()), formCsrf)) {
       return c.json({ error: { code: "CSRF_FAILED", message: "Invalid CSRF token" } }, 403);
     }
 
@@ -382,12 +486,20 @@ export function createAuthRoutes(
     // round-trip via SameSite=Lax), then hand off to the existing OAuth leg.
     setCookie(c, DEVICE_USER_CODE_COOKIE, userCode, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: deviceCookiesAreSecure(),
       sameSite: "Lax",
       path: "/",
       maxAge: 600,
     });
-    setCookie(c, DEVICE_CSRF_COOKIE, "", { maxAge: 0, path: "/" });
+    // `secure` is not decoration here: under the prefix, hono raises before
+    // writing the header rather than emit a `__Host-` cookie without it, and this
+    // consent POST would answer 500 on every production instance — with nothing
+    // locally to show it, since the prefix is off there.
+    setCookie(c, deviceCsrfCookieName(), "", {
+      maxAge: 0,
+      path: "/",
+      secure: deviceCookiesAreSecure(),
+    });
     return c.redirect("/auth/github");
   });
 
@@ -589,11 +701,19 @@ export function createAuthRoutes(
 
   // POST /auth/logout — clear session
   router.post("/auth/logout", async (c) => {
-    const sessionId = getCookie(c, SESSION_COOKIE_NAME);
+    const sessionId = getCookie(c, sessionCookieName());
     if (sessionId) {
       await destroySession(db, sessionId);
     }
-    setCookie(c, SESSION_COOKIE_NAME, "", { maxAge: 0, path: "/" });
+    // Every name and every scope still in play, not just the one this instance
+    // would set today. A deployment that has just turned the domain on faces
+    // browsers still carrying the host-only cookie under the old name, and an
+    // erasure aimed only at the new one would leave that cookie signing the user
+    // in for the rest of its seven days. The factory bounds the list (one, two or
+    // four) and carries the `secure` flag a prefixed name requires.
+    for (const { name, options } of sessionCookieErasures()) {
+      setCookie(c, name, "", options);
+    }
     return c.json({ ok: true });
   });
 

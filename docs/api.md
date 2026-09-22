@@ -2,7 +2,7 @@
 
 Base URL: `http://localhost:4000` (local dev) or your deployed instance.
 
-> **Interactive docs**: visit `GET /docs` on your running server for a live API explorer (Scalar UI).
+> **Interactive docs**: visit `GET /docs` on your running server for a live API explorer (Scalar UI). The page loads Scalar's renderer from `cdn.jsdelivr.net` at a pinned version with an integrity hash, so the browser you open it from needs to reach that host; "Try it" requests go straight to your server, never through a third-party proxy.
 > **OpenAPI schema**: `GET /openapi.json` — import into Postman, Insomnia, or use for SDK generation.
 > **Prefer the SDK?** Use `@skrun-dev/sdk` for a typed client instead of raw HTTP calls: `npm install @skrun-dev/sdk`
 
@@ -79,6 +79,11 @@ curl -X POST https://your-domain.com/api/keys \
   -d '{"name": "CI deploy"}'
 # Response: {"id": "...", "key": "sk_live_a1b2c3d4...", ...}
 # ⚠️ The key is shown ONCE — save it now.
+# The Content-Type above is required, not decoration: a change-making request
+# that carries the session cookie, sends a form-style body and shows no browser
+# signal is refused with 403 — it is indistinguishable from a forged one.
+# The cookie's name is __Secure-skrun_session on a server that runs in
+# production AND configures a session cookie domain; skrun_session elsewhere.
 
 # Use the API key everywhere
 skrun login --token sk_live_a1b2c3d4...
@@ -135,7 +140,7 @@ An expired key is refused with `401 UNAUTHORIZED` ("API key has expired"), the s
 
 When a request arrives, the middleware checks authentication in this order:
 
-1. **Session cookie** (`skrun_session`) — from browser login
+1. **Session cookie** (`skrun_session`, or `__Secure-skrun_session` on a server that runs in production **and** configures a session cookie domain) — from browser login
 2. **API key** (`Bearer sk_live_...`) — from `POST /api/keys`
 3. **Dev-token** (`Bearer dev-token`) — only if OAuth is NOT configured
 4. Otherwise — `401 Unauthorized`
@@ -146,8 +151,8 @@ When a request arrives, the middleware checks authentication in this order:
 |----------|--------|------|-------------|
 | `/login` | GET | No | Login page (HTML) — shows "Sign in with GitHub" or dev-token instructions |
 | `/auth/github` | GET | No | Redirects to GitHub OAuth (returns 404 if OAuth not configured) |
-| `/auth/github/callback` | GET | No | Handles OAuth callback — creates user, sets session cookie |
-| `/auth/logout` | POST | No | Clears session cookie, redirects to `/` |
+| `/auth/github/callback` | GET | No | Handles OAuth callback — creates user, sets session cookie, then redirects where the server's own configuration says: `/dashboard` by default, or the root of the configured site origin. A login that fails or is refused comes back to that destination with an opaque `login=failed` / `login=denied` marker; with no destination configured it answers `400` / `403` / `500` as before |
+| `/auth/logout` | POST | No | Clears the session cookie on every scope and name it may hold, and answers `200 {"ok": true}` — it does not redirect |
 | `/api/me` | GET | Yes | Returns current user info (`id`, `username`, `namespace`, `email`, `plan`) |
 | `/api/keys` | POST | Yes | Create API key — returns `sk_live_...` key (shown once). Optional `expires_at` (ISO-8601, must be in the future); omitted = never expires |
 | `/api/keys` | GET | Yes | List your API keys (prefix only, never the full key) — includes `expires_at` (`null` = no expiry) |
@@ -1407,7 +1412,7 @@ Removes the file from storage and the cache. Returns `204 No Content` on success
 | Env var | Default | Description |
 |---------|---------|-------------|
 | `INPUT_FILES_MAX_SIZE_MB` | `25` | Max upload size per file |
-| `INPUT_FILES_RETENTION_S` | `86400` (24 h) | How long uploaded input files remain available |
+| `INPUT_FILES_RETENTION_S` | `86400` (24 h) | How long uploaded input files are kept; expired files are deleted by a sweep every five minutes |
 | `INPUT_FILES_MAX_INLINE_MB` | `4` | Max base64 inline size on `POST /run` (`source: data`) |
 
 ### Capability negotiation
@@ -1473,7 +1478,7 @@ Both paths require authentication. `GET /api/files/:id/content` returns `403 FOR
 |---------|---------|-------------|
 | `FILES_MAX_SIZE_MB` | `10` | Max file size in MB (larger files excluded) |
 | `FILES_MAX_COUNT` | `20` | Max files per run |
-| `FILES_RETENTION_S` | `3600` (1 hour) | How long output files are available for download |
+| `FILES_RETENTION_S` | `3600` (1 hour) | How long output files are kept for download; expired files are deleted by a sweep every five minutes |
 
 Agents without file output get `files: []` in the response (backward compatible).
 

@@ -26,7 +26,7 @@ import { streamSSE } from "hono/streaming";
 import { bundleCache, getOrExtract } from "../cache/bundle-cache.js";
 import { depsCache } from "../cache/deps-cache.js";
 import { getInputFile } from "../cache/input-cache.js";
-import { registerOutput } from "../cache/output-cache.js";
+import { OUTPUT_DIR_PREFIX, registerOutput } from "../cache/output-cache.js";
 import type { DbAdapter } from "../db/adapter.js";
 import type { Agent } from "../db/schema.js";
 import { getUser } from "../middleware/auth.js";
@@ -808,7 +808,7 @@ export function createRunRoutes(
     // script provider — the provider passes this path to spawned scripts
     // via SKRUN_OUTPUT_DIR. Re-used by LocalAdapter for output collection
     // (LocalAdapter no-ops when outputDir is already set).
-    const runOutputDir = join(tmpdir(), `skrun-outputs-${runId}`);
+    const runOutputDir = join(tmpdir(), `${OUTPUT_DIR_PREFIX}${runId}`);
     mkdirSync(runOutputDir, { recursive: true });
 
     let toolRegistry: ToolRegistry;

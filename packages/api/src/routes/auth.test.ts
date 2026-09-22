@@ -2,16 +2,20 @@ import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateApiKey, hashApiKey } from "../auth/api-key.js";
 import { hashCode } from "../auth/device-code.js";
-import { createSession, hashSessionId } from "../auth/session.js";
+import { createSession, hashSessionId, sessionCookieName } from "../auth/session.js";
 import { MemoryDb } from "../db/memory.js";
 import { createApp } from "../index.js";
 import { MemoryStorage } from "../storage/memory.js";
 
-// #101-VT-10 asserts the `signup_rejected` structured log. pino writes to fd 1
-// directly (bypassing process.stdout.write), so createLogger is mocked to capture
-// logger.warn. vi.mock is hoisted; vi.hoisted declares the spy in lock-step. Only
-// createLogger is replaced — the rest of @skrun-dev/runtime is left intact.
-const { logWarnSpy } = vi.hoisted(() => ({ logWarnSpy: vi.fn() }));
+// #101-VT-10 asserts the `signup_rejected` structured log, and VT-25 (#123) the
+// `oauth_exchange_failed` one. pino writes to fd 1 directly (bypassing
+// process.stdout.write), so createLogger is mocked to capture logger.warn and
+// logger.error. vi.mock is hoisted; vi.hoisted declares the spies in lock-step.
+// Only createLogger is replaced — the rest of @skrun-dev/runtime is left intact.
+const { logWarnSpy, logErrorSpy } = vi.hoisted(() => ({
+  logWarnSpy: vi.fn(),
+  logErrorSpy: vi.fn(),
+}));
 vi.mock("@skrun-dev/runtime", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@skrun-dev/runtime")>();
   return {
@@ -19,12 +23,12 @@ vi.mock("@skrun-dev/runtime", async (importOriginal) => {
     createLogger: () => ({
       info: vi.fn(),
       warn: logWarnSpy,
-      error: vi.fn(),
+      error: logErrorSpy,
       debug: vi.fn(),
       trace: vi.fn(),
       fatal: vi.fn(),
       level: "info",
-      child: () => ({ info: vi.fn(), warn: logWarnSpy }),
+      child: () => ({ info: vi.fn(), warn: logWarnSpy, error: logErrorSpy }),
     }),
   };
 });
@@ -486,7 +490,11 @@ describe("Auth Routes", () => {
       process.env.SKRUN_ALLOWED_GITHUB_USERS = "alice,bob";
       const res = await loginViaCallback({ id: 1, login: "Alice" });
       expect(res.status).toBe(302);
-      expect(res.headers.get("Location")).toContain("/dashboard");
+      // Exact, not a substring: with no destination configured the callback
+      // must land on /dashboard and carry NO query parameter — the unconfigured
+      // branch of the return destination (#123). A `toContain` would also have
+      // accepted "https://elsewhere.example/dashboard?login=failed".
+      expect(res.headers.get("Location")).toBe("/dashboard");
       expect(res.headers.get("Set-Cookie")).toContain("skrun_session=");
       expect(await db.getUserByGithubId("1")).toBeTruthy();
     });
@@ -523,7 +531,11 @@ describe("Auth Routes", () => {
     it("#101-RT-1: with the var unset, web login is unchanged (allowed)", async () => {
       const res = await loginViaCallback({ id: 3, login: "anyone" });
       expect(res.status).toBe(302);
-      expect(res.headers.get("Location")).toContain("/dashboard");
+      // Exact, not a substring: with no destination configured the callback
+      // must land on /dashboard and carry NO query parameter — the unconfigured
+      // branch of the return destination (#123). A `toContain` would also have
+      // accepted "https://elsewhere.example/dashboard?login=failed".
+      expect(res.headers.get("Location")).toBe("/dashboard");
     });
 
     async function seedDeviceCode(userCode: string) {
@@ -617,7 +629,8 @@ describe("Auth Routes", () => {
       redirect: "manual",
     });
     expect(callbackRes.status).toBe(302);
-    expect(callbackRes.headers.get("Location")).toContain("/dashboard");
+    // Exact, not a substring — see the note on #101-VT-4 above (#123).
+    expect(callbackRes.headers.get("Location")).toBe("/dashboard");
 
     // Session cookie should be set
     // biome-ignore lint/style/noNonNullAssertion: test assertion — value checked by expect
@@ -678,7 +691,11 @@ describe("Auth Routes", () => {
         redirect: "manual",
       });
       expect(res.status).toBe(302);
-      expect(res.headers.get("Location")).toContain("/dashboard");
+      // Exact, not a substring: with no destination configured the callback
+      // must land on /dashboard and carry NO query parameter — the unconfigured
+      // branch of the return destination (#123). A `toContain` would also have
+      // accepted "https://elsewhere.example/dashboard?login=failed".
+      expect(res.headers.get("Location")).toBe("/dashboard");
 
       // biome-ignore lint/style/noNonNullAssertion: test assertion — value checked by expect
       const setCookie = res.headers.get("Set-Cookie")!;
@@ -827,7 +844,7 @@ describe("Auth Routes", () => {
     const res = await app.request("/api/keys", {
       method: "POST",
       headers: {
-        Cookie: `skrun_session=${sessionId}`,
+        Cookie: `${sessionCookieName()}=${sessionId}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ name: "CI key" }),
@@ -849,7 +866,10 @@ describe("Auth Routes", () => {
 
     const res = await app.request("/api/keys", {
       method: "POST",
-      headers: { Cookie: `skrun_session=${sessionId}`, "Content-Type": "application/json" },
+      headers: {
+        Cookie: `${sessionCookieName()}=${sessionId}`,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({ name: "client key", expires_at: expiresAt }),
     });
     expect(res.status).toBe(201);
@@ -857,7 +877,7 @@ describe("Auth Routes", () => {
     expect(created.expires_at).toBe(expiresAt);
 
     const listRes = await app.request("/api/keys", {
-      headers: { Cookie: `skrun_session=${sessionId}` },
+      headers: { Cookie: `${sessionCookieName()}=${sessionId}` },
     });
     const listed = await listRes.json();
     expect(listed.find((k: { id: string }) => k.id === created.id)?.expires_at).toBe(expiresAt);
@@ -869,7 +889,10 @@ describe("Auth Routes", () => {
     const mint = (expires_at: string) =>
       app.request("/api/keys", {
         method: "POST",
-        headers: { Cookie: `skrun_session=${sessionId}`, "Content-Type": "application/json" },
+        headers: {
+          Cookie: `${sessionCookieName()}=${sessionId}`,
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({ name: "bad key", expires_at }),
       });
 
@@ -885,7 +908,10 @@ describe("Auth Routes", () => {
     const sessionId = await createSession(db, user.id);
     const res = await app.request("/api/keys", {
       method: "POST",
-      headers: { Cookie: `skrun_session=${sessionId}`, "Content-Type": "application/json" },
+      headers: {
+        Cookie: `${sessionCookieName()}=${sessionId}`,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({ name: "integration key" }),
     });
     // A key wired into someone else's integration must not acquire a lifetime
@@ -948,7 +974,10 @@ describe("Auth Routes", () => {
     // Create key
     const createRes = await app.request("/api/keys", {
       method: "POST",
-      headers: { Cookie: `skrun_session=${sessionId}`, "Content-Type": "application/json" },
+      headers: {
+        Cookie: `${sessionCookieName()}=${sessionId}`,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({ name: "temp" }),
     });
     const { id, key } = await createRes.json();
@@ -962,7 +991,12 @@ describe("Auth Routes", () => {
     // Revoke
     const deleteRes = await app.request(`/api/keys/${id}`, {
       method: "DELETE",
-      headers: { Cookie: `skrun_session=${sessionId}` },
+      // A DELETE carrying the session cookie and no Content-Type is exactly the
+      // shape the CSRF guard refuses. A browser puts Sec-Fetch-Site on it — the
+      // dashboard's own delete is saved by that header and by nothing else — so
+      // the request here does what a browser does, rather than the guard being
+      // loosened to accommodate a test.
+      headers: { Cookie: `${sessionCookieName()}=${sessionId}`, "Sec-Fetch-Site": "same-origin" },
     });
     expect(deleteRes.status).toBe(204);
 
@@ -1037,7 +1071,7 @@ describe("Auth Routes", () => {
   function mintAs(session: string, payload: Record<string, unknown>) {
     return app.request("/api/keys", {
       method: "POST",
-      headers: { Cookie: `skrun_session=${session}`, "Content-Type": "application/json" },
+      headers: { Cookie: `${sessionCookieName()}=${session}`, "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
   }
@@ -1158,7 +1192,7 @@ describe("Auth Routes", () => {
     const sessionId = await createSession(db, user.id);
 
     const res = await app.request("/api/me", {
-      headers: { Cookie: `skrun_session=${sessionId}` },
+      headers: { Cookie: `${sessionCookieName()}=${sessionId}` },
     });
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -1184,7 +1218,7 @@ describe("Auth Routes", () => {
     const sessionId = await createSession(policyDb, u.id);
 
     const res = await policyApp.request("/api/me", {
-      headers: { Cookie: `skrun_session=${sessionId}` },
+      headers: { Cookie: `${sessionCookieName()}=${sessionId}` },
     });
     expect(res.status).toBe(200);
     expect((await res.json()).verification_policy).toBe("owner");
@@ -1271,7 +1305,11 @@ describe("Auth Routes", () => {
 
     const res = await app.request("/auth/logout", {
       method: "POST",
-      headers: { Cookie: `skrun_session=${sessionId}` },
+      // Sec-Fetch-Site: the dashboard's sign-out is a POST with the cookie and no
+      // Content-Type, and this header is the only thing that carries it past the
+      // CSRF guard. Sending it here is reproducing the browser, not weakening the
+      // guard.
+      headers: { Cookie: `${sessionCookieName()}=${sessionId}`, "Sec-Fetch-Site": "same-origin" },
       redirect: "manual",
     });
     expect(res.status).toBe(200);
@@ -1309,5 +1347,810 @@ describe("Auth Routes", () => {
       headers: { Authorization: `Bearer ${key}` },
     });
     expect(res.status).toBe(401);
+  });
+});
+
+// Sign-out on the one deployment shape where it is hard: production, with a
+// cookie domain configured. Two things can go wrong there and neither shows up
+// in a default test run — the erasure can miss a cookie that is still
+// authenticating, or it can THROW before writing a header and turn the sign-out
+// into a 500.
+//
+// The app is built inside the block because the startup interlock reads the
+// environment once, at createApp time.
+describe("POST /auth/logout under a configured cookie domain (#123)", () => {
+  const KEYS = [
+    "NODE_ENV",
+    "CORS_ORIGIN",
+    "SKRUN_DEV_AUTH",
+    "SKRUN_PUBLIC_URL",
+    "SKRUN_SESSION_COOKIE_DOMAIN",
+  ] as const;
+  const snapshot: Record<string, string | undefined> = {};
+
+  let app: ReturnType<typeof createTestApp>["app"];
+  let db: MemoryDb;
+
+  beforeEach(() => {
+    for (const key of KEYS) snapshot[key] = process.env[key];
+    // Production is not decoration here: it is what turns the Secure flag on,
+    // which is what turns the prefix on, which is the only configuration where
+    // hono's serialiser can throw. A case that forgot this line would exercise
+    // the unprefixed path and stay green over a broken sign-out.
+    process.env.NODE_ENV = "production";
+    process.env.CORS_ORIGIN = "https://app.example.com"; // required in production
+    delete process.env.SKRUN_DEV_AUTH; // production + dev-auth refuses to boot
+    process.env.SKRUN_PUBLIC_URL = "https://api.example.com";
+    process.env.SKRUN_SESSION_COOKIE_DOMAIN = "example.com";
+
+    const ctx = createTestApp();
+    app = ctx.app;
+    db = ctx.db;
+  });
+
+  afterEach(() => {
+    for (const key of KEYS) {
+      if (snapshot[key] === undefined) delete process.env[key];
+      else process.env[key] = snapshot[key];
+    }
+  });
+
+  // VT-26 — the transition case, and the reason the erasure list has four
+  // entries. A browser that signed in BEFORE this element carries a host-only
+  // cookie under the old name; one that signs in after carries a domain-scoped
+  // cookie under the prefixed name. A sign-out that erased only the second would
+  // leave the first authenticating for the rest of its seven days — and the user
+  // would have been told they were signed out.
+  it("VT-26: sign-out covers both names and both scopes, and neither cookie signs anyone in afterwards", async () => {
+    const user = await db.createUser({ github_id: "gh-two-scopes", username: "twoscopes" });
+    const currentSession = await createSession(db, user.id);
+    const legacySession = await createSession(db, user.id);
+
+    const res = await app.request("/auth/logout", {
+      method: "POST",
+      headers: {
+        Cookie: `__Secure-skrun_session=${currentSession}; skrun_session=${legacySession}`,
+        // As above: a cookie-borne POST with no Content-Type is refused by the
+        // CSRF guard unless the browser signal is present.
+        "Sec-Fetch-Site": "same-origin",
+      },
+      redirect: "manual",
+    });
+    expect(res.status).toBe(200);
+
+    // Read as a list, not as the joined string — a single get() would hide a
+    // missing header behind a comma.
+    const setCookies = res.headers.getSetCookie();
+    expect(setCookies).toHaveLength(4);
+    const erased = setCookies.map((c) => {
+      const name = c.slice(0, c.indexOf("="));
+      const domain = /;\s*Domain=([^;]+)/i.exec(c)?.[1];
+      return `${name}|${domain ?? "-"}`;
+    });
+    expect(new Set(erased)).toEqual(
+      new Set([
+        "skrun_session|-",
+        "skrun_session|example.com",
+        "__Secure-skrun_session|-",
+        "__Secure-skrun_session|example.com",
+      ]),
+    );
+
+    // The session the request actually presented is gone from the store.
+    expect(await db.getSession(hashSessionId(currentSession))).toBeNull();
+
+    // And neither cookie authenticates anything now: the current one because its
+    // row is gone, the legacy one because the server no longer reads that name at
+    // all under this configuration — which is why erasing it in the browser is
+    // the whole of the remedy.
+    for (const cookie of [
+      `__Secure-skrun_session=${currentSession}`,
+      `skrun_session=${legacySession}`,
+    ]) {
+      const after = await app.request("/api/me", { headers: { Cookie: cookie } });
+      expect(after.status, cookie).toBe(401);
+    }
+  });
+
+  // VT-36 (session half) — the erasure must not THROW. hono's setCookie refuses
+  // to serialise a __Secure- name without secure:true and raises instead, so an
+  // erasure written the old way — { maxAge: 0, path: "/" } — answers 500 in
+  // exactly the nominal case of a domain-configured production deployment, and
+  // nothing locally shows it because no name is prefixed there. Asserted through
+  // a real request, never through the options object: it is the serialisation
+  // that throws, not the factory.
+  it("VT-36: erasing a prefixed cookie name does not throw, and every header carries Secure and Max-Age=0", async () => {
+    const user = await db.createUser({ github_id: "gh-no-throw", username: "nothrow" });
+    const sessionId = await createSession(db, user.id);
+
+    const res = await app.request("/auth/logout", {
+      method: "POST",
+      headers: {
+        Cookie: `__Secure-skrun_session=${sessionId}`,
+        // Same reason as the two cases above — the browser signal, not a
+        // relaxation of the guard.
+        "Sec-Fetch-Site": "same-origin",
+      },
+      redirect: "manual",
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+
+    const setCookies = res.headers.getSetCookie();
+    expect(setCookies).toHaveLength(4);
+    for (const cookie of setCookies) {
+      expect(cookie, cookie).toMatch(/;\s*Max-Age=0/i);
+      expect(cookie, cookie).toMatch(/;\s*Secure/i);
+      expect(cookie, cookie).toMatch(/;\s*Path=\//i);
+    }
+    // Both scopes present — the half that makes the erasure reach the cookie an
+    // older browser is still carrying.
+    expect(setCookies.filter((c) => /;\s*Domain=example\.com/i.test(c))).toHaveLength(2);
+    expect(setCookies.filter((c) => !/;\s*Domain=/i.test(c))).toHaveLength(2);
+  });
+});
+
+// The device-login cookies in production. NODE_ENV is set explicitly and it is
+// the whole point of the block: the file runs in test, where the prefix is off
+// and the code path that can raise is never taken.
+//
+// No cookie domain is configured here, deliberately — the device CSRF cookie's
+// condition is the Secure flag ALONE, unlike the session cookie's, and a block
+// that configured a domain would not tell the two conditions apart.
+describe("device-login cookies in production (#123)", () => {
+  const KEYS = [
+    "NODE_ENV",
+    "CORS_ORIGIN",
+    "SKRUN_DEV_AUTH",
+    "GITHUB_CLIENT_ID",
+    "GITHUB_CLIENT_SECRET",
+    "SKRUN_PUBLIC_URL",
+    "SKRUN_SESSION_COOKIE_DOMAIN",
+  ] as const;
+  const snapshot: Record<string, string | undefined> = {};
+
+  let app: ReturnType<typeof createTestApp>["app"];
+  let db: MemoryDb;
+
+  const csrfFrom = (setCookie: string | null): string =>
+    setCookie?.match(/skrun_device_csrf=([^;]+)/)?.[1] ?? "";
+
+  beforeEach(() => {
+    for (const key of KEYS) snapshot[key] = process.env[key];
+    process.env.NODE_ENV = "production";
+    process.env.CORS_ORIGIN = "https://app.example.com";
+    delete process.env.SKRUN_DEV_AUTH;
+    delete process.env.SKRUN_SESSION_COOKIE_DOMAIN;
+    delete process.env.SKRUN_PUBLIC_URL;
+    process.env.GITHUB_CLIENT_ID = "test-id";
+    process.env.GITHUB_CLIENT_SECRET = "test-secret";
+
+    const ctx = createTestApp();
+    app = ctx.app;
+    db = ctx.db;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    for (const key of KEYS) {
+      if (snapshot[key] === undefined) delete process.env[key];
+      else process.env[key] = snapshot[key];
+    }
+  });
+
+  /** Mints a pending device code and returns its user_code. */
+  async function pendingCode(userCode: string, challenge = "chal") {
+    await db.createDeviceCode({
+      device_code_hash: hashCode(`dev-${userCode}`),
+      user_code_hash: hashCode(userCode),
+      code_challenge: challenge,
+      expires_at: new Date(Date.now() + 600_000).toISOString(),
+    });
+    return userCode;
+  }
+
+  // VT-27 — the consent cookie is host-locked. __Host- is the one attribute a
+  // sibling host of the domain cannot write, which is what keeps the
+  // double-submit check meaningful once the session is shared across a domain.
+  it("VT-27: GET /device sets __Host-skrun_device_csrf with Secure, Path=/ and no Domain", async () => {
+    const res = await app.request("/device?user_code=ABCD-2345");
+    expect(res.status).toBe(200);
+
+    const setCookies = res.headers.getSetCookie();
+    const csrfCookie = setCookies.find((c) => c.includes("skrun_device_csrf="));
+    expect(csrfCookie).toBeDefined();
+    expect(csrfCookie).toMatch(/^__Host-skrun_device_csrf=/);
+    expect(csrfCookie).toMatch(/;\s*Secure/i);
+    expect(csrfCookie).toMatch(/;\s*Path=\//i);
+    expect(csrfCookie).not.toMatch(/;\s*Domain=/i);
+    expect(csrfCookie).toMatch(/;\s*HttpOnly/i);
+  });
+
+  // VT-28 — the two binding cookies do NOT change, and this is the most useful
+  // case of the phase. Both have to survive the round trip to GitHub; the KB page
+  // for this flow warns that hardening them "silently removes the branch" — the
+  // CLI would poll until expiry with nothing failing anywhere. So their names and
+  // attributes are pinned here, in the very configuration where a prefix would
+  // otherwise have been applied.
+  it("VT-28: the two binding cookies keep their names and attributes in production", async () => {
+    const authRes = await app.request("/auth/github", { redirect: "manual" });
+    const stateCookie = authRes.headers.getSetCookie().find((c) => c.startsWith("skrun_oauth_"));
+    expect(stateCookie).toBeDefined();
+    expect(stateCookie).toMatch(/^skrun_oauth_state=/); // no prefix
+    expect(stateCookie).toMatch(/;\s*SameSite=Lax/i);
+    expect(stateCookie).not.toMatch(/;\s*Domain=/i);
+    expect(stateCookie).not.toMatch(/__Host-|__Secure-/);
+
+    const userCode = await pendingCode("BIND-2345");
+    const get = await app.request("/device");
+    const csrf = csrfFrom(get.headers.get("Set-Cookie"));
+    const postRes = await app.request("/device", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `__Host-skrun_device_csrf=${csrf}`,
+      },
+      body: `user_code=${userCode}&csrf=${csrf}`,
+      redirect: "manual",
+    });
+    expect(postRes.status).toBe(302);
+
+    const bindCookie = postRes.headers
+      .getSetCookie()
+      .find((c) => c.startsWith("skrun_device_user_code="));
+    expect(bindCookie).toBeDefined();
+    expect(bindCookie).toMatch(/;\s*SameSite=Lax/i);
+    expect(bindCookie).not.toMatch(/;\s*Domain=/i);
+    expect(bindCookie).not.toMatch(/__Host-|__Secure-/);
+  });
+
+  // VT-36 (device half) — the erasure of the prefixed consent cookie must not
+  // throw. hono refuses to serialise a __Host- name without secure:true and
+  // raises instead, so POST /device would answer 500 on EVERY production
+  // instance, configured domain or not. Through a real request, since it is the
+  // serialisation that raises.
+  it("VT-36: POST /device does not throw, and the consent cookie is erased with Secure, Path=/ and no Domain", async () => {
+    const userCode = await pendingCode("NOTH-2345");
+    const get = await app.request("/device");
+    const csrf = csrfFrom(get.headers.get("Set-Cookie"));
+
+    const res = await app.request("/device", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `__Host-skrun_device_csrf=${csrf}`,
+      },
+      body: `user_code=${userCode}&csrf=${csrf}`,
+      redirect: "manual",
+    });
+
+    expect(res.status).toBe(302); // not 500 — nothing raised
+    expect(res.headers.get("Location")).toBe("/auth/github");
+
+    const erasure = res.headers
+      .getSetCookie()
+      .find((c) => c.startsWith("__Host-skrun_device_csrf="));
+    expect(erasure).toBeDefined();
+    expect(erasure).toMatch(/;\s*Max-Age=0/i);
+    expect(erasure).toMatch(/;\s*Secure/i);
+    expect(erasure).toMatch(/;\s*Path=\//i);
+    expect(erasure).not.toMatch(/;\s*Domain=/i);
+  });
+
+  // VT-29 — the whole device journey, end to end, under the prefix: consent,
+  // the GitHub leg, then the CLI's poll. What must not change is where the token
+  // comes out: the poll body, never a URL and never the consent page.
+  it("VT-29: the device journey is unchanged end to end, and the token arrives in the poll body", async () => {
+    const verifier = "v".repeat(43);
+    const challenge = createHash("sha256").update(verifier).digest("base64url");
+    const userCode = await pendingCode("JRNY-2345", challenge);
+
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockImplementation((url: string) =>
+          Promise.resolve(
+            new Response(
+              JSON.stringify(
+                url.includes("access_token")
+                  ? { access_token: "tok" }
+                  : { id: 424242, login: "Journey", email: "journey@test.com" },
+              ),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            ),
+          ),
+        ),
+    );
+
+    // 1. Consent, under the prefixed cookie name.
+    const get = await app.request("/device");
+    const csrf = csrfFrom(get.headers.get("Set-Cookie"));
+    const consent = await app.request("/device", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `__Host-skrun_device_csrf=${csrf}`,
+      },
+      body: `user_code=${userCode}&csrf=${csrf}`,
+      redirect: "manual",
+    });
+    expect(consent.status).toBe(302);
+
+    // 2. The GitHub leg, carrying the binding cookie the consent just set.
+    const authRes = await app.request("/auth/github", { redirect: "manual" });
+    // biome-ignore lint/style/noNonNullAssertion: OAuth is configured in this block
+    const state = new URL(authRes.headers.get("Location")!).searchParams.get("state")!;
+    // biome-ignore lint/style/noNonNullAssertion: present after the redirect
+    const stateCookie = authRes.headers.get("Set-Cookie")!.split(";")[0];
+    const callback = await app.request(`/auth/github/callback?code=c&state=${state}`, {
+      headers: { Cookie: `${stateCookie}; skrun_device_user_code=${userCode}` },
+      redirect: "manual",
+    });
+    expect(callback.status).toBe(200);
+    const html = await callback.text();
+    expect(html).toContain("You're all set");
+    expect(html).not.toContain("sk_live"); // never on the page
+
+    // 3. The CLI polls, and only here does the token exist.
+    const poll = await app.request("/auth/device/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_code: `dev-${userCode}`, code_verifier: verifier }),
+    });
+    expect(poll.status).toBe(200);
+    const body = await poll.json();
+    expect(typeof body.token).toBe("string");
+    expect(body.token.length).toBeGreaterThan(0);
+    // Lower-cased, as the namespace always has been — measured, not assumed: the
+    // GitHub login here is "Journey".
+    expect(body.username).toBe("journey");
+  });
+});
+
+// ── #123 the return destination: the two worlds of the callback ────────────
+//
+// Two blocks, because they cannot share an app: the startup interlock reads the
+// environment once, at createApp time. The second block is the one that matters
+// most to a self-hoster — it says that an operator who configured nothing sees
+// the callback do exactly what it did before.
+
+/** The exception message the browser must never see, and the log must. */
+const EXCHANGE_DETAIL = "upstream-detail-b7f19c-never-shown-to-a-browser";
+
+/** Mocks GitHub's token + profile endpoints for one successful callback. */
+function stubGithubOk(gh: { id: number; login: string }) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockImplementation((url: string) => {
+      const body = url.includes("access_token")
+        ? { access_token: "tok" }
+        : { id: gh.id, login: gh.login, email: null };
+      return Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    }),
+  );
+}
+
+/** Mocks a token exchange that throws, with a message nothing else produces. */
+function stubGithubThrows() {
+  vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error(EXCHANGE_DETAIL)));
+}
+
+/**
+ * Everything a caller could read off a response, as one string: the status, every
+ * header, and the body. Asserting on this rather than on the body alone is the
+ * point — a marker that named the account would most likely do it in `Location`.
+ */
+async function readableSurface(res: Response): Promise<string> {
+  const headers = [...res.headers].map(([k, v]) => `${k}: ${v}`).join("\n");
+  return `${res.status}\n${headers}\n${await res.text()}`;
+}
+
+describe("the OAuth callback with a return destination configured (#123)", () => {
+  const KEYS = [
+    "NODE_ENV",
+    "CORS_ORIGIN",
+    "SKRUN_DEV_AUTH",
+    "GITHUB_CLIENT_ID",
+    "GITHUB_CLIENT_SECRET",
+    "SKRUN_ALLOWED_GITHUB_USERS",
+    "SKRUN_PUBLIC_URL",
+    "SKRUN_SESSION_COOKIE_DOMAIN",
+  ] as const;
+  const snapshot: Record<string, string | undefined> = {};
+
+  // The site sits at the apex of the cookie's domain, and the scheme is the
+  // canonical origin's — not a literal https, which under VT-3's configuration (a
+  // domain outside production) would point at an origin serving http.
+  const RETURN_ORIGIN = "https://example.com";
+  // One identity for every case in the block, so "no identity came back" is a
+  // single pair of strings to look for rather than one per case.
+  const GH = { id: 909090, login: "mallory-unlisted" };
+
+  let app: ReturnType<typeof createTestApp>["app"];
+  let db: MemoryDb;
+
+  beforeEach(() => {
+    for (const key of KEYS) snapshot[key] = process.env[key];
+    // Production, because the prefix on the session cookie is half of what VT-20
+    // asserts and it is off anywhere else.
+    process.env.NODE_ENV = "production";
+    process.env.CORS_ORIGIN = "https://app.example.com";
+    delete process.env.SKRUN_DEV_AUTH;
+    delete process.env.SKRUN_ALLOWED_GITHUB_USERS;
+    process.env.GITHUB_CLIENT_ID = "id";
+    process.env.GITHUB_CLIENT_SECRET = "secret";
+    process.env.SKRUN_PUBLIC_URL = "https://api.example.com";
+    process.env.SKRUN_SESSION_COOKIE_DOMAIN = "example.com";
+
+    const ctx = createTestApp();
+    app = ctx.app;
+    db = ctx.db;
+    logErrorSpy.mockClear();
+    logWarnSpy.mockClear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    for (const key of KEYS) {
+      if (snapshot[key] === undefined) delete process.env[key];
+      else process.env[key] = snapshot[key];
+    }
+  });
+
+  /** Starts a login and hands back the state and the cookie the browser holds. */
+  async function beginLogin(): Promise<{ state: string; cookie: string }> {
+    const res = await app.request("/auth/github", { redirect: "manual" });
+    const location = res.headers.get("Location");
+    if (!location) throw new Error("no Location on /auth/github — OAuth misconfigured?");
+    return {
+      state: new URL(location).searchParams.get("state") ?? "",
+      cookie: (res.headers.get("Set-Cookie") ?? "").split(";")[0] ?? "",
+    };
+  }
+
+  async function callback(query: string, cookie: string, headers: Record<string, string> = {}) {
+    return app.request(`/auth/github/callback${query}`, {
+      headers: { Cookie: cookie, ...headers },
+      redirect: "manual",
+    });
+  }
+
+  // VT-20 — the nominal case of the whole element: the browser is sent to the
+  // site, and the cookie it now carries is one the site's host will send back.
+  it("VT-20: a finished login lands on the configured origin, carrying the domain-scoped cookie", async () => {
+    stubGithubOk(GH);
+    const { state, cookie } = await beginLogin();
+    const res = await callback(`?code=c&state=${state}`, cookie);
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("Location")).toBe(`${RETURN_ORIGIN}/`);
+
+    const session = res.headers.getSetCookie().find((c) => c.includes("skrun_session="));
+    expect(session).toBeDefined();
+    expect(session).toMatch(/^__Secure-skrun_session=/);
+    expect(session).toMatch(/;\s*Domain=example\.com/i);
+    expect(session).toMatch(/;\s*Secure/i);
+    expect(session).toMatch(/;\s*HttpOnly/i);
+    expect(await db.getUserByGithubId(String(GH.id))).toBeTruthy();
+  });
+
+  // VT-22 — the open-redirect family, asserted as an absence. Nothing here is
+  // filtered; the values below are simply never read, and this is what proves it.
+  it("VT-22: no query parameter and no header moves the destination", async () => {
+    const hostile =
+      "&return_to=https%3A%2F%2Fevil.example" +
+      "&next=https%3A%2F%2Fevil.example%2Fnext" +
+      "&redirect_uri=https%3A%2F%2Fevil.example%2Fcb" +
+      "&returnTo=https%3A%2F%2Fevil.example";
+    const hostileHeaders = {
+      return_to: "https://evil.example",
+      next: "https://evil.example/next",
+      redirect_uri: "https://evil.example/cb",
+      "X-Forwarded-Host": "evil.example",
+      Referer: "https://evil.example/",
+    };
+
+    stubGithubOk(GH);
+    const { state, cookie } = await beginLogin();
+    const ok = await callback(`?code=c&state=${state}${hostile}`, cookie, hostileHeaders);
+    expect(ok.status).toBe(302);
+    expect(ok.headers.get("Location")).toBe(`${RETURN_ORIGIN}/`);
+
+    // The failing exit is steerable in exactly the same way — that is, not at
+    // all. A guard that covered only the success path would be worth nothing.
+    const failed = await callback(`?code=c&state=mismatch${hostile}`, cookie, hostileHeaders);
+    expect(failed.status).toBe(302);
+    expect(failed.headers.get("Location")).toBe(`${RETURN_ORIGIN}/?login=failed`);
+
+    for (const res of [ok, failed]) {
+      expect(await readableSurface(res)).not.toContain("evil.example");
+    }
+  });
+
+  // VT-23 — the five ways a callback can end badly or be refused, side by side.
+  // The four technical ones must be ONE answer: telling them apart tells someone
+  // probing the callback which half of the handshake they got wrong, and tells a
+  // support reader nothing they can act on.
+  it("VT-23: four technical failures are one answer, a refusal is another, and none of the five says who", async () => {
+    const technical: Array<{ name: string; res: Response }> = [];
+
+    // 1. No state at all in the query.
+    stubGithubOk(GH);
+    {
+      const { cookie } = await beginLogin();
+      technical.push({ name: "state absent", res: await callback("?code=c", cookie) });
+    }
+    // 2. A state that does not match the one in the cookie.
+    {
+      const { cookie } = await beginLogin();
+      technical.push({
+        name: "state mismatched",
+        res: await callback("?code=c&state=not-the-one", cookie),
+      });
+    }
+    // 3. The visitor pressed Cancel at GitHub — it comes back with no code.
+    {
+      const { state, cookie } = await beginLogin();
+      technical.push({
+        name: "cancelled at GitHub",
+        res: await callback(`?state=${state}&error=access_denied`, cookie),
+      });
+    }
+    // 4. The token exchange throws.
+    {
+      const { state, cookie } = await beginLogin();
+      stubGithubThrows();
+      technical.push({
+        name: "exchange threw",
+        res: await callback(`?code=c&state=${state}`, cookie),
+      });
+    }
+
+    for (const { name, res } of technical) expect(res.status, name).toBe(302);
+    expect(new Set(technical.map((t) => t.res.headers.get("Location")))).toEqual(
+      new Set([`${RETURN_ORIGIN}/?login=failed`]),
+    );
+
+    // 5. The signup allowlist refuses the account — a different marker, because
+    // it is a different thing: nothing failed, the visitor is simply not admitted.
+    process.env.SKRUN_ALLOWED_GITHUB_USERS = "alice";
+    stubGithubOk(GH);
+    const { state: sWeb, cookie: cWeb } = await beginLogin();
+    const deniedWeb = await callback(`?code=c&state=${sWeb}`, cWeb);
+    expect(deniedWeb.status).toBe(302);
+    expect(deniedWeb.headers.get("Location")).toBe(`${RETURN_ORIGIN}/?login=denied`);
+
+    // 5b. The same refusal reached through a CLI device login. The branch is
+    // shared, so the browser leaves by the same door — and the work that has to
+    // happen before it leaves still happens: the device code is consumed, so the
+    // CLI's next poll gets expired_token instead of waiting out a stale pending.
+    const userCode = "DENY-2345";
+    await db.createDeviceCode({
+      device_code_hash: hashCode(`dev-${userCode}`),
+      user_code_hash: hashCode(userCode),
+      code_challenge: "chal",
+      expires_at: new Date(Date.now() + 600_000).toISOString(),
+    });
+    const { state: sDev, cookie: cDev } = await beginLogin();
+    const deniedDevice = await callback(
+      `?code=c&state=${sDev}`,
+      `${cDev}; skrun_device_user_code=${userCode}`,
+    );
+    expect(deniedDevice.status).toBe(302);
+    expect(deniedDevice.headers.get("Location")).toBe(`${RETURN_ORIGIN}/?login=denied`);
+    expect(await db.getDeviceCodeByUserHash(hashCode(userCode))).toBeNull();
+    expect(
+      deniedDevice.headers.getSetCookie().some((c) => c.startsWith("skrun_device_user_code=;")),
+    ).toBe(true);
+
+    // None of the five names the account, its id, or what went wrong upstream.
+    for (const { name, res } of [
+      ...technical,
+      { name: "refused (web)", res: deniedWeb },
+      { name: "refused (device)", res: deniedDevice },
+    ]) {
+      const surface = await readableSurface(res);
+      expect(surface, name).not.toContain(GH.login);
+      expect(surface, name).not.toContain(String(GH.id));
+      expect(surface, name).not.toContain(EXCHANGE_DETAIL);
+    }
+
+    // And a success says nothing either — no marker at all, so a page cannot be
+    // told "a login just happened" by a link somebody else wrote.
+    delete process.env.SKRUN_ALLOWED_GITHUB_USERS;
+    stubGithubOk(GH);
+    const { state: sOk, cookie: cOk } = await beginLogin();
+    const ok = await callback(`?code=c&state=${sOk}`, cOk);
+    expect(ok.headers.get("Location")).toBe(`${RETURN_ORIGIN}/`);
+    expect(new URL(`${ok.headers.get("Location")}`).search).toBe("");
+  });
+
+  // VT-25 — where the detail went. Removing it from the response is only half of
+  // the change; an operator who now has less to read in a support ticket must
+  // have more to read in their logs.
+  it("VT-25: the exchange's own message reaches the error log and never the browser", async () => {
+    const { state, cookie } = await beginLogin();
+    stubGithubThrows();
+    const res = await callback(`?code=c&state=${state}`, cookie);
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("Location")).toBe(`${RETURN_ORIGIN}/?login=failed`);
+    expect(await readableSurface(res)).not.toContain(EXCHANGE_DETAIL);
+
+    expect(logErrorSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "oauth_exchange_failed", error: EXCHANGE_DETAIL }),
+      expect.any(String),
+    );
+  });
+});
+
+describe("the OAuth callback with nothing configured (#123)", () => {
+  const KEYS = [
+    "GITHUB_CLIENT_ID",
+    "GITHUB_CLIENT_SECRET",
+    "SKRUN_ALLOWED_GITHUB_USERS",
+    "SKRUN_PUBLIC_URL",
+    "SKRUN_SESSION_COOKIE_DOMAIN",
+  ] as const;
+  const snapshot: Record<string, string | undefined> = {};
+
+  let app: ReturnType<typeof createTestApp>["app"];
+  let db: MemoryDb;
+
+  beforeEach(() => {
+    for (const key of KEYS) snapshot[key] = process.env[key];
+    process.env.GITHUB_CLIENT_ID = "id";
+    process.env.GITHUB_CLIENT_SECRET = "secret";
+    delete process.env.SKRUN_ALLOWED_GITHUB_USERS;
+    delete process.env.SKRUN_PUBLIC_URL;
+    delete process.env.SKRUN_SESSION_COOKIE_DOMAIN;
+
+    const ctx = createTestApp();
+    app = ctx.app;
+    db = ctx.db;
+    logErrorSpy.mockClear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    for (const key of KEYS) {
+      if (snapshot[key] === undefined) delete process.env[key];
+      else process.env[key] = snapshot[key];
+    }
+  });
+
+  async function beginLogin(): Promise<{ state: string; cookie: string }> {
+    const res = await app.request("/auth/github", { redirect: "manual" });
+    const location = res.headers.get("Location");
+    if (!location) throw new Error("no Location on /auth/github — OAuth misconfigured?");
+    return {
+      state: new URL(location).searchParams.get("state") ?? "",
+      cookie: (res.headers.get("Set-Cookie") ?? "").split(";")[0] ?? "",
+    };
+  }
+
+  async function callback(query: string, cookie: string) {
+    return app.request(`/auth/github/callback${query}`, {
+      headers: { Cookie: cookie },
+      redirect: "manual",
+    });
+  }
+
+  // VT-21 — the success path of every deployment that has not opted in.
+  it("VT-21: a finished login still lands on /dashboard, with the cookie it always had", async () => {
+    stubGithubOk({ id: 5001, login: "Selfhost" });
+    const { state, cookie } = await beginLogin();
+    const res = await callback(`?code=c&state=${state}`, cookie);
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("Location")).toBe("/dashboard");
+
+    const session = res.headers.getSetCookie().find((c) => c.includes("skrun_session="));
+    expect(session).toMatch(/^skrun_session=/); // no prefix
+    expect(session).not.toMatch(/;\s*Domain=/i); // host-only
+  });
+
+  // VT-24 — the four failures keep their status and their shape. One thing does
+  // change and it is meant to: the 500 no longer hands the exception's message to
+  // the browser. That was never part of the contract a self-hoster relies on, and
+  // it is the one line an audit would flag.
+  it("VT-24: the four failures keep today's status and shape, and the 500 carries no exception message", async () => {
+    stubGithubOk({ id: 5002, login: "Selfhost" });
+
+    for (const [name, query] of [
+      ["state absent", "?code=c"],
+      ["state mismatched", "?code=c&state=not-the-one"],
+    ] as const) {
+      const { cookie } = await beginLogin();
+      const res = await callback(query, cookie);
+      expect(res.status, name).toBe(400);
+      expect((await res.json()).error.code, name).toBe("INVALID_OAUTH_CALLBACK");
+    }
+
+    {
+      const { state, cookie } = await beginLogin();
+      const res = await callback(`?state=${state}&error=access_denied`, cookie);
+      expect(res.status).toBe(400);
+      expect((await res.json()).error.code).toBe("INVALID_OAUTH_CALLBACK");
+    }
+
+    {
+      const { state, cookie } = await beginLogin();
+      stubGithubThrows();
+      const res = await callback(`?code=c&state=${state}`, cookie);
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.error.code).toBe("OAUTH_FAILED");
+      expect(body.error.message).toBe("OAuth authentication failed");
+      expect(JSON.stringify(body)).not.toContain(EXCHANGE_DETAIL);
+      // The detail is not lost, it moved: the log fires with no destination
+      // configured just as it does with one.
+      expect(logErrorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ event: "oauth_exchange_failed", error: EXCHANGE_DETAIL }),
+        expect.any(String),
+      );
+    }
+
+    // And the refusal is still the generic page, with no echo of the account.
+    process.env.SKRUN_ALLOWED_GITHUB_USERS = "alice";
+    stubGithubOk({ id: 5003, login: "mallory-unlisted" });
+    const { state, cookie } = await beginLogin();
+    const denied = await callback(`?code=c&state=${state}`, cookie);
+    expect(denied.status).toBe(403);
+    const html = await denied.text();
+    expect(html).toContain("Not authorized");
+    expect(html).not.toContain("mallory-unlisted");
+  });
+
+  // RT-1 — the self-hoster's whole web journey, read as they would see it: the
+  // leg out to GitHub, the cookie that comes back, the landing, and the session
+  // actually authenticating afterwards. Nothing in this test knows that #123
+  // happened, which is the point of it.
+  it("RT-1: the unconfigured web journey is unchanged end to end", async () => {
+    // The leg out still derives its redirect_uri from the request's own headers,
+    // because no canonical origin is pinned here.
+    const out = await app.request("http://selfhost.example/auth/github", {
+      headers: { "X-Forwarded-Proto": "https" },
+      redirect: "manual",
+    });
+    expect(out.status).toBe(302);
+    const authorize = new URL(`${out.headers.get("Location")}`);
+    expect(authorize.origin + authorize.pathname).toBe("https://github.com/login/oauth/authorize");
+    expect(authorize.searchParams.get("redirect_uri")).toBe(
+      "https://selfhost.example/auth/github/callback",
+    );
+
+    stubGithubOk({ id: 5004, login: "Selfhost" });
+    const { state, cookie } = await beginLogin();
+    const res = await callback(`?code=c&state=${state}`, cookie);
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("Location")).toBe("/dashboard");
+
+    const session = res.headers.getSetCookie().find((c) => c.includes("skrun_session="));
+    expect(session).toMatch(/^skrun_session=/);
+    expect(session).not.toMatch(/;\s*Domain=/i);
+    expect(session).toMatch(/;\s*SameSite=Lax/i);
+    expect(session).toMatch(/;\s*HttpOnly/i);
+    expect(session).toMatch(/;\s*Path=\//i);
+
+    // The name the browser was handed is the name the server reads back.
+    const raw = `${session}`.match(/skrun_session=([^;]+)/)?.[1] ?? "";
+    expect(raw).not.toBe("");
+    const me = await app.request("/api/me", {
+      headers: { Cookie: `${sessionCookieName()}=${raw}` },
+    });
+    expect(me.status).toBe(200);
+    expect((await me.json()).username).toBe("selfhost");
+
+    // And the user really was created, under the lower-cased namespace.
+    expect((await db.getUserByGithubId("5004"))?.username).toBe("selfhost");
   });
 });

@@ -81,4 +81,22 @@ export class TTLCache<K, V> {
   get size(): number {
     return this.map.size;
   }
+
+  /**
+   * Remove every expired entry now, without waiting for a read, calling
+   * `onEvict` for each. Returns how many were removed. Expiry on `get` only
+   * means an entry nobody asks for again is never evicted; a caller that owns
+   * a timer uses this to make the TTL a bound rather than a hint.
+   */
+  sweep(now: number = Date.now()): number {
+    let removed = 0;
+    for (const [key, entry] of this.map) {
+      if (now - entry.timestamp > this.ttlMs) {
+        this.map.delete(key);
+        this.onEvict?.(key, entry.value);
+        removed++;
+      }
+    }
+    return removed;
+  }
 }

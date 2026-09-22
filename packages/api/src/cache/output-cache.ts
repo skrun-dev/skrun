@@ -4,6 +4,9 @@ import { TTLCache } from "@skrun-dev/runtime";
 
 const DEFAULT_RETENTION_S = 3600; // 1 hour
 
+/** Per-run output directories live under the temp root as `<prefix><runId>`. */
+export const OUTPUT_DIR_PREFIX = "skrun-outputs-";
+
 function readEnvInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
