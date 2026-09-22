@@ -7,7 +7,7 @@ export function getOpenAPISchema(baseUrl = "http://localhost:4000") {
     openapi: "3.1.0",
     info: {
       title: "Skrun API",
-      version: "1.2.0",
+      version: "1.2.1",
       description:
         "Deploy any Agent Skill as an API. Multi-model, stateful, multimodal, open source.",
       license: { name: "MIT", url: "https://github.com/skrun-dev/skrun/blob/main/LICENSE" },

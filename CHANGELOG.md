@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-09-22
+
+### Fixed
+- **Signing in with GitHub failed on the 1.2.0 image (`?login=failed`) — every response the server fetched from an HTTP/2 origin arrived compressed and unread.** The runtime's outbound-request guard imports the `undici` package for its own fetch; Node's built-in `fetch` bundles another copy, and the two share one global dispatcher. `undici` 8.11.0, published the morning of the 1.2.0 build and picked up by it, installs a dispatcher that negotiates HTTP/2 for the built-in fetch's connections, after which gzip bodies reach `json()` raw — the GitHub OAuth token exchange was the first caller to notice. `undici` is now pinned to 8.10.0, and a test loads the guard and then checks that the built-in fetch still decodes a gzip response from an HTTP/2 origin. Affects the 1.2.0 image and `@skrun-dev/api@1.2.0` on Node 22 with `undici` 8.11.0 installed; Node 24 is unaffected.
+
 ## [1.2.0] - 2026-09-22
 
 ### Breaking

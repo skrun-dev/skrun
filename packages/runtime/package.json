@@ -1,6 +1,6 @@
 {
   "name": "@skrun-dev/runtime",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "exports": {
     ".": {
@@ -31,7 +31,7 @@
     "ajv": "^8.20.0",
     "openai": "^6.35.0",
     "pino": "^10.3.1",
-    "undici": "^8.10.0",
+    "undici": "8.10.0",
     "zod": "^4.4.1"
   },
   "devDependencies": {
