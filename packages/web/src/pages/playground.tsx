@@ -1,13 +1,21 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { EmptyState } from "../components/shared/empty-state";
 import { FilesBlock, type RunFile } from "../components/shared/files-block";
 import { IconChevRight, IconCopy, IconLock, IconPlay } from "../components/shared/icons";
 import { JsonViewer } from "../components/shared/json-viewer";
 import { Btn, Card, PageHeader, Pill } from "../components/shared/ui";
-import { getAuthHeaders, type RunEvent, useAgent, useAgentVersions } from "../lib/api-client";
-
-const LLM_KEY_STORAGE = "skrun-llm-key";
+import {
+  type AgentVersion,
+  getAuthHeaders,
+  type RunEvent,
+  USAGE_QUERY_KEY,
+  useAgent,
+  useAgentVersions,
+} from "../lib/api-client";
+import { useAuth, useLlmKey } from "../lib/auth";
+import { isRunGatedByVerification, verificationPolicyOf } from "../lib/verification";
 
 type PlaygroundStatus = "idle" | "running" | "completed" | "failed" | "error";
 
@@ -28,6 +36,47 @@ function mediaToAcceptAttr(media?: string): string | undefined {
   if (media === "document") return "application/pdf";
   if (media === "audio") return "audio/*";
   return undefined;
+}
+
+/**
+ * Whether this browser masks a text field's characters itself
+ * (`-webkit-text-security`). `CSS` or `CSS.supports` may be missing — a test
+ * DOM, an old browser —: then it does not.
+ */
+function canMaskTextField(): boolean {
+  return (
+    typeof CSS !== "undefined" &&
+    typeof CSS.supports === "function" &&
+    CSS.supports("-webkit-text-security", "disc")
+  );
+}
+
+/** The providers the model of the latest version names: its own, then its fallback's. */
+function modelProvidersOf(versions: AgentVersion[] | undefined): string[] {
+  const latest = versions && versions.length > 0 ? versions[versions.length - 1] : null;
+  const model = (latest?.config_snapshot as Record<string, unknown> | undefined)?.model as
+    | { provider?: string; fallback?: { provider?: string } }
+    | undefined;
+  const providers: string[] = [];
+  if (model?.provider) providers.push(model.provider);
+  if (model?.fallback?.provider && !providers.includes(model.fallback.provider)) {
+    providers.push(model.fallback.provider);
+  }
+  return providers;
+}
+
+/**
+ * Sets the field `name` of the input the JSON editor holds: defined, not
+ * assigned, so that an input named `__proto__` stays a field of the input,
+ * where an assignment would set the object's prototype and drop the field.
+ */
+function setInputField(input: Record<string, unknown>, name: string, value: unknown): void {
+  Object.defineProperty(input, name, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
 }
 
 async function uploadFileToApi(file: File): Promise<AttachedFile> {
@@ -52,6 +101,8 @@ export function PlaygroundPage() {
   const [searchParams] = useSearchParams();
   const { data: agent, isLoading: agentLoading, error: agentError } = useAgent(namespace, name);
   const { data: versions } = useAgentVersions(namespace, name);
+  const { user } = useAuth();
+  const queryClient = useQueryClient();
 
   const prefillInput = searchParams.get("input");
   const [input, setInput] = useState(() => {
@@ -65,7 +116,13 @@ export function PlaygroundPage() {
     return "{}";
   });
 
-  const [llmKey, setLlmKey] = useState(() => localStorage.getItem(LLM_KEY_STORAGE) ?? "");
+  // Held in app memory by the auth provider, never in Web Storage.
+  const { llmKey, setLlmKey } = useLlmKey();
+  // A password field makes the browser offer to save the key (Chrome does, and
+  // ignores autocomplete="off" for that offer): where the browser can mask a
+  // text field itself, the key field is one; elsewhere it stays a password
+  // field, never shown in clear.
+  const [maskedTextField] = useState(canMaskTextField);
   const [selectedProvider, setSelectedProvider] = useState<string>("");
   const [selectedVersion, setSelectedVersion] = useState<string>("");
   const [status, setStatus] = useState<PlaygroundStatus>("idle");
@@ -81,14 +138,11 @@ export function PlaygroundPage() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  // Persist LLM key
-  useEffect(() => {
-    if (llmKey) {
-      localStorage.setItem(LLM_KEY_STORAGE, llmKey);
-    }
-  }, [llmKey]);
+  // The providers the agent's model names — its own, then its fallback's —,
+  // from its latest version. Read before any early return: the run function
+  // below uses them, whichever render it was made in.
+  const agentProviders = useMemo(() => modelProvidersOf(versions), [versions]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: agentProviders[0] is computed from props, stable per render
   const runAgent = useCallback(async () => {
     let parsedInput: Record<string, unknown>;
     try {
@@ -180,7 +234,15 @@ export function PlaygroundPage() {
                 finalStatus = "completed";
               }
               if (data.type === "run_error") {
-                setError(data.error ?? "Agent execution failed");
+                // The event carries `error: { code, message }`; only a string is
+                // ever rendered, whatever shape arrives.
+                setError(
+                  typeof data.error?.message === "string"
+                    ? data.error.message
+                    : typeof data.error === "string"
+                      ? data.error
+                      : "Agent execution failed",
+                );
                 finalStatus = "failed";
               }
             } catch {
@@ -195,8 +257,21 @@ export function PlaygroundPage() {
       if (abort.signal.aborted) return;
       setError(err instanceof Error ? err.message : "Connection failed");
       setStatus("error");
+    } finally {
+      // However the run ended, the strip's figures may be out of date: the
+      // home page reads them again.
+      queryClient.invalidateQueries({ queryKey: USAGE_QUERY_KEY });
     }
-  }, [namespace, name, input, llmKey, selectedVersion, selectedProvider]);
+  }, [
+    namespace,
+    name,
+    input,
+    llmKey,
+    selectedVersion,
+    selectedProvider,
+    agentProviders,
+    queryClient,
+  ]);
 
   const stopAgent = useCallback(() => {
     abortRef.current?.abort();
@@ -223,7 +298,7 @@ export function PlaygroundPage() {
         } catch {
           /* ignore */
         }
-        obj[inputName] = maxCount === 1 ? wireValues[0] : wireValues;
+        setInputField(obj, inputName, maxCount === 1 ? wireValues[0] : wireValues);
         setInput(JSON.stringify(obj, null, 2));
       } catch (err) {
         setUploadError(err instanceof Error ? err.message : "Upload failed");
@@ -288,18 +363,12 @@ export function PlaygroundPage() {
   // Default to "verified" while versions still loading (undefined). The API
   // enforces the real gate; this prevents a flash of disabled UI on cold load.
   const selectedVersionVerified = resolvedVersionInfo ? resolvedVersionInfo.verified : true;
+  // Only the `admin` policy refuses an unverified version; under `owner` and
+  // `disabled` the server runs it, and the button lets it go.
+  const runGated = isRunGatedByVerification(verificationPolicyOf(user), selectedVersionVerified);
   const resolvedVersionLabel = resolvedVersionInfo?.version ?? selectedVersion ?? "latest";
   const agentInputs = (latestVersion?.config_snapshot as Record<string, unknown> | undefined)
     ?.inputs as AgentInput[] | undefined;
-  const modelConfig = (latestVersion?.config_snapshot as Record<string, unknown> | undefined)
-    ?.model as
-    | { provider?: string; name?: string; fallback?: { provider: string; name: string } }
-    | undefined;
-  const agentProviders: string[] = [];
-  if (modelConfig?.provider) agentProviders.push(modelConfig.provider);
-  if (modelConfig?.fallback?.provider && !agentProviders.includes(modelConfig.fallback.provider)) {
-    agentProviders.push(modelConfig.fallback.provider);
-  }
 
   return (
     <div>
@@ -340,7 +409,7 @@ export function PlaygroundPage() {
           variant="secondary"
           icon={<IconCopy />}
           onClick={() => {
-            const cmd = `curl -X POST ${window.location.origin}/api/agents/${namespace}/${name}/run -H "Authorization: Bearer YOUR_TOKEN" -H "Content-Type: application/json" -d '${JSON.stringify({ input: JSON.parse(input) })}'`;
+            const cmd = `curl -X POST ${window.location.origin}/api/agents/${namespace}/${name}/run -H "Authorization: Bearer YOUR_TOKEN" -H "Content-Type: application/json" -H "Accept: text/event-stream" -d '${JSON.stringify({ input: JSON.parse(input) })}'`;
             navigator.clipboard.writeText(cmd).catch(() => {});
           }}
         >
@@ -351,9 +420,10 @@ export function PlaygroundPage() {
       <div className="grid grid-cols-5 gap-5">
         {/* Left: form */}
         <div className="col-span-2 space-y-4">
-          {/* Unverified-version banner — informational; the real gate is the
-              POST /run 403 enforced server-side. */}
-          {!selectedVersionVerified && (
+          {/* Unverified-version banner, shown when the policy gates the run —
+              informational; the real gate is the POST /run 403 enforced
+              server-side. */}
+          {runGated && (
             <div
               role="status"
               className="rounded-md border border-amber-200 dark:border-amber-900/60 bg-amber-50 dark:bg-amber-950/30 px-3 py-2 text-[12px] text-amber-800 dark:text-amber-300"
@@ -469,7 +539,10 @@ export function PlaygroundPage() {
                   }
                   let currentVal = "";
                   try {
-                    currentVal = JSON.parse(input)[inp.name] ?? "";
+                    // The value the input carries as a field of its own, never
+                    // one every object inherits (`__proto__`, `toString`…).
+                    const parsed = JSON.parse(input);
+                    currentVal = Object.hasOwn(parsed, inp.name) ? (parsed[inp.name] ?? "") : "";
                   } catch {
                     /* ignore */
                   }
@@ -491,7 +564,7 @@ export function PlaygroundPage() {
                         onChange={(e) => {
                           try {
                             const obj = JSON.parse(input);
-                            obj[inp.name] = e.target.value;
+                            setInputField(obj, inp.name, e.target.value);
                             setInput(JSON.stringify(obj, null, 2));
                           } catch {
                             setInput(JSON.stringify({ [inp.name]: e.target.value }, null, 2));
@@ -563,15 +636,26 @@ export function PlaygroundPage() {
                 <IconLock className="w-3 h-3 text-gray-400" />
                 <input
                   id="llm-api-key"
-                  type="password"
+                  type={maskedTextField ? "text" : "password"}
                   value={llmKey}
                   onChange={(e) => setLlmKey(e.target.value)}
                   placeholder={`API key for ${selectedProvider || agentProviders[0] || "LLM provider"}`}
                   disabled={status === "running"}
-                  className="flex-1 bg-transparent outline-hidden text-[11.5px] font-mono text-gray-700 dark:text-gray-300 placeholder:text-gray-400 disabled:opacity-50"
+                  // No password manager offers to save or fill the key.
+                  autoComplete="off"
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  data-1p-ignore
+                  data-lpignore="true"
+                  data-bwignore
+                  data-form-type="other"
+                  className={`flex-1 bg-transparent outline-hidden text-[11.5px] font-mono text-gray-700 dark:text-gray-300 placeholder:text-gray-400 disabled:opacity-50${maskedTextField ? " [-webkit-text-security:disc]" : ""}`}
                 />
               </div>
-              <p className="text-[10.5px] text-gray-400 mt-1">Key stored in browser only.</p>
+              <p className="text-[10.5px] text-gray-400 mt-1">
+                Kept in this tab's memory only — gone on reload or sign-out.
+              </p>
             </div>
 
             {/* Version pin */}
@@ -639,18 +723,18 @@ export function PlaygroundPage() {
                     variant="primary"
                     icon={<IconPlay />}
                     onClick={runAgent}
-                    disabled={!selectedVersionVerified}
-                    aria-disabled={!selectedVersionVerified}
-                    aria-describedby={!selectedVersionVerified ? "run-disabled-reason" : undefined}
+                    disabled={runGated}
+                    aria-disabled={runGated}
+                    aria-describedby={runGated ? "run-disabled-reason" : undefined}
                     title={
-                      !selectedVersionVerified
+                      runGated
                         ? `Version ${resolvedVersionLabel} must be verified by an admin before it can run`
                         : undefined
                     }
                   >
                     Run agent
                   </Btn>
-                  {!selectedVersionVerified && (
+                  {runGated && (
                     <span id="run-disabled-reason" className="sr-only">
                       Version {resolvedVersionLabel} must be verified by an admin before it can run.
                     </span>
@@ -735,9 +819,12 @@ export function PlaygroundPage() {
             </div>
           )}
 
-          {/* Error */}
+          {/* Error — announced: a run's failure or refusal is read out as it appears */}
           {error && (
-            <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-3">
+            <div
+              role="alert"
+              className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-3"
+            >
               <p className="text-sm text-red-700 dark:text-red-400">{error}</p>
             </div>
           )}
@@ -752,7 +839,7 @@ export function PlaygroundPage() {
           )}
 
           {/* Files produced by the run (if any) */}
-          <FilesBlock files={runFiles} />
+          <FilesBlock files={runFiles} runId={runId} />
 
           {/* Run link */}
           {runId && status !== "running" && (
@@ -787,17 +874,38 @@ function getEventColor(type: string): string {
   return "text-gray-500";
 }
 
+/** One value of an event as text: a string as it is, anything else as JSON — never "[object Object]". */
+function eventValueText(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/** A run's error — `{ code, message }` on the wire — as `code: message`, else as its value. */
+function eventErrorText(error: unknown): string {
+  if (error !== null && typeof error === "object") {
+    const { code, message } = error as { code?: unknown; message?: unknown };
+    if (typeof message === "string") {
+      return typeof code === "string" ? `${code}: ${message}` : message;
+    }
+  }
+  return eventValueText(error);
+}
+
 function formatEventText(e: RunEvent): string {
   const d = e.data;
   if (d.type === "tool_call_error") {
-    const tool = d.tool ? String(d.tool) : "?";
-    const msg = d.message ? String(d.message) : "(no message)";
+    const tool = d.tool ? eventValueText(d.tool) : "?";
+    const msg = d.message ? eventValueText(d.message) : "(no message)";
     return `Tool error: ${tool} — ${msg}`;
   }
-  if (d.message) return String(d.message);
+  if (d.message) return eventValueText(d.message);
   if (d.type === "run_start") return `agent=${d.agent ?? ""}`;
   if (d.tool_name) return `${d.tool_name}(${d.args ? "..." : ""})`;
-  if (d.output) return String(d.output).slice(0, 120);
-  if (d.error) return String(d.error);
+  if (d.output) return eventValueText(d.output).slice(0, 120);
+  if (d.error) return eventErrorText(d.error);
   return JSON.stringify(d).slice(0, 120);
 }

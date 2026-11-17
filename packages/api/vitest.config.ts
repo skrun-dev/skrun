@@ -5,5 +5,6 @@ export default defineConfig({
     globals: true,
     passWithNoTests: true,
     setupFiles: ["./vitest.setup.ts"],
+    globalSetup: ["./vitest.global-setup.ts"],
   },
 });

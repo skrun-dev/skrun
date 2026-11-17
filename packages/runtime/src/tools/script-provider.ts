@@ -64,8 +64,12 @@ export class ScriptToolProvider implements ToolProvider {
     this.scanScripts();
 
     // Wire up deps resolver only when both bundleRoot + depsCache are
-    // provided. Either one alone is meaningless — leave deps disabled.
-    if (options.bundleRoot && options.depsCache) {
+    // provided — either one alone is meaningless — and the bundle has a
+    // scripts directory: the dependencies are the scripts', and a bundle
+    // without one has nothing to install them for. The local route makes no
+    // provider for such a bundle; the sandbox runner always makes one, and
+    // this keeps the two alike.
+    if (options.bundleRoot && options.depsCache && existsSync(scriptsDir)) {
       this.depsResolver = new ScriptDepsResolver(options.bundleRoot, options.depsCache);
     }
   }
@@ -81,6 +85,29 @@ export class ScriptToolProvider implements ToolProvider {
       this.depsResolved = this.depsResolver.resolve();
     }
     return this.depsResolved;
+  }
+
+  /**
+   * Resolve the bundle's dependencies now rather than at the first tool call.
+   *
+   * The sandbox runner calls this while it initialises, so that a long install
+   * runs while the caller is still waiting for a runner, and never inside a
+   * tool request, whose round-trip has a much shorter bound.
+   *
+   * Never rejects. It awaits the same memoized resolution `callTool` does, so a
+   * failed install is not retried: the first tool call still returns it, typed
+   * `[code] message`. `error` is that failure, for the caller's own log. `ms` is
+   * the time spent here — near zero when nothing is declared, when the
+   * dependencies are already resolved, or when no cache was provided.
+   */
+  async prepareDependencies(): Promise<{ ms: number; failed: boolean; error?: unknown }> {
+    const started = Date.now();
+    try {
+      await this.getDepsResolved();
+      return { ms: Date.now() - started, failed: false };
+    } catch (error) {
+      return { ms: Date.now() - started, failed: true, error };
+    }
   }
 
   private scanScripts(): void {
@@ -141,12 +168,15 @@ export class ScriptToolProvider implements ToolProvider {
     // Choose the spawn command + env. Three branches:
     //   - resolvedDeps null → legacy system runtime (back-compat).
     //   - resolvedDeps Python → venv-local python.
-    //   - resolvedDeps Node → system node + NODE_PATH=<depsPath>/node_modules.
+    //   - resolvedDeps Node → system node + NODE_PATH=<depsPath>/node_modules
+    //     (for require); ES modules find the same tree through the
+    //     <bundleRoot>/node_modules link the resolver made.
     const command = resolveCommand(script.ext, resolvedDeps);
     // `.ts` scripts run through Node's native type-stripping
-    // (`--experimental-strip-types`; native + default from Node 22.18/23.6 — the
-    // runner is pinned to Node 22.12 where the flag is still required). Without
-    // it, `node script.ts` fails with ERR_UNKNOWN_FILE_EXTENSION. `.js`/`.py`
+    // (`--experimental-strip-types`; native + default from Node 22.18/23.6, so on
+    // every Node this package's engines admit, the runner image's included, the
+    // flag is accepted without effect; below 22.18 it is required, and without it
+    // `node script.ts` fails with ERR_UNKNOWN_FILE_EXTENSION). `.js`/`.py`
     // take no extra flag. (The legacy `--input-type=module` flag is rejected by
     // Node v24 and was dropped.)
     const cmdArgs = buildInterpreterArgs(script.ext, script.path);
@@ -165,10 +195,13 @@ export class ScriptToolProvider implements ToolProvider {
           // registry's own process.cwd(). Falls back to the parent process's
           // cwd when bundleRoot is unset (legacy in-memory tests).
           cwd: this.bundleRoot,
-          // Explicit 5MB cap on combined stdout+stderr. Node's default is
-          // 1MB which silently buffer-overflows on large outputs; capping
-          // explicitly + surfacing ENOBUFS as a clear message avoids opaque
-          // "stdout maxBuffer length exceeded" errors leaking to the LLM.
+          // Explicit 5MB cap on each of stdout and stderr: Node applies
+          // `maxBuffer` to each stream on its own, so the two together may
+          // hold up to twice the cap, and the result — stdout on success,
+          // stderr on failure — stays within it. Node's default is 1MB, which
+          // silently buffer-overflows on large outputs; capping explicitly +
+          // surfacing ENOBUFS as a clear message avoids opaque "stdout
+          // maxBuffer length exceeded" errors leaking to the LLM.
           maxBuffer: SCRIPT_MAX_BUFFER_BYTES,
         },
         (error, stdout, stderr) => {
@@ -241,9 +274,10 @@ function resolveCommand(ext: string, resolvedDeps: ResolvedDeps | null): string 
  * Build the spawn arguments for a script (interpreter flags + the script path).
  *
  * `.ts` scripts are run through Node's native type-stripping
- * (`--experimental-strip-types`) — required on the runner's pinned Node 22.12,
- * a no-op default from Node 22.18/23.6. Without it, `node script.ts` fails with
- * `ERR_UNKNOWN_FILE_EXTENSION`. `.js`/`.py` take no extra flag. Erasable syntax
+ * (`--experimental-strip-types`) — the default from Node 22.18/23.6, so a no-op
+ * on every Node this package's engines admit, the runner image's included; it
+ * stays for an older Node, where it is required: without it, `node script.ts`
+ * fails with `ERR_UNKNOWN_FILE_EXTENSION`. `.js`/`.py` take no extra flag. Erasable syntax
  * only: `enum`/`namespace` throw a clear error (escalate to
  * `--experimental-transform-types` if a real need ever arises).
  */
@@ -306,7 +340,9 @@ function buildSpawnEnv(
   base.SKRUN_ALLOWED_HOSTS = allowedHosts.join(",");
   base.SKRUN_OUTPUT_DIR = outputDir;
 
-  // 3. NODE_PATH when Node deps were resolved.
+  // 3. NODE_PATH when Node deps were resolved. It reaches `require()` only —
+  //    ES-module imports ignore it and resolve through the bundle-root
+  //    `node_modules` link instead (see `linkNodeModules`).
   if (resolvedDeps?.ecosystem === "node") {
     base.NODE_PATH = join(resolvedDeps.depsPath, "node_modules");
   }

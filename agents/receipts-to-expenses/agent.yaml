@@ -1,6 +1,7 @@
 name: receipts-to-expenses
-version: 0.4.0
+version: 0.5.1
 
+# v0.5.0: Gemini 3.8 Flash, with Gemini 3.5 Flash-Lite as fallback.
 # v0.4.0: tool_choice: build_workbook so Gemini Flash always invokes the
 #         workbook builder (previously skipped, returning JSON only — vt29 live fail).
 # v0.3.0: deps now auto-resolved by Skrun runtime via requirements.txt.
@@ -11,10 +12,10 @@ version: 0.4.0
 
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
   fallback:
     provider: google
-    name: gemini-2.5-flash-lite
+    name: gemini-3.5-flash-lite
 
 tool_choice: build_workbook
 
@@ -122,10 +123,7 @@ outputs:
 environment:
   networking:
     allowed_hosts: []
-  filesystem: read-write
-  secrets: []
   timeout: 240s
-  sandbox: strict
 
 state:
   type: none

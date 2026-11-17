@@ -191,9 +191,12 @@ function ApiKeysSection() {
 }
 
 /**
- * Lifetimes offered at creation. 90 days is preselected — the same window the
- * login flow uses — and "No expiration" is a separate, explicit choice rather
- * than the default, so a key that never dies is something you asked for.
+ * Lifetimes offered at creation. 90 days is preselected: the default lifetime
+ * of the key the CLI's browser sign-in mints, copied here (a token given to
+ * `skrun login` mints none). An operator who gives that key another one
+ * (SKRUN_API_KEY_TTL_DAYS) leaves this preselection at 90, and no test
+ * compares the two. "No expiration" is a separate, explicit choice rather than
+ * the default, so a key that never dies is something you asked for.
  */
 const EXPIRY_CHOICES = [
   { value: "90", label: "90 days" },

@@ -9,6 +9,29 @@ const mocks = vi.hoisted(() => ({
   filesCreate: vi.fn(),
 }));
 
+// Every line the adapter's logger writes, kept with its arguments, at every level.
+const logs = vi.hoisted(() => ({ lines: [] as unknown[][] }));
+
+vi.mock("../../logger.js", () => ({
+  createLogger: (name: string) => {
+    const keep =
+      (level: string) =>
+      (...args: unknown[]) => {
+        logs.lines.push([name, level, ...args]);
+      };
+    const logger: Record<string, unknown> = {
+      trace: keep("trace"),
+      debug: keep("debug"),
+      info: keep("info"),
+      warn: keep("warn"),
+      error: keep("error"),
+      fatal: keep("fatal"),
+    };
+    logger.child = () => logger;
+    return logger;
+  },
+}));
+
 vi.mock("openai", () => ({
   // vitest 4: arrow functions in mockImplementation can't be called with `new`.
   // Use a regular function so `new OpenAI(...)` works as a constructor mock.
@@ -604,43 +627,212 @@ describe("OpenAICompatibleProvider — prompt caching (#68)", () => {
     expect(response.usage.promptTokens).toBe(1000); // gross = residual
   });
 
-  // VT-9: Mistral factory variant — skipCaching=true. NO cache primitives
-  // sent (no prompt_cache_key body, no x-grok-conv-id header) and NO cache
-  // fields extracted (cacheReadTokens undefined even if response somehow
-  // has them — defensive). Also emits a structured `cache_skipped` log;
-  // visible in test output but not asserted programmatically (peer-review
-  // N2: assertion on the log message string is brittle, the BEHAVIOR is
-  // the test).
-  it("VT-9: Mistral no-op — no cache primitives sent, no extraction", async () => {
+  it("Mistral: passes the run's cache key as prompt_cache_key and reads the cached tokens back, net of the prompt", async () => {
     mocks.chatCompletionsCreate.mockResolvedValue({
       choices: [{ message: { content: "ok" } }],
-      // Response shouldn't have cache fields for Mistral, but if it ever does
-      // (Mistral could add caching later without us bumping the flag), the
-      // skipCaching path defensively ignores them.
       usage: {
-        prompt_tokens: 1000,
-        completion_tokens: 50,
-        prompt_tokens_details: { cached_tokens: 500 }, // shouldn't affect output
+        prompt_tokens: 3000,
+        completion_tokens: 100,
+        prompt_tokens_details: { cached_tokens: 1024 },
       },
     });
+    logs.lines.length = 0;
     const provider = createMistralProvider("test-key");
     const response = await provider.call({
       ...makeRequest([{ kind: "text", text: "hi" }], "mistral-large-3"),
-      cacheKey: "should-be-ignored",
+      cacheKey: "c".repeat(64),
     });
 
-    // No cache primitives passed.
-    const callArgs = mocks.chatCompletionsCreate.mock.calls[0];
-    expect(callArgs[0].prompt_cache_key).toBeUndefined();
-    expect(callArgs[1]?.headers?.["x-grok-conv-id"]).toBeUndefined();
-
-    // Cache fields NOT extracted — even when response has them, skipCaching
-    // overrides extractCachedTokens. promptTokens stays GROSS (no subtraction).
+    const [body, options] = mocks.chatCompletionsCreate.mock.calls[0] ?? [];
+    expect(body.prompt_cache_key).toBe("c".repeat(64));
+    expect(options?.headers?.["x-grok-conv-id"]).toBeUndefined();
     expect(response.usage).toEqual({
-      promptTokens: 1000, // not normalized — Mistral has no caching, so no subtraction
-      completionTokens: 50,
+      promptTokens: 1976, // 3000 - 1024
+      completionTokens: 100,
+      cacheReadTokens: 1024,
     });
-    expect(response.usage.cacheReadTokens).toBeUndefined();
-    expect(response.usage.cacheWriteTokens).toBeUndefined();
+    // No line says caching is skipped.
+    expect(logs.lines.filter((line) => JSON.stringify(line).includes("cache_skipped"))).toEqual([]);
+  });
+
+  it("Mistral: with no cache key from the router, none is sent", async () => {
+    mocks.chatCompletionsCreate.mockResolvedValue(FAKE_RESPONSE);
+    const provider = createMistralProvider("test-key");
+    await provider.call(makeRequest([{ kind: "text", text: "hi" }], "mistral-large-3"));
+
+    expect(mocks.chatCompletionsCreate.mock.calls[0]?.[0].prompt_cache_key).toBeUndefined();
+  });
+});
+
+describe("OpenAICompatibleProvider — the native turn", () => {
+  beforeEach(() => {
+    mocks.chatCompletionsCreate.mockReset();
+  });
+
+  it("returns the assistant message restricted to what Chat Completions takes back: its text and its function calls, arguments in the model's string", async () => {
+    mocks.chatCompletionsCreate.mockResolvedValueOnce({
+      choices: [
+        {
+          index: 0,
+          finish_reason: "tool_calls",
+          message: {
+            role: "assistant",
+            content: "witness text",
+            refusal: null,
+            annotations: [],
+            audio: null,
+            reasoning: "witness reasoning field of a provider extension",
+            tool_calls: [
+              {
+                id: "call_witness",
+                type: "function",
+                function: { name: "lookup", arguments: '{"q": "x",}' },
+              },
+              { id: "call_custom", type: "custom", custom: { name: "grammar", input: "x" } },
+            ],
+          },
+        },
+      ],
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    });
+    const provider = createGroqProvider("test-key");
+
+    const response = await provider.call(makeRequest([{ kind: "text", text: "hi" }]));
+
+    expect(response.assistantTurn).toEqual({
+      provider: "groq",
+      content: {
+        role: "assistant",
+        content: "witness text",
+        tool_calls: [
+          {
+            id: "call_witness",
+            type: "function",
+            function: { name: "lookup", arguments: '{"q": "x",}' },
+          },
+        ],
+      },
+    });
+    // The arguments the model wrote do not parse: the call runs with none,
+    // and the turn still carries the string as written.
+    expect(response.toolCalls).toEqual([{ name: "lookup", args: {}, id: "call_witness" }]);
+    expect("reasoning_content" in (response.assistantTurn.content as object)).toBe(false);
+  });
+
+  it("keeps a reasoning_content the response carries, exactly as returned — and only a string", async () => {
+    const reasoning = "witness reasoning content, kept\nas returned ";
+    const answer = (message: Record<string, unknown>) => ({
+      choices: [{ index: 0, finish_reason: "stop", message }],
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    });
+    mocks.chatCompletionsCreate
+      .mockResolvedValueOnce(
+        answer({ role: "assistant", content: "witness text", reasoning_content: reasoning }),
+      )
+      .mockResolvedValueOnce(
+        answer({ role: "assistant", content: "witness text", reasoning_content: null }),
+      )
+      .mockResolvedValueOnce(
+        answer({ role: "assistant", content: "witness text", reasoning_content: { not: "text" } }),
+      );
+    const provider = new OpenAICompatibleProvider("openai", "k", "https://models.example/v1");
+
+    const kept = await provider.call(makeRequest([{ kind: "text", text: "hi" }]));
+    const nulled = await provider.call(makeRequest([{ kind: "text", text: "hi" }]));
+    const notText = await provider.call(makeRequest([{ kind: "text", text: "hi" }]));
+
+    expect(kept.assistantTurn.content).toEqual({
+      role: "assistant",
+      content: "witness text",
+      reasoning_content: reasoning,
+    });
+    expect((kept.assistantTurn.content as Record<string, unknown>).reasoning_content).toBe(
+      reasoning,
+    );
+    for (const response of [nulled, notText]) {
+      expect(response.assistantTurn.content).toEqual({
+        role: "assistant",
+        content: "witness text",
+      });
+      expect("reasoning_content" in (response.assistantTurn.content as object)).toBe(false);
+    }
+  });
+});
+
+describe("OpenAICompatibleProvider — the usage an endpoint reports", () => {
+  // An endpoint an agent declares (`model.base_url`) answers what it likes.
+  beforeEach(() => {
+    mocks.chatCompletionsCreate.mockReset();
+    logs.lines.length = 0;
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const answer = (usage: Record<string, unknown>) => ({
+    choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+    usage,
+  });
+  const usageLines = () =>
+    logs.lines.filter((line) => JSON.stringify(line).includes("llm_usage_invalid"));
+
+  it("a count that is not a whole number, not negative — a fraction, a negative, a string — counts nothing, and one line names its fields", async () => {
+    mocks.chatCompletionsCreate.mockResolvedValue(
+      answer({
+        prompt_tokens: 1.5,
+        completion_tokens: -3,
+        prompt_tokens_details: { cached_tokens: "7" },
+      }),
+    );
+    const provider = new OpenAICompatibleProvider("openai", "k", "https://models.example/v1");
+
+    const response = await provider.call(makeRequest([{ kind: "text", text: "hi" }]));
+
+    expect(response.usage).toEqual({ promptTokens: 0, completionTokens: 0 });
+    expect(usageLines()).toEqual([
+      [
+        "llm:openai",
+        "warn",
+        {
+          event: "llm_usage_invalid",
+          provider: "openai",
+          fields: ["prompt_tokens", "cached_tokens", "completion_tokens"],
+        },
+        "openai reported a usage that is not a token count; it counts nothing",
+      ],
+    ]);
+  });
+
+  it("a whole count, however large, is handed on as reported, with no line: the run's record bounds what it keeps", async () => {
+    mocks.chatCompletionsCreate.mockResolvedValue(
+      answer({
+        prompt_tokens: 3_000_000_010,
+        completion_tokens: 2 ** 31,
+        prompt_tokens_details: { cached_tokens: 3_000_000_000 },
+      }),
+    );
+    const provider = new OpenAICompatibleProvider("openai", "k", "https://models.example/v1");
+
+    const response = await provider.call(makeRequest([{ kind: "text", text: "hi" }]));
+
+    expect(response.usage).toEqual({
+      promptTokens: 10,
+      completionTokens: 2 ** 31,
+      cacheReadTokens: 3_000_000_000,
+    });
+    expect(usageLines()).toEqual([]);
+  });
+
+  it("no usage at all counts nothing, with no line", async () => {
+    mocks.chatCompletionsCreate.mockResolvedValue({
+      choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+    });
+    const provider = new OpenAICompatibleProvider("openai", "k", "https://models.example/v1");
+
+    const response = await provider.call(makeRequest([{ kind: "text", text: "hi" }]));
+
+    expect(response.usage).toEqual({ promptTokens: 0, completionTokens: 0 });
+    expect(usageLines()).toEqual([]);
   });
 });

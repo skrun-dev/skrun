@@ -8,8 +8,12 @@ import {
 } from "../../lib/api-client";
 import { Btn, Card } from "../shared/ui";
 
-/** Providers the runtime can instantiate (must match the API's attach validation). */
-const PROVIDERS = ["anthropic", "openai", "google", "mistral", "groq", "xai"] as const;
+/**
+ * The providers agent.yaml knows: the API derives this list from its schema to
+ * validate an attach; this package, which does not depend on the schema, writes
+ * it. A meta key serves only an agent that declares `model.base_url`.
+ */
+const PROVIDERS = ["anthropic", "openai", "google", "mistral", "groq", "xai", "meta"] as const;
 
 /**
  * Creator LLM key management for an agent (owner-only). Write-only: the plaintext

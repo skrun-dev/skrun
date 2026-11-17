@@ -7,6 +7,45 @@ import { Btn, Card, PageHeader, Pill, StatusPill } from "../components/shared/ui
 import { type RunEvent, useRun } from "../lib/api-client";
 import { formatUsd } from "../lib/format";
 
+/** Why Re-run is off for a run whose input was kept truncated. */
+const RERUN_TRUNCATED_HINT =
+  "This run's input was too large to keep — run it again from the playground or the API.";
+
+/**
+ * The size, in bytes, of a run's input or output that was too large to keep
+ * whole — read from the marker the server keeps in its place,
+ * `{ "_truncated": { "bytes", "preview" } }` — or null for one kept whole.
+ */
+function truncatedBytes(value: Record<string, unknown> | null): number | null {
+  if (value === null || Object.keys(value).length !== 1) return null;
+  const marker = value._truncated;
+  if (typeof marker !== "object" || marker === null) return null;
+  const { bytes, preview } = marker as Record<string, unknown>;
+  return typeof bytes === "number" && typeof preview === "string" ? bytes : null;
+}
+
+/** The size, in bytes, of a value's JSON text, counted in UTF-8 — as the server counts it. */
+function jsonBytes(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).length;
+}
+
+/** The suffix the server ends an error with when it keeps it cut: `… [truncated: N bytes]`. */
+const ERROR_TRUNCATED_SUFFIX = /… \[truncated: (\d+) bytes\]$/;
+
+/**
+ * The size, in bytes, of a run's error as the server received it: the size
+ * its suffix carries when the row kept it cut, else its own UTF-8 size.
+ */
+function errorSize(error: string): { bytes: number; truncated: boolean } {
+  const own = new TextEncoder().encode(error).length;
+  const suffix = ERROR_TRUNCATED_SUFFIX.exec(error);
+  const original = suffix ? Number(suffix[1]) : null;
+  // Cut only beyond what the row kept: an error that merely ends with those words is its own size.
+  return original !== null && original > own
+    ? { bytes: original, truncated: true }
+    : { bytes: own, truncated: false };
+}
+
 export function RunDetailPage() {
   const { id = "" } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -37,6 +76,10 @@ export function RunDetailPage() {
 
   const agentRef = run.agent_version?.includes("/") ? run.agent_version.split("@")[0] : null;
   const agentVersion = run.agent_version?.includes("@") ? run.agent_version.split("@")[1] : null;
+  const inputTruncatedBytes = truncatedBytes(run.input);
+  const inputTruncated = inputTruncatedBytes !== null;
+  const outputTruncatedBytes = truncatedBytes(run.output);
+  const shownError = run.status === "failed" && run.error ? errorSize(run.error) : null;
 
   const events: RunEvent[] = [];
   if (run.output && typeof run.output === "object" && "_events" in run.output) {
@@ -86,18 +129,33 @@ export function RunDetailPage() {
         }
         meta={<StatusPill status={run.status} />}
       >
-        {agentRef && (
-          <Btn
-            variant="secondary"
-            icon={<IconPlay />}
-            onClick={() => {
-              const inputEncoded = run.input ? encodeURIComponent(JSON.stringify(run.input)) : "";
-              navigate(`/agents/${agentRef}/run${inputEncoded ? `?input=${inputEncoded}` : ""}`);
-            }}
-          >
-            Re-run
-          </Btn>
-        )}
+        {agentRef &&
+          (inputTruncated ? (
+            // The run's input was too large to keep whole: re-running it from
+            // here would send the marker kept in its place.
+            <span title={RERUN_TRUNCATED_HINT} className="inline-flex">
+              <Btn
+                variant="secondary"
+                icon={<IconPlay />}
+                disabled
+                aria-label={`Re-run — ${RERUN_TRUNCATED_HINT}`}
+                className="opacity-50 cursor-not-allowed"
+              >
+                Re-run
+              </Btn>
+            </span>
+          ) : (
+            <Btn
+              variant="secondary"
+              icon={<IconPlay />}
+              onClick={() => {
+                const inputEncoded = run.input ? encodeURIComponent(JSON.stringify(run.input)) : "";
+                navigate(`/agents/${agentRef}/run${inputEncoded ? `?input=${inputEncoded}` : ""}`);
+              }}
+            >
+              Re-run
+            </Btn>
+          ))}
       </PageHeader>
 
       {/* Token strip */}
@@ -143,7 +201,7 @@ export function RunDetailPage() {
       {/* Files produced by the run (if any) */}
       {run.files && run.files.length > 0 && (
         <div className="mb-5">
-          <FilesBlock files={run.files as RunFile[]} />
+          <FilesBlock files={run.files as RunFile[]} runId={run.id} />
         </div>
       )}
 
@@ -153,7 +211,12 @@ export function RunDetailPage() {
           title="Input"
           action={
             <span className="text-[10px] font-mono text-gray-400">
-              {run.input ? `${JSON.stringify(run.input).length} B` : "—"}
+              {/* A truncated input: the size the server read, not the marker's. */}
+              {inputTruncated
+                ? `${inputTruncatedBytes} B, truncated`
+                : run.input
+                  ? `${jsonBytes(run.input)} B`
+                  : "—"}
             </span>
           }
           pad={false}
@@ -171,11 +234,14 @@ export function RunDetailPage() {
           title={run.status === "failed" ? "Error" : "Output"}
           action={
             <span className="text-[10px] font-mono text-gray-400">
-              {run.status === "failed" && run.error
-                ? `${run.error.length} B`
-                : run.output
-                  ? `${JSON.stringify(run.output).length} B`
-                  : "—"}
+              {/* The size the server received, in bytes — never a truncated marker's or a cut error's. */}
+              {shownError
+                ? `${shownError.bytes} B${shownError.truncated ? ", truncated" : ""}`
+                : outputTruncatedBytes !== null
+                  ? `${outputTruncatedBytes} B, truncated`
+                  : run.output
+                    ? `${jsonBytes(run.output)} B`
+                    : "—"}
             </span>
           }
           pad={false}

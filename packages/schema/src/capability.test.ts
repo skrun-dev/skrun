@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  acceptsTemperature,
   type CapabilityValidationOutcome,
   getModelCapabilities,
   MODEL_CAPABILITIES,
@@ -59,7 +60,7 @@ function makeAgentConfig(overrides: Partial<AgentConfig>): AgentConfig {
   return {
     name: "test-agent",
     version: "0.1.0",
-    model: { provider: "anthropic", name: "claude-3-7-sonnet" },
+    model: { provider: "anthropic", name: "claude-sonnet-5-5" },
     tools: [],
     mcp_servers: [],
     inputs: [{ name: "q", type: "string", required: true }],
@@ -73,39 +74,70 @@ function makeAgentConfig(overrides: Partial<AgentConfig>): AgentConfig {
 }
 
 describe("getModelCapabilities", () => {
-  it("returns the matrix entry for an exact match (claude-3-7-sonnet)", () => {
-    const caps = getModelCapabilities("anthropic", "claude-3-7-sonnet");
+  it("returns the matrix entry for an exact match (claude-sonnet-4-6)", () => {
+    const caps = getModelCapabilities("anthropic", "claude-sonnet-4-6");
     expect(caps).toEqual({
       image: true,
       document: true,
       audio: false,
       caching: true,
+      temperature: true,
     } satisfies ModelCapabilities);
   });
 
   it("returns capabilities for a versioned model name via longest-prefix match", () => {
-    const caps = getModelCapabilities("anthropic", "claude-3-7-sonnet-20250219");
-    expect(caps).toEqual({ image: true, document: true, audio: false, caching: true });
+    const caps = getModelCapabilities("anthropic", "claude-haiku-4-5-20251001");
+    expect(caps).toEqual({
+      image: true,
+      document: true,
+      audio: false,
+      caching: true,
+      temperature: true,
+    });
   });
 
   it("returns capabilities for Gemini (full multimodal)", () => {
     const caps = getModelCapabilities("google", "gemini-2.5-flash");
-    expect(caps).toEqual({ image: true, document: true, audio: true, caching: true });
+    expect(caps).toEqual({
+      image: true,
+      document: true,
+      audio: true,
+      caching: true,
+      temperature: true,
+    });
   });
 
-  it("returns audio-only for gpt-4o-audio-preview", () => {
-    const caps = getModelCapabilities("openai", "gpt-4o-audio-preview");
-    expect(caps).toEqual({ image: false, document: false, audio: true, caching: true });
+  it("returns audio-only for gpt-audio-1.5, with no caching (no cached-input rate)", () => {
+    const caps = getModelCapabilities("openai", "gpt-audio-1.5");
+    expect(caps).toEqual({
+      image: false,
+      document: false,
+      audio: true,
+      caching: false,
+      temperature: true,
+    });
   });
 
-  it("returns image-only for Mistral large-3 (caching=false: no native caching)", () => {
-    const caps = getModelCapabilities("mistral", "mistral-large-3");
-    expect(caps).toEqual({ image: true, document: false, audio: false, caching: false });
+  it("returns image-only for Mistral Large 3 by its dated id (caching=true: prompt_cache_key)", () => {
+    const caps = getModelCapabilities("mistral", "mistral-large-2512");
+    expect(caps).toEqual({
+      image: true,
+      document: false,
+      audio: false,
+      caching: true,
+      temperature: true,
+    });
   });
 
   it("returns image-only for xAI grok-4.3 (caching=true: implicit + x-grok-conv-id)", () => {
     const caps = getModelCapabilities("xai", "grok-4.3");
-    expect(caps).toEqual({ image: true, document: false, audio: false, caching: true });
+    expect(caps).toEqual({
+      image: true,
+      document: false,
+      audio: false,
+      caching: true,
+      temperature: true,
+    });
   });
 
   it("returns undefined for an unknown model (self-hosted bypass)", () => {
@@ -124,7 +156,7 @@ describe("getModelCapabilities", () => {
   });
 
   it("MODEL_CAPABILITIES is exposed as a readable matrix", () => {
-    expect(MODEL_CAPABILITIES.anthropic["claude-3-7-sonnet"]).toBeDefined();
+    expect(MODEL_CAPABILITIES.anthropic["claude-sonnet-5-5"]).toBeDefined();
     expect(MODEL_CAPABILITIES.google["gemini-2.5-flash"]).toBeDefined();
     expect(MODEL_CAPABILITIES.openai["gpt-4o-mini"]).toBeDefined();
   });
@@ -153,12 +185,12 @@ describe("getModelCapabilities", () => {
     ["anthropic", "claude-sonnet-4-6-20260301", "claude-sonnet-4-6"],
     ["anthropic", "claude-haiku-4-5-20251001", "claude-haiku-4-5"],
     ["openai", "gpt-5.5-2026-04-23", "gpt-5.5"],
-    ["openai", "gpt-audio-2025-08-28", "gpt-audio"],
+    ["openai", "gpt-4o-2024-08-06", "gpt-4o"],
     ["google", "gemini-3.1-pro-preview-002", "gemini-3.1-pro-preview"],
     ["google", "gemini-3-flash-preview-001", "gemini-3-flash-preview"],
-    ["mistral", "mistral-medium-3.5-2026-02", "mistral-medium-3.5"],
+    ["mistral", "mistral-medium-2604-01", "mistral-medium-2604"],
     ["xai", "grok-4.3-2026-04", "grok-4.3"],
-    ["xai", "grok-4.20-multi-agent-beta", "grok-4.20-multi-agent"],
+    ["anthropic", "claude-opus-4-5-20251101", "claude-opus-4-5"],
   ] as const)("snapshot %s/%s resolves to base %s", (provider, snapshotName, baseName) => {
     const snapCaps = getModelCapabilities(provider, snapshotName);
     const baseCaps = getModelCapabilities(provider, baseName);
@@ -182,6 +214,17 @@ describe("getModelCapabilities", () => {
     ["groq", "llama-guard-4-12b"], // deprecated 2026-02-10
     ["groq", "llama-3.2-90b-vision-preview"], // removed from Groq catalog 2026-05
     ["groq", "llama-3.2-11b-vision-preview"], // removed from Groq catalog 2026-05
+    // Retired, their row gone: no shorter key takes them either.
+    ["anthropic", "claude-opus-4-20250514"], // its family key, claude-opus-4, is gone
+    ["anthropic", "claude-3-7-sonnet-20250219"],
+    ["anthropic", "claude-3-5-sonnet-latest"],
+    ["google", "gemini-3.1-flash-lite-preview"],
+    ["openai", "o1"],
+    ["openai", "gpt-4-turbo"],
+    ["openai", "gpt-audio"], // not gpt-audio-1.5: no key extends into another
+    ["mistral", "mistral-large-3"], // a commercial name, not an API id
+    ["groq", "llama-3.3-70b-versatile"],
+    ["xai", "grok-4.1-fast"], // never an API id
   ] as const)("deprecated/phantom %s/%s returns undefined", (provider, name) => {
     expect(getModelCapabilities(provider, name)).toBeUndefined();
   });
@@ -209,33 +252,107 @@ describe("getModelCapabilities", () => {
     }
   });
 
-  // VT-1 (#68 prompt-caching) — Mistral entries are all caching=false (no
-  // native API as of May 2026). Locks in the data point — if Mistral ever
-  // adds caching, this test breaks and the developer must verify the new API
-  // shape before flipping the flag.
-  it("all Mistral entries have caching=false (verified May 2026)", () => {
-    for (const [modelName, caps] of Object.entries(MODEL_CAPABILITIES.mistral)) {
-      expect(caps.caching, `mistral/${modelName}`).toBe(false);
+  it("every MODEL_CAPABILITIES entry says whether the model accepts a temperature", () => {
+    for (const [provider, models] of Object.entries(MODEL_CAPABILITIES)) {
+      for (const [modelName, caps] of Object.entries(models)) {
+        expect(typeof caps.temperature, `${provider}/${modelName}.temperature`).toBe("boolean");
+      }
     }
   });
 
-  // VT-1 (#68 prompt-caching) — Groq caching is limited to `openai/gpt-oss-*`
-  // family (+ kimi-k2 once added to matrix). Llama / Qwen / compound = false.
-  // Locks in the docs-verified per-model split.
-  it("Groq caching is limited to openai/gpt-oss-* family", () => {
+  it("the models whose provider refuses or ignores a temperature are marked, the others accept one", () => {
+    const refusing = Object.entries(MODEL_CAPABILITIES).flatMap(([provider, models]) =>
+      Object.entries(models).flatMap(([name, caps]) =>
+        caps.temperature ? [] : [`${provider}/${name}`],
+      ),
+    );
+    expect(refusing.sort()).toEqual(
+      [
+        "anthropic/claude-opus-5-5",
+        "anthropic/claude-sonnet-5-5",
+        "anthropic/claude-fable-5-2",
+        "anthropic/claude-mythos-5-2",
+        "anthropic/claude-fable-5-1",
+        "anthropic/claude-mythos-5-1",
+        "anthropic/claude-fable-5",
+        "anthropic/claude-mythos-5",
+        "anthropic/claude-opus-5",
+        "anthropic/claude-sonnet-5",
+        "anthropic/claude-opus-4-8",
+        "anthropic/claude-opus-4-7",
+        "anthropic/claude-haiku-5-5",
+        "google/gemini-4-argon",
+        "google/gemini-3.8-flash",
+        "google/gemini-3.6-flash",
+        "openai/gpt-6.1-sol",
+        "openai/gpt-6.1-terra",
+        "openai/gpt-6-astra",
+        "openai/gpt-6-sol",
+        "openai/gpt-6-luna",
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-terra",
+        "openai/gpt-5.6-luna",
+        "openai/gpt-5.5",
+        "openai/gpt-5",
+        "openai/gpt-5-mini",
+        "openai/gpt-5-nano",
+      ].sort(),
+    );
+    // A dated id takes its base model's flag.
+    expect(getModelCapabilities("anthropic", "claude-opus-4-7-20260416")?.temperature).toBe(false);
+  });
+
+  it("the models that refuse a forced tool choice are marked false, and no row says true", () => {
+    const marked = Object.entries(MODEL_CAPABILITIES).flatMap(([provider, models]) =>
+      Object.entries(models).flatMap(([name, caps]) => {
+        if (!("forcedToolChoice" in caps)) return [];
+        expect(caps.forcedToolChoice, `${provider}/${name}`).toBe(false);
+        return [`${provider}/${name}`];
+      }),
+    );
+    // The six Claude models Anthropic's page on thinking names: they reject
+    // forced tool use on every request.
+    expect(marked.sort()).toEqual(
+      [
+        "anthropic/claude-opus-5-5",
+        "anthropic/claude-sonnet-5-5",
+        "anthropic/claude-fable-5-2",
+        "anthropic/claude-mythos-5-2",
+        "anthropic/claude-fable-5-1",
+        "anthropic/claude-mythos-5-1",
+      ].sort(),
+    );
+  });
+
+  // Claude Fable 5.2 and Mythos 5.2 extend claude-fable-5 and claude-mythos-5,
+  // which accept a forced tool choice: without rows of their own they would
+  // take those rows, and a forced choice would reach Anthropic, which answers
+  // 400 on every request.
+  it.each([
+    "claude-fable-5-2",
+    "claude-mythos-5-2",
+  ])("%s resolves to a row that refuses a forced tool choice", (model) => {
+    expect(getModelCapabilities("anthropic", model)?.forcedToolChoice).toBe(false);
+  });
+
+  // Mistral caches a repeated prefix on every model, and the adapter wires it
+  // (prompt_cache_key, cached_tokens): every Mistral entry says so.
+  it("all Mistral entries have caching=true", () => {
+    for (const [modelName, caps] of Object.entries(MODEL_CAPABILITIES.mistral)) {
+      expect(caps.caching, `mistral/${modelName}`).toBe(true);
+    }
+  });
+
+  // Groq caches its `openai/gpt-oss-*` family, listed by Groq's own ids: the
+  // only Groq models in the matrix, each caching=true.
+  it("Groq lists its openai/gpt-oss-* family by Groq's ids, each with caching", () => {
     const groq = MODEL_CAPABILITIES.groq;
-    // Supported (caching=true)
-    expect(groq["openai/gpt-oss-120b"]?.caching).toBe(true);
-    expect(groq["openai/gpt-oss-20b"]?.caching).toBe(true);
-    expect(groq["openai/gpt-oss-safeguard-20b"]?.caching).toBe(true);
-    // Unprefixed back-compat aliases also true
-    expect(groq["gpt-oss-120b"]?.caching).toBe(true);
-    expect(groq["gpt-oss-20b"]?.caching).toBe(true);
-    // Unsupported (caching=false)
-    expect(groq["llama-4-scout-17b-16e-instruct"]?.caching).toBe(false);
-    expect(groq["qwen/qwen3-32b"]?.caching).toBe(false);
-    expect(groq["llama-3.3-70b-versatile"]?.caching).toBe(false);
-    expect(groq["groq/compound"]?.caching).toBe(false);
+    expect(Object.keys(groq).sort()).toEqual(
+      ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "openai/gpt-oss-safeguard-20b"].sort(),
+    );
+    for (const [name, caps] of Object.entries(groq)) {
+      expect(caps.caching, `groq/${name}`).toBe(true);
+    }
   });
 
   // VT-3 (docs ↔ code parity) — every model in capability.ts must appear in
@@ -343,6 +460,40 @@ function parseDocsCacheColumn(): Map<string, boolean> {
   return result;
 }
 
+describe("acceptsTemperature", () => {
+  it.each([
+    ["anthropic", "claude-sonnet-4-6", true],
+    ["anthropic", "claude-opus-4-7-20260416", false],
+    ["google", "gemini-2.5-flash", true],
+    ["google", "gemini-3.8-flash", false],
+  ] as const)("a model the matrix lists takes its row's flag: %s/%s → %s", (provider, name, expected) => {
+    expect(acceptsTemperature(provider, name)).toBe(expected);
+    // Behind a declared base_url too: the row says what the model takes.
+    expect(acceptsTemperature(provider, name, "https://llm.example.test/v1")).toBe(expected);
+  });
+
+  it.each([
+    ["anthropic", "claude-unlisted-9", false],
+    ["google", "gemini-9.9-flash", false],
+    ["openai", "gpt-9-unlisted", false],
+    ["mistral", "mistral-unlisted-9", true],
+    ["groq", "groq-unlisted-9", true],
+    ["xai", "grok-unlisted-9", true],
+    ["meta", "llama-unlisted-9", true],
+  ] as const)("a model the matrix does not list, at its provider's own API, takes its provider's default: %s/%s → %s", (provider, name, expected) => {
+    expect(getModelCapabilities(provider, name)).toBeUndefined();
+    expect(acceptsTemperature(provider, name)).toBe(expected);
+  });
+
+  it.each([
+    ["anthropic", "llama3.1:8b"],
+    ["google", "gemma3:4b"],
+    ["openai", "qwen3:8b"],
+  ] as const)("a model the matrix does not list, behind a declared base_url, gets it whatever the provider: %s/%s", (provider, name) => {
+    expect(acceptsTemperature(provider, name, "http://localhost:11434/v1")).toBe(true);
+  });
+});
+
 describe("validateAgentCapabilities", () => {
   it("returns {ok:true} when no file inputs are declared", () => {
     const config = makeAgentConfig({});
@@ -352,7 +503,7 @@ describe("validateAgentCapabilities", () => {
 
   it("returns {ok:true} when primary model supports all declared file media", () => {
     const config = makeAgentConfig({
-      model: { provider: "anthropic", name: "claude-3-7-sonnet" },
+      model: { provider: "anthropic", name: "claude-sonnet-5-5" },
       inputs: [{ name: "photo", type: "file", media: "image", max_count: 1, required: true }],
     });
     const result = validateAgentCapabilities(config);
@@ -361,7 +512,7 @@ describe("validateAgentCapabilities", () => {
 
   it("returns {ok:false} when primary model lacks audio support (Claude + audio)", () => {
     const config = makeAgentConfig({
-      model: { provider: "anthropic", name: "claude-3-7-sonnet" },
+      model: { provider: "anthropic", name: "claude-sonnet-5-5" },
       inputs: [{ name: "voice", type: "file", media: "audio", max_count: 1, required: true }],
     });
     const result = validateAgentCapabilities(config);
@@ -370,7 +521,7 @@ describe("validateAgentCapabilities", () => {
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0]).toContain("voice");
       expect(result.errors[0]).toContain("audio");
-      expect(result.errors[0]).toContain("anthropic/claude-3-7-sonnet");
+      expect(result.errors[0]).toContain("anthropic/claude-sonnet-5-5");
       expect(result.errors[0]).toContain("primary");
     }
   });
@@ -380,7 +531,7 @@ describe("validateAgentCapabilities", () => {
       model: {
         provider: "google",
         name: "gemini-2.5-flash",
-        fallback: { provider: "anthropic", name: "claude-3-7-sonnet" },
+        fallback: { provider: "anthropic", name: "claude-sonnet-5-5" },
       },
       inputs: [{ name: "voice", type: "file", media: "audio", max_count: 1, required: true }],
     });
@@ -389,7 +540,7 @@ describe("validateAgentCapabilities", () => {
     if (!result.ok) {
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0]).toContain("fallback");
-      expect(result.errors[0]).toContain("anthropic/claude-3-7-sonnet");
+      expect(result.errors[0]).toContain("anthropic/claude-sonnet-5-5");
     }
   });
 
@@ -397,8 +548,8 @@ describe("validateAgentCapabilities", () => {
     const config = makeAgentConfig({
       model: {
         provider: "mistral",
-        name: "mistral-large-3",
-        fallback: { provider: "groq", name: "llama-4-scout-17b-16e-instruct" },
+        name: "mistral-large-2512",
+        fallback: { provider: "groq", name: "openai/gpt-oss-120b" },
       },
       inputs: [{ name: "doc", type: "file", media: "document", max_count: 1, required: true }],
     });

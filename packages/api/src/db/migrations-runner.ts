@@ -1,6 +1,5 @@
 /**
- * Migration applicator — auto-applies SQL migrations on api-server boot
- * (#007 spec §Approach 4, Phase 2 of plan).
+ * Migration applicator — auto-applies SQL migrations on api-server boot.
  *
  * Concurrency: takes a Postgres advisory lock (`pg_advisory_lock(<id>)`)
  * BEFORE the `CREATE TABLE IF NOT EXISTS _skrun_migrations` + apply loop.
@@ -30,7 +29,7 @@
 
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Pool, PoolClient } from "pg";
+import { Client, type ClientBase, type Pool } from "pg";
 
 export interface Migration {
   /** File basename, e.g. `001_initial_schema.sql`. Acts as the primary key
@@ -240,7 +239,7 @@ export function lintAllMigrations(migrations: Migration[]): void {
  * api-server instances connecting to the SAME database serialise here.
  * Separate databases (e.g. dev vs prod) lock independently.
  */
-const MIGRATION_LOCK_ID = 5478913219876541n; // = hashtext('skrun_migrations') as bigint
+export const MIGRATION_LOCK_ID = 5478913219876541n; // = hashtext('skrun_migrations') as bigint
 
 export interface RunResult {
   /** Number of migrations whose SQL was executed in this boot. */
@@ -258,11 +257,11 @@ export interface RunResult {
  * Postgres connection that runs the migrations — using a different
  * connection from the pool would defeat the lock.
  */
-async function acquireMigrationLock(client: PoolClient): Promise<void> {
+async function acquireMigrationLock(client: ClientBase): Promise<void> {
   await client.query("SELECT pg_advisory_lock($1)", [MIGRATION_LOCK_ID.toString()]);
 }
 
-async function releaseMigrationLock(client: PoolClient): Promise<void> {
+async function releaseMigrationLock(client: ClientBase): Promise<void> {
   await client.query("SELECT pg_advisory_unlock($1)", [MIGRATION_LOCK_ID.toString()]);
 }
 
@@ -271,7 +270,7 @@ async function releaseMigrationLock(client: PoolClient): Promise<void> {
  * the table is present, false otherwise. Used by the cloud-backfill
  * probe (`agents` present + `_skrun_migrations` absent → backfill).
  */
-async function relationExists(client: PoolClient, relname: string): Promise<boolean> {
+async function relationExists(client: ClientBase, relname: string): Promise<boolean> {
   const result = await client.query<{ exists: boolean }>(
     "SELECT to_regclass($1) IS NOT NULL AS exists",
     [`public.${relname}`],
@@ -281,10 +280,11 @@ async function relationExists(client: PoolClient, relname: string): Promise<bool
 
 /**
  * Apply all pending migrations against the connected database. The
- * caller passes a `pg.Pool`; this function checks out a single client,
- * runs the entire migration set under an advisory lock, and returns
- * counts. Idempotent: subsequent calls are no-ops once everything has
- * been applied.
+ * caller passes a `pg.Pool`; this function opens a connection of its own
+ * from the pool's configuration — outside the pool and its bounds —,
+ * runs the entire migration set under an advisory lock, closes the
+ * connection, and returns counts. Idempotent: subsequent calls are
+ * no-ops once everything has been applied.
  *
  * Lint runs BEFORE any DDL — a bad migration file causes the boot to
  * fail loud without partial application.
@@ -307,12 +307,31 @@ export async function runMigrations(pool: Pool, migrationsDir: string): Promise<
   const migrations = loadMigrationFiles(migrationsDir);
   lintAllMigrations(migrations); // fail loud before any DDL
 
-  const client = await pool.connect();
+  // A connection of their own, outside the pool: the pool may bound each
+  // statement it sends, and a migration — or the wait for another instance's
+  // lock — may rightly run longer. Opened from the pool's configuration
+  // without its client timer (`query_timeout`); the password, which the pool
+  // keeps out of its enumerable options, read apart. The pool's `onConnect`,
+  // which sets the bounds of each of its connections, is a pool option: a
+  // client never runs it.
+  const { query_timeout: _clientTimer, ...options } = pool.options;
+  const client = new Client({ ...options, password: pool.options.password });
+  await client.connect();
+  // A session the server ends while the migrations hold this connection
+  // arrives as an error event of the client, outside any query's answer —
+  // with nobody listening, an uncaught exception, the process's end. The
+  // statement in flight, or the next one, fails with the session's end, and
+  // the run with it; the connection is closed below either way.
+  const onLost = () => {};
+  client.on("error", onLost);
   let applied = 0;
   let backfilled = 0;
   let skipped = 0;
 
   try {
+    // No bound on this connection's statements — a host's own default for
+    // its role included.
+    await client.query("SET statement_timeout = 0");
     await acquireMigrationLock(client);
 
     // Cloud backfill probe: agents EXISTS + _skrun_migrations ABSENT
@@ -359,7 +378,10 @@ export async function runMigrations(pool: Pool, migrationsDir: string): Promise<
         await client.query("COMMIT");
         applied += 1;
       } catch (err) {
-        await client.query("ROLLBACK");
+        // A session the server ended under the migration fails its ROLLBACK
+        // too: the error the run gives is the migration's, never the
+        // ROLLBACK's — the transaction goes with the session either way.
+        await client.query("ROLLBACK").catch(() => {});
         throw new Error(
           `Migration ${m.name} failed: ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -369,9 +391,10 @@ export async function runMigrations(pool: Pool, migrationsDir: string): Promise<
     try {
       await releaseMigrationLock(client);
     } catch {
-      // Best-effort; pool client release below will close the conn anyway.
+      // Best-effort; closing the connection below lets the lock go anyway.
     }
-    client.release();
+    await client.end();
+    client.off("error", onLost);
   }
 
   return { applied, backfilled, skipped };

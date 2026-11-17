@@ -10,7 +10,7 @@ vi.mock("@skrun-dev/runtime", async (importOriginal) => {
   return { ...actual, safeFetch: vi.fn() };
 });
 
-import { safeFetch } from "@skrun-dev/runtime";
+import { type Logger, safeFetch } from "@skrun-dev/runtime";
 import { deliverWebhook } from "./webhook.js";
 
 const safeFetchMock = vi.mocked(safeFetch);
@@ -127,5 +127,89 @@ describe("deliverWebhook", () => {
       if (previousEnv !== undefined) process.env.WEBHOOK_SIGNING_KEY = previousEnv;
       else delete process.env.WEBHOOK_SIGNING_KEY;
     }
+  });
+});
+
+// A webhook URL can carry its secret in its path (Slack and Discord do) or in
+// its query: a log line names the webhook by its origin, never by the URL.
+describe("deliverWebhook — what its log lines say about the webhook", () => {
+  const HOOK = "https://hooks.example.test/services/T/B/SECRET";
+  const ORIGIN = "https://hooks.example.test";
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    safeFetchMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A logger that keeps every call, in order, with its level. */
+  function recordingLogger(): { logger: Logger; lines: Array<[string, ...unknown[]]> } {
+    const lines: Array<[string, ...unknown[]]> = [];
+    const record =
+      (level: string) =>
+      (...args: unknown[]) => {
+        lines.push([level, ...args]);
+      };
+    const logger = {
+      debug: record("debug"),
+      info: record("info"),
+      warn: record("warn"),
+      error: record("error"),
+    } as unknown as Logger;
+    return { logger, lines };
+  }
+
+  /** Every attempt fails; the three waits between them run out. */
+  async function deliverUntilExhausted(url: string, logger: Logger): Promise<void> {
+    const promise = deliverWebhook(url, { run_id: "abc" }, "key", logger);
+    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(4000);
+    await vi.advanceTimersByTimeAsync(16000);
+    await promise;
+  }
+
+  it("writes the origin alone, whether an attempt fails on the network or on its status", async () => {
+    safeFetchMock
+      .mockRejectedValueOnce(
+        Object.assign(new Error(`connect ECONNREFUSED ${HOOK}`), { code: "ECONNREFUSED" }),
+      )
+      .mockResolvedValue({ ok: false, status: 500 } as never);
+    const { logger, lines } = recordingLogger();
+
+    await deliverUntilExhausted(HOOK, logger);
+
+    expect(JSON.stringify(lines)).not.toContain("SECRET");
+    expect(lines.map(([level, fields]) => [level, fields])).toEqual([
+      [
+        "warn",
+        {
+          event: "webhook_retry",
+          url: ORIGIN,
+          attempt: 1,
+          maxAttempts: 4,
+          error_name: "Error",
+          error_code: "ECONNREFUSED",
+        },
+      ],
+      ["warn", { event: "webhook_retry", url: ORIGIN, attempt: 2, maxAttempts: 4, status: 500 }],
+      ["warn", { event: "webhook_retry", url: ORIGIN, attempt: 3, maxAttempts: 4, status: 500 }],
+      ["warn", { event: "webhook_retry", url: ORIGIN, attempt: 4, maxAttempts: 4, status: 500 }],
+      ["error", { event: "webhook_exhausted", url: ORIGIN, attempts: 4 }],
+    ]);
+  });
+
+  it("writes no part of a URL that does not parse", async () => {
+    safeFetchMock.mockRejectedValue(new TypeError("Invalid URL"));
+    const { logger, lines } = recordingLogger();
+
+    await deliverUntilExhausted("hooks.example.test/services/T/B/SECRET", logger);
+
+    expect(JSON.stringify(lines)).not.toContain("SECRET");
+    expect(lines.map(([, fields]) => (fields as { url?: unknown }).url)).toEqual(
+      Array(5).fill("(unparseable webhook URL, not logged)"),
+    );
   });
 });

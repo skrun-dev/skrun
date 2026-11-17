@@ -1,8 +1,9 @@
 import { screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
-import { Route, Routes } from "react-router-dom";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { Route, Routes, useLocation } from "react-router-dom";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { renderWithProviders } from "../test-utils";
 import { RunDetailPage } from "./run-detail";
 
@@ -134,6 +135,8 @@ describe("RunDetailPage", () => {
 
   // ── Bug D: FilesBlock wiring ────────────────────────────────────────
 
+  // The server stores a run's files as names and sizes only — no URL, no id —
+  // and GET /api/runs/:id returns them as stored.
   it("renders the Files block when the run produced files", async () => {
     server.use(
       http.get("/api/runs/run-with-files", () =>
@@ -141,8 +144,8 @@ describe("RunDetailPage", () => {
           ...mockRun,
           id: "run-with-files",
           files: [
-            { name: "report.pdf", size: 8192, file_id: "fil_abc123" },
-            { name: "summary.csv", size: 512, file_id: "fil_def456" },
+            { name: "report.pdf", size: 8192 },
+            { name: "summary.csv", size: 512 },
           ],
         }),
       ),
@@ -153,6 +156,57 @@ describe("RunDetailPage", () => {
       expect(screen.getByText("report.pdf")).toBeInTheDocument();
       expect(screen.getByText("summary.csv")).toBeInTheDocument();
     });
+  });
+
+  it("downloads a file of the run through a fresh link, navigating to a presigned one", async () => {
+    const presigned =
+      "https://objects.example/bucket/_runs/run-with-files/outputs/report.pdf?sig=x";
+    let asked: string | null = null;
+    server.use(
+      http.get("/api/runs/run-with-files", () =>
+        HttpResponse.json({
+          ...mockRun,
+          id: "run-with-files",
+          files: [{ name: "report.pdf", size: 8192 }],
+        }),
+      ),
+      http.get("/api/runs/:run_id/files/:filename/link", ({ request }) => {
+        asked = new URL(request.url).pathname;
+        return HttpResponse.json({ url: presigned, expires_at: "2026-10-01T12:15:00.000Z" });
+      }),
+      // Answered, so that a page which did fetch the store fails on the origin
+      // assertion below, never on a request leaving the test.
+      http.get("https://objects.example/*", () => new HttpResponse("%PDF")),
+    );
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const clicks: string[] = [];
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      clicks.push(this.href);
+    });
+    const user = userEvent.setup();
+
+    try {
+      renderRunDetail("run-with-files");
+      await user.click(await screen.findByRole("button", { name: /Download/i }));
+
+      // Settled: either the browser was sent somewhere, or an error is shown.
+      await waitFor(() =>
+        expect(clicks.length + screen.queryAllByRole("alert").length).toBeGreaterThan(0),
+      );
+      expect(screen.queryByRole("alert")?.textContent ?? null).toBeNull();
+      const fetched = fetchSpy.mock.calls.map(
+        ([input]) =>
+          new URL(String(input instanceof Request ? input.url : input), window.location.href),
+      );
+      expect(fetched.filter((url) => url.origin !== window.location.origin)).toEqual([]);
+      expect(asked).toBe("/api/runs/run-with-files/files/report.pdf/link");
+      expect(clicks).toEqual([presigned]);
+    } finally {
+      clickSpy.mockRestore();
+      fetchSpy.mockRestore();
+    }
   });
 
   it("hides the Files block when the run produced no files", async () => {
@@ -194,6 +248,170 @@ describe("RunDetailPage", () => {
     await waitFor(() => {
       expect(screen.getByText(/Tool error: fetch_data — Connection refused/)).toBeInTheDocument();
       expect(screen.getByText(/LLM still received this; run continues/)).toBeInTheDocument();
+    });
+  });
+
+  // ── The Input card's size ───────────────────────────────────────────
+
+  // On an input kept whole, the card gives the size of its JSON text, in UTF-8
+  // bytes — as the server counts it; on the marker kept in place of one too
+  // large, the size the server read — never the marker's own — and that it was
+  // truncated.
+  describe("the Input card's size", () => {
+    const MARKER = { _truncated: { bytes: 16416, preview: '{"topic":"AI agen' } };
+
+    it("on an input kept truncated, is the original input's size in bytes, said truncated", async () => {
+      server.use(
+        http.get("/api/runs/run-truncated-size", () =>
+          HttpResponse.json({ ...mockRun, id: "run-truncated-size", input: MARKER }),
+        ),
+      );
+      renderRunDetail("run-truncated-size");
+
+      expect(await screen.findByText("16416 B, truncated")).toBeInTheDocument();
+      expect(screen.queryByText(`${JSON.stringify(MARKER).length} B`)).not.toBeInTheDocument();
+    });
+
+    it("on an input kept whole, is the size of its JSON text in bytes, with no word of truncation", async () => {
+      renderRunDetail("run-abc-123-def-456");
+
+      expect(
+        await screen.findByText(
+          `${new TextEncoder().encode(JSON.stringify(mockRun.input)).length} B`,
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/truncated/)).not.toBeInTheDocument();
+    });
+
+    it("on an input kept whole that is not ASCII, is its size in bytes, not in characters", async () => {
+      // {"topic":"café"}: 16 characters, 17 bytes — the "é" takes two.
+      server.use(
+        http.get("/api/runs/run-input-utf8", () =>
+          HttpResponse.json({ ...mockRun, id: "run-input-utf8", input: { topic: "café" } }),
+        ),
+      );
+      renderRunDetail("run-input-utf8");
+
+      expect(await screen.findByText("17 B")).toBeInTheDocument();
+      expect(screen.queryByText("16 B")).not.toBeInTheDocument();
+    });
+  });
+
+  // ── The Output and Error cards' size ────────────────────────────────
+
+  // The same for the second card: an output kept truncated gives the size the
+  // server read, said truncated; an error, its size in bytes — the original
+  // size its suffix carries when the row kept it cut.
+  describe("the Output and Error cards' size", () => {
+    function renderWith(runId: string, fields: Record<string, unknown>) {
+      server.use(
+        http.get(`/api/runs/${runId}`, () =>
+          HttpResponse.json({ ...mockRun, id: runId, ...fields }),
+        ),
+      );
+      renderRunDetail(runId);
+    }
+
+    it("on an output kept truncated, is the original output's size in bytes, said truncated", async () => {
+      const marker = { _truncated: { bytes: 70000, preview: '{"result":"Dra' } };
+      renderWith("run-truncated-output", { output: marker });
+
+      expect(await screen.findByText("70000 B, truncated")).toBeInTheDocument();
+      expect(screen.queryByText(`${JSON.stringify(marker).length} B`)).not.toBeInTheDocument();
+    });
+
+    it("on an error kept whole, is its size in bytes, not in characters", async () => {
+      // 17 characters, 18 bytes: the "é" takes two.
+      renderWith("run-error-whole", { status: "failed", output: null, error: "Tool failed: café" });
+
+      expect(await screen.findByText("18 B")).toBeInTheDocument();
+      expect(screen.queryByText("17 B")).not.toBeInTheDocument();
+      expect(screen.queryByText(/B, truncated/)).not.toBeInTheDocument();
+    });
+
+    it("on an output kept whole that is not ASCII, is its size in bytes, not in characters", async () => {
+      // {"result":"€"}: 14 characters, 16 bytes — the "€" takes three.
+      renderWith("run-output-utf8", { output: { result: "€" } });
+
+      expect(await screen.findByText("16 B")).toBeInTheDocument();
+      expect(screen.queryByText("14 B")).not.toBeInTheDocument();
+      expect(screen.queryByText(/B, truncated/)).not.toBeInTheDocument();
+    });
+
+    it("on an error kept whole that merely ends with the suffix's words, its N no larger than itself, is its own size, not truncated", async () => {
+      // 34 bytes, its suffix saying 9: not a cut error — the row kept it whole.
+      const error = "Tool said … [truncated: 9 bytes]";
+      renderWith("run-error-suffix-words", { status: "failed", output: null, error });
+      const own = new TextEncoder().encode(error).length;
+
+      expect(await screen.findByText(`${own} B`)).toBeInTheDocument();
+      expect(screen.queryByText("9 B, truncated")).not.toBeInTheDocument();
+      expect(screen.queryByText(/B, truncated/)).not.toBeInTheDocument();
+    });
+
+    it("on an error kept cut, is the original error's size its suffix carries, said truncated", async () => {
+      // 66 characters, 68 bytes as kept; 20000 bytes as received.
+      const error = `${"x".repeat(40)}… [truncated: 20000 bytes]`;
+      renderWith("run-error-cut", { status: "failed", output: null, error });
+
+      expect(await screen.findByText("20000 B, truncated")).toBeInTheDocument();
+      expect(screen.queryByText("66 B")).not.toBeInTheDocument();
+      expect(screen.queryByText("68 B")).not.toBeInTheDocument();
+    });
+  });
+
+  // ── Re-run and an input kept truncated ──────────────────────────────
+
+  // The server keeps a run's input whole up to a size, and a marker in its
+  // place beyond: re-running from the marker would send the marker.
+  describe("Re-run", () => {
+    const HINT =
+      "This run's input was too large to keep — run it again from the playground or the API.";
+
+    /** The run page, and a stand-in for the playground that shows the input it was sent. */
+    function renderWithPlayground(runId: string) {
+      function Playground() {
+        const { search } = useLocation();
+        return <p>playground {new URLSearchParams(search).get("input")}</p>;
+      }
+      return renderWithProviders(
+        <Routes>
+          <Route path="/runs/:id" element={<RunDetailPage />} />
+          <Route path="/agents/:namespace/:name/run" element={<Playground />} />
+        </Routes>,
+        { route: `/runs/${runId}` },
+      );
+    }
+
+    it("is off on a run whose input was kept truncated, and says why", async () => {
+      server.use(
+        http.get("/api/runs/run-truncated-input", () =>
+          HttpResponse.json({
+            ...mockRun,
+            id: "run-truncated-input",
+            input: { _truncated: { bytes: 16416, preview: '{"topic":"AI agen' } },
+          }),
+        ),
+      );
+      const user = userEvent.setup();
+      renderWithPlayground("run-truncated-input");
+
+      const button = await screen.findByRole("button", { name: /Re-run/ });
+      expect(button).toBeDisabled();
+      expect(screen.getByTitle(HINT)).toContainElement(button);
+      await user.click(button);
+      expect(screen.queryByText(/^playground/)).not.toBeInTheDocument();
+    });
+
+    it("is on for a run whose input was kept whole, and sends that input to the playground", async () => {
+      const user = userEvent.setup();
+      renderWithPlayground("run-abc-123-def-456");
+
+      const button = await screen.findByRole("button", { name: "Re-run" });
+      expect(button).toBeEnabled();
+      expect(screen.queryByTitle(HINT)).not.toBeInTheDocument();
+      await user.click(button);
+      expect(await screen.findByText('playground {"topic":"AI agents"}')).toBeInTheDocument();
     });
   });
 });

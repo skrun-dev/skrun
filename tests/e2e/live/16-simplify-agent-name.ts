@@ -3,24 +3,25 @@
  *
  * VT-9: push slug-only agent → registry stores (namespace, name) correctly,
  *       no drift between bundle yaml and registry identity.
- * VT-14: stateful kv-mode run → state row in agent_state is keyed by
- *        `${namespace}/${slug}` (proves the multi-tenant wiring fix).
- * VT-15: DB defensive — pre-flight asserts no legacy <ns>/<slug> form
- *        survived in `agents.name`, and any `agent_state.agent_name` row
- *        carries the namespaced prefix.
+ * State, per caller: the fixture keeps one notebook per caller
+ *        (`scope: per_caller`). A dev-token run writes under the account's
+ *        partition (`account:<id>`), and deleting the agent deletes every
+ *        notebook it had — read in the registry's own database.
+ * Database pre-flight: no legacy <ns>/<slug> form survived in `agents.name`,
+ *        and every state row names an agent that exists.
  * Also: a CLI-level rejection check that `skrun build` fails fast on a
  * legacy-form yaml with the new schema error message.
  *
  * Self-bootstrapping: pushes its own fixture under stable version 9.16.1
- * and DELETEs at the end. Does not depend on Task 7.1 wipe script.
+ * and DELETEs at the end. Does not depend on the demo wipe script.
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import Database from "better-sqlite3";
-import { CLI, REGISTRY, ROOT, results, skrun, TOKEN } from "./_ctx.js";
+import { CLI, cliEnv, pushFixture, REGISTRY, results, skrun, TOKEN } from "./_ctx.js";
+import { openRegistryDb, queryFailure } from "./registry-db.js";
 
 const NS = "dev";
 const AGENT = "simplify-name-live";
@@ -42,20 +43,22 @@ async function verifyVersion(version: string): Promise<Response> {
   });
 }
 
-async function deleteAgent(): Promise<void> {
-  await fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}`, {
+/** DELETE the agent; resolves to the HTTP status (204 when it was deleted). */
+async function deleteAgent(): Promise<number> {
+  const res = await fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}`, {
     method: "DELETE",
     headers: { Authorization: `Bearer ${TOKEN}` },
   });
+  return res.status;
 }
 
-function buildAndPush(version: string): string {
+async function buildAndPush(version: string): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), `skrun-live-16-${version}-`));
   writeFileSync(
     join(dir, "SKILL.md"),
     `---
 name: ${AGENT}
-description: Phase 16 live fixture — minimal stateful agent used by tests/e2e/live/16-simplify-agent-name.ts to assert post-#84 slug-only push, no bundle↔registry drift, and namespace-scoped agent_state keys. Not for end-user consumption.
+description: Phase 16 live fixture — minimal stateful agent used by tests/e2e/live/16-simplify-agent-name.ts to assert slug-only push, no bundle↔registry drift, and one state notebook per caller. Not for end-user consumption.
 ---
 
 # ${AGENT}
@@ -69,9 +72,10 @@ Reply with the literal string "ok".
 version: ${version}
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
 state:
   type: kv
+  scope: per_caller
   ttl: 1d
 inputs:
   - name: task
@@ -83,27 +87,31 @@ outputs:
 `,
   );
   skrun(["build"], dir);
-  try {
-    skrun(["push"], dir);
-  } catch {
-    // 409 if the version was already pushed in a prior run — proceed.
-  }
+  await pushFixture(dir);
   return dir;
 }
 
-/**
- * Open the local SQLite DB read-only. Returns null if the DB doesn't exist
- * (e.g., cloud mode where the registry is backed by Postgres). Only the
- * direct-DB checks VT-15a/b (agents.name has no slash, agent_state.agent_name
- * carries its namespace prefix) use this — they are violation-ABSENCE
- * assertions with no clean API equivalent (agent_state has no public route),
- * so they skip cleanly off the local backend and a stale skrun.db can't
- * false-fail them. VT-9a (a presence check) was migrated to the API instead.
- */
-function openLocalDb(): Database.Database | null {
-  const dbFile = join(ROOT, "skrun.db");
-  if (!existsSync(dbFile)) return null;
-  return new Database(dbFile, { readonly: true });
+/** The id of the dev-token's account, as the registry knows it. */
+async function devAccountId(): Promise<string | null> {
+  const res = await fetch(`${REGISTRY}/api/me`, {
+    headers: { Authorization: `Bearer ${TOKEN}` },
+  });
+  if (!res.ok) return null;
+  const me = (await res.json()) as { id?: string };
+  return me.id ?? null;
+}
+
+/** The `state.scope` the registry parsed from the pushed version. */
+async function pushedScope(version: string): Promise<string | null> {
+  const res = await fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}/versions`, {
+    headers: { Authorization: `Bearer ${TOKEN}` },
+  });
+  if (!res.ok) return null;
+  const body = (await res.json()) as {
+    versions?: Array<{ version: string; config_snapshot?: { state?: { scope?: string } } }>;
+  };
+  const v = body.versions?.find((x) => x.version === version);
+  return v?.config_snapshot?.state?.scope ?? null;
 }
 
 export async function run(): Promise<void> {
@@ -112,41 +120,57 @@ export async function run(): Promise<void> {
 
   const dirs: string[] = [];
   const legacyDir = mkdtempSync(join(tmpdir(), "skrun-live-16-legacy-"));
+  const db = openRegistryDb();
 
   try {
-    // ── VT-15: DB defensive pre-flight (SC-10) ─────────────────────────────
-    {
-      const db = openLocalDb();
-      if (db) {
-        try {
-          const agentsViolators = db
-            .prepare("SELECT COUNT(*) as c FROM agents WHERE name LIKE '%/%'")
-            .get() as { c: number };
-          results.push({
-            agent: "simplify-name",
-            feature: "VT-15a: DB defensive — agents.name has no slash",
-            passed: agentsViolators.c === 0,
-            duration: 0,
-            cost: 0,
-            detail: `count=${agentsViolators.c}`,
-          });
+    if (!db) {
+      results.push({
+        agent: "simplify-name",
+        feature: "the registry's database is readable (DATABASE_URL, or skrun.db at the root)",
+        passed: false,
+        duration: 0,
+        cost: 0,
+        detail: "no database to read",
+      });
+    }
 
-          // agent_state may legitimately be empty (no stateful runs yet).
-          // Only assert non-violation: every row, IF any, must be prefixed.
-          const stateViolators = db
-            .prepare("SELECT COUNT(*) as c FROM agent_state WHERE agent_name NOT LIKE '%/%'")
-            .get() as { c: number };
-          results.push({
-            agent: "simplify-name",
-            feature: "VT-15b: DB defensive — agent_state.agent_name carries prefix",
-            passed: stateViolators.c === 0,
-            duration: 0,
-            cost: 0,
-            detail: `count=${stateViolators.c}`,
-          });
-        } finally {
-          db.close();
-        }
+    // ── Database pre-flight ───────────────────────────────────────────────
+    if (db) {
+      try {
+        const [agentsRow] = await db.all("SELECT COUNT(*) AS c FROM agents WHERE name LIKE '%/%'");
+        const agentsViolators = Number(agentsRow?.c);
+        results.push({
+          agent: "simplify-name",
+          feature: "database pre-flight: agents.name has no slash",
+          passed: agentsViolators === 0,
+          duration: 0,
+          cost: 0,
+          detail: `db=${db.kind} count=${agentsViolators}`,
+        });
+
+        // agent_state may legitimately be empty (no stateful runs yet).
+        // Only assert non-violation: every row, if any, names an agent that exists.
+        const [orphanRow] = await db.all(
+          "SELECT COUNT(*) AS c FROM agent_state s LEFT JOIN agents a ON a.id = s.agent_id WHERE a.id IS NULL",
+        );
+        const orphans = Number(orphanRow?.c);
+        results.push({
+          agent: "simplify-name",
+          feature: "database pre-flight: every agent_state row names an existing agent",
+          passed: orphans === 0,
+          duration: 0,
+          cost: 0,
+          detail: `db=${db.kind} orphans=${orphans}`,
+        });
+      } catch (err) {
+        results.push({
+          agent: "simplify-name",
+          feature: "database pre-flight",
+          passed: false,
+          duration: 0,
+          cost: 0,
+          detail: `db=${db.kind} ${queryFailure(err)}`,
+        });
       }
     }
 
@@ -168,7 +192,7 @@ Should never reach the registry — the build step rejects this yaml.
 version: 9.16.99
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
 inputs:
   - name: task
     type: string
@@ -185,6 +209,7 @@ outputs:
           cwd: legacyDir,
           encoding: "utf-8",
           stdio: "pipe",
+          env: cliEnv(),
         });
       } catch (err) {
         crashed = true;
@@ -205,7 +230,7 @@ outputs:
 
     // ── VT-9: push slug-only → no drift ────────────────────────────────────
     console.log(`Testing VT-9: push slug-only ${AGENT} ${V1}...`);
-    dirs.push(buildAndPush(V1));
+    dirs.push(await buildAndPush(V1));
     {
       // VT-9a: assert the registry stored identity (namespace, name) with no
       // drift from the bundle yaml. Queried via the API — backend-agnostic, so
@@ -264,39 +289,65 @@ outputs:
       });
     }
 
-    // ── VT-14: stateful-run shape check on agent_state key ────────────────
+    // ── State, per caller: the run's partition, then the agent's deletion ──
     // We don't depend on the LLM actually writing state (Gemini may not on a
-    // single-turn echo). Instead we assert: IF a row landed in agent_state
-    // for this agent, its key matches the `<ns>/<slug>` shape — confirming
-    // the wiring fix lands the right key in the DB.
-    {
-      const db = openLocalDb();
-      if (db) {
-        try {
-          const stateRows = db.prepare("SELECT agent_name FROM agent_state").all() as Array<{
-            agent_name: string;
-          }>;
-          const relevantRows = stateRows.filter((r) => r.agent_name.includes(AGENT));
-          // Two acceptable outcomes: (a) no row landed (LLM didn't set state),
-          // (b) one or more rows landed AND every one is in `<ns>/<slug>` form.
-          const allPrefixed = relevantRows.every((r) => r.agent_name === `${NS}/${AGENT}`);
-          results.push({
-            agent: "simplify-name",
-            feature: "VT-14: agent_state keys for this agent (if any) are `<ns>/<slug>`",
-            passed: allPrefixed,
-            duration: 0,
-            cost: 0,
-            detail: `rows=${relevantRows.length} all_prefixed=${allPrefixed} sample=${
-              relevantRows[0]?.agent_name ?? "(none)"
-            }`,
-          });
-        } finally {
-          db.close();
-        }
+    // single-turn echo). Two acceptable outcomes for the run: (a) no row
+    // landed, (b) every row of this agent is the dev-token account's
+    // partition. Then, unconditionally: the agent's DELETE answers 204, and no
+    // state row is left for its id. With no row written, "none left" proves
+    // nothing about the cascade: the detail line says so (cascade=vacuous)
+    // rather than passing it off as evidence.
+    if (db) {
+      try {
+        const scope = await pushedScope(V1);
+        const accountId = await devAccountId();
+        const [agentRow] = await db.all("SELECT id FROM agents WHERE namespace = ? AND name = ?", [
+          NS,
+          AGENT,
+        ]);
+        const agentId = agentRow ? String(agentRow.id) : null;
+        const stateRows = agentId
+          ? await db.all("SELECT partition_key FROM agent_state WHERE agent_id = ?", [agentId])
+          : [];
+        const partitions = stateRows.map((r) => String(r.partition_key));
+        const allAccount =
+          accountId !== null && partitions.every((p) => p === `account:${accountId}`);
+        const kinds = [...new Set(partitions.map((p) => p.split(":")[0]))].join(",") || "(none)";
+
+        const deleteStatus = await deleteAgent();
+        const [afterRow] = agentId
+          ? await db.all("SELECT COUNT(*) AS c FROM agent_state WHERE agent_id = ?", [agentId])
+          : [];
+        const afterDelete = afterRow ? Number(afterRow.c) : Number.NaN;
+
+        results.push({
+          agent: "simplify-name",
+          feature:
+            "state per caller: a dev-token run writes the account's notebook, and the agent's deletion leaves none",
+          passed:
+            scope === "per_caller" &&
+            agentId !== null &&
+            allAccount &&
+            deleteStatus === 204 &&
+            afterDelete === 0,
+          duration: 0,
+          cost: 0,
+          detail: `scope=${scope} rows=${partitions.length} partitions=${kinds} delete=${deleteStatus} after_delete=${afterDelete} cascade=${partitions.length > 0 ? "proven" : "vacuous"}`,
+        });
+      } catch (err) {
+        results.push({
+          agent: "simplify-name",
+          feature: "state per caller",
+          passed: false,
+          duration: 0,
+          cost: 0,
+          detail: `db=${db.kind} ${queryFailure(err)}`,
+        });
       }
     }
   } finally {
-    // Cleanup — DELETE the whole agent (cascades to versions + state) so
+    await db?.close().catch(() => {});
+    // Cleanup — DELETE the whole agent (with its versions and its state) so
     // the next phase-16 invocation starts from a clean slate.
     await deleteAgent();
     for (const dir of dirs) {

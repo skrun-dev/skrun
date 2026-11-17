@@ -1,6 +1,7 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import type { DbAdapter } from "../db/adapter.js";
+import { PATH_SEGMENT_REGEX } from "../db/namespace.js";
 import type { Agent, AgentLlmKeyPolicy } from "../db/schema.js";
 import { getUser } from "../middleware/auth.js";
 import {
@@ -10,9 +11,6 @@ import {
 } from "../services/creator-llm-key.js";
 import type { KeyProvider } from "../services/secrets/key-provider.js";
 import { dispatchRegistryError, requireMasterCredential } from "./_helpers.js";
-
-/** Lowercase-kebab path segments, length ≤64 (mirrors registry.ts). */
-const PATH_SEGMENT_REGEX = /^[a-z0-9-]{1,64}$/;
 
 /**
  * Creator-attached LLM key management — all endpoints are WRITE-ONLY: the

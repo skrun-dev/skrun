@@ -27,7 +27,7 @@ cd agents/changelog-generator
 skrun build && skrun push
 
 # 2. Verify the just-pushed version (admin step; dev-token is auto-admin)
-skrun verify dev/changelog-generator@1.0.0
+skrun verify dev/changelog-generator@0.3.1
 
 # 3. Call it via the CLI (or use curl below)
 skrun run dev/changelog-generator \
@@ -80,7 +80,7 @@ Pass a directory path. The agent runs `git log --pretty=format:'%H|%s|%an|%ad'` 
 
 ### Captured git log dump
 
-Useful when the repo lives outside the runtime's filesystem sandbox, or for CI pipelines that capture the log upstream. Format: one commit per line, `hash|subject|author|date` (see `fixtures/sample-repo.git-log.txt` for an example).
+Useful when the repo lives outside the run's sandbox, or for CI pipelines that capture the log upstream. Format: one commit per line, `hash|subject|author|date` (see `fixtures/sample-repo.git-log.txt` for an example).
 
 ```json
 {

@@ -1,12 +1,12 @@
 name: email-drafter
-version: 1.0.0
+version: 1.1.1
 
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
   fallback:
-    provider: openai
-    name: gpt-4o-mini
+    provider: google
+    name: gemini-3.5-flash-lite
 
 inputs:
   - name: context
@@ -36,10 +36,7 @@ outputs:
 environment:
   networking:
     allowed_hosts: []
-  filesystem: read-only
-  secrets: []
   timeout: 60s
-  sandbox: strict
 
 state:
   type: none

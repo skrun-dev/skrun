@@ -2,11 +2,18 @@ import { watch } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import type { AgentConfig } from "@skrun-dev/schema";
-import { validateAgent } from "@skrun-dev/schema";
+import {
+  runBodyInput,
+  runDeclaredInputsRefusal,
+  runInputTypeRefusal,
+  validateAgent,
+} from "@skrun-dev/schema";
 import type { Command } from "commander";
+import { exitWith } from "../utils/exit.js";
 import * as format from "../utils/format.js";
 import { mockRun } from "../utils/mock-runner.js";
 import { getValidatedConfig } from "../utils/validated-config.js";
+import { printValidationWarnings } from "../utils/validation-output.js";
 
 export function registerDevCommand(program: Command): void {
   program
@@ -29,13 +36,10 @@ async function runDev(portStr: string): Promise<void> {
     for (const err of result.errors) {
       format.error(`${err.file ?? ""}: ${err.message}`);
     }
-    process.exit(1);
+    exitWith(1);
   }
   config = getValidatedConfig(result);
-
-  for (const w of result.warnings) {
-    format.warn(w.message);
-  }
+  printValidationWarnings(result);
 
   // Start HTTP server
   const server = createServer(async (req, res) => {
@@ -53,13 +57,38 @@ async function runDev(portStr: string): Promise<void> {
       body += chunk;
     }
 
-    let input: Record<string, unknown>;
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(body);
-      input = parsed.input ?? parsed;
+      parsed = JSON.parse(body);
     } catch {
       res.writeHead(400);
       res.end(JSON.stringify({ error: { code: "INVALID_REQUEST", message: "Invalid JSON body" } }));
+      return;
+    }
+    // The agent's input is the body's `input` field, read by the same rule
+    // and refused in the same words as by the API's POST /run: never the
+    // whole body. Then an input that is not an object — a string, a number,
+    // a boolean — is refused as the API refuses it, its type named; then each
+    // input the agent declares, its absence — no field of the input's own,
+    // null, or an empty list for a file input — then its type. A file input is
+    // judged for its absence only: this server reads no file.
+    const reading = runBodyInput(parsed);
+    if ("refusal" in reading) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: reading.refusal }));
+      return;
+    }
+    const typeRefusal = runInputTypeRefusal(reading.input);
+    if (typeRefusal) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: typeRefusal }));
+      return;
+    }
+    const input = reading.input as Record<string, unknown>;
+    const inputsRefusal = runDeclaredInputsRefusal(config.inputs, input);
+    if (inputsRefusal) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: inputsRefusal }));
       return;
     }
 
@@ -80,19 +109,28 @@ async function runDev(portStr: string): Promise<void> {
     }
   });
 
-  server.on("error", (err: NodeJS.ErrnoException) => {
-    if (err.code === "EADDRINUSE") {
+  // Listen, awaited: a port in use ends the command here, inside the command,
+  // where exitWith() reaches the exit code — an exit thrown from the server's
+  // error event would land after the command returned, as an uncaught
+  // exception. Nothing is watched before the server listens.
+  try {
+    await new Promise<void>((resolveListen, rejectListen) => {
+      server.once("error", rejectListen);
+      server.listen(port, () => {
+        server.off("error", rejectListen);
+        resolveListen();
+      });
+    });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EADDRINUSE") {
       format.error(`Port ${port} is in use. Try \`skrun dev --port ${port + 1}\``);
-      process.exit(1);
+      exitWith(1);
     }
     throw err;
-  });
-
-  server.listen(port, () => {
-    format.success(`Agent validated: ${config.name}`);
-    format.success(`Server running at http://localhost:${port}`);
-    format.info("POST /run ready — watching for changes...");
-  });
+  }
+  format.success(`Agent validated: ${config.name}`);
+  format.success(`Server running at http://localhost:${port}`);
+  format.info("POST /run ready — watching for changes...");
 
   // Watch for file changes
   const filesToWatch = ["SKILL.md", "agent.yaml"];
@@ -103,6 +141,7 @@ async function runDev(portStr: string): Promise<void> {
         if (revalidation.valid) {
           config = getValidatedConfig(revalidation);
           format.success(`Reloaded — ${file} changed`);
+          printValidationWarnings(revalidation);
         } else {
           for (const err of revalidation.errors) {
             format.warn(
@@ -116,7 +155,9 @@ async function runDev(portStr: string): Promise<void> {
     }
   }
 
-  // Graceful shutdown
+  // Graceful shutdown: the server keeps the process alive on purpose, and a
+  // signal is the way to stop it — one of the two places the CLI ends the
+  // process itself.
   const shutdown = () => {
     format.info("Shutting down...");
     server.close();

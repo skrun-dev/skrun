@@ -3,6 +3,8 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     include: ["tests/e2e/**/*.test.ts"],
+    setupFiles: ["./tests/e2e/vitest.setup.ts"],
+    globalSetup: ["./tests/e2e/vitest.global-setup.ts"],
     globals: false,
     env: {
       // The dev-token admin shortcut is a fail-secure opt-in (SKRUN_DEV_AUTH).

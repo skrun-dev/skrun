@@ -1,7 +1,17 @@
 // @skrun-dev/sdk — Official TypeScript SDK for Skrun
 
 export { SkrunClient } from "./client.js";
-export { SkrunApiError, SkrunFileUploadError, SkrunNotVerifiedError } from "./errors.js";
+export {
+  SkrunApiError,
+  SkrunCapacityError,
+  SkrunComputeQuotaError,
+  SkrunConcurrencyLimitError,
+  SkrunFileUploadError,
+  SkrunInputFilesLimitError,
+  SkrunNotVerifiedError,
+  SkrunStorageQuotaError,
+  SkrunTimeoutAboveLimitError,
+} from "./errors.js";
 export type {
   AgentIdentifier,
   AgentMetadata,
@@ -16,12 +26,15 @@ export type {
   RunCompleteEvent,
   RunErrorEvent,
   RunEvent,
+  RunHeartbeatEvent,
   RunInput,
   RunInputValue,
   RunnerSpawnedEvent,
   RunOptions,
   RunStartEvent,
+  SdkFileExclusionReason,
   SdkFileInfo,
+  SdkFilesExcluded,
   SdkRunResult,
   SdkUploadedFileInfo,
   SkrunClientOptions,
@@ -29,4 +42,5 @@ export type {
   ToolCallErrorEvent,
   ToolCallEvent,
   ToolResultEvent,
+  UsageResponse,
 } from "./types.js";

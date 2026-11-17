@@ -1,8 +1,10 @@
 /**
  * Dev-token auth gate (fail-secure).
  *
- * The api accepts a Bearer `dev-token` (any non-`sk_live_` bearer) as an admin
- * shortcut for local development / CI. It is **off unless `SKRUN_DEV_AUTH` is
+ * The api accepts a Bearer `dev-token` (any bearer that does not start with a
+ * key prefix, current or retired, in any letter case — see `api-key.ts`; a key-shaped bearer is
+ * never a dev token) as an admin shortcut for local development / CI.
+ * It is **off unless `SKRUN_DEV_AUTH` is
  * explicitly enabled** — because enabling it grants admin to anyone who can
  * reach the server, so it must only be used on localhost / a trusted LAN, never
  * a public host. `createApp` additionally refuses to boot if this is enabled

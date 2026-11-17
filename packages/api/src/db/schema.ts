@@ -70,10 +70,26 @@ export interface AgentVersion {
   verified: boolean;
 }
 
-export interface AgentState {
-  agent_id: string;
+/**
+ * Whose notebook a state row is, within one agent. `shared`: one notebook for
+ * every caller of the agent. `account`: the notebook of an account (a master
+ * credential — session, dev token, account key with every operation). `key`:
+ * the notebook of one API key (a reduced or delegated key).
+ */
+export type StatePartition =
+  | { kind: "shared" }
+  | { kind: "account"; userId: string }
+  | { kind: "key"; keyId: string };
+
+/** A state row as the adapter reads it back: the notebook and its deadline. */
+export interface StoredState {
   state: Record<string, unknown>;
-  updated_at: string;
+  /**
+   * When the notebook expires, as a `toISOString()` string — written by the
+   * caller of the adapter, returned as written. The adapter does not filter on
+   * it: a row past its deadline is returned like any other.
+   */
+  expires_at: string;
 }
 
 export type UserRole = "admin" | "user";
@@ -139,7 +155,7 @@ export type DeviceCodeStatus = "pending" | "authorized";
  * A pending/authorized OAuth 2.0 Device Authorization Grant (RFC 8628), backing
  * the CLI device-login flow that replaced the loopback `?token=` redirect.
  * The device_code/user_code are stored SHA-256-HASHED (the raw codes live only in
- * transit, like `api_keys.key_hash`); the `sk_live` token is minted only at
+ * transit, like `api_keys.key_hash`); the API key is minted only at
  * poll-success, so this row holds no secret at rest. See routes/auth.ts (the
  * device endpoints) + auth/device-code.ts.
  */
@@ -211,13 +227,99 @@ export interface Run {
    */
   private_ip: string | null;
   /**
-   * Per-phase cold-start timing (ms) for the runner spawn — the `runner_spawned`
-   * event's phases map. Cloud runs only; null for local.
+   * The runner spawn's phases — per-phase cold-start durations (ms), and the
+   * pool's indicators — the `runner_spawned` event's phases map. Cloud runs
+   * only; null for local.
    */
   phase_timings: Record<string, number> | null;
   files: Record<string, unknown>[] | null;
   created_at: string;
   completed_at: string | null;
+  /**
+   * Operator-only: when this run's output files in object storage fall due for
+   * deletion — completion time plus the files retention window. Set only for a
+   * cloud run that uploaded at least one file; null for every other run. Not
+   * exposed in the run API.
+   */
+  purge_after: string | null;
+  /**
+   * Operator-only: when the purge deleted this run's output objects; null until
+   * then. The first mark stands. The file names and sizes stay in `files`. Not
+   * exposed in the run API.
+   */
+  outputs_purged_at: string | null;
+  /**
+   * Operator-only: when this run's content (input, output, error, file list)
+   * was cleared, because the account it belonged to was deleted; null for every
+   * other run. Written by the account deletion only — never by `updateRun`.
+   * Not exposed in the run API.
+   */
+  content_cleared_at: string | null;
+  /**
+   * Operator-only: the instant past which a run still `running` no longer
+   * holds a seat of its account, nor one of the instance. Written once, by the
+   * admission that writes the row; null for a run written otherwise, and a
+   * null deadline counts as expired. Not exposed in the run API.
+   */
+  deadline_at: string | null;
+  /**
+   * Operator-only: the milliseconds the run is charged against its account's
+   * compute, written with its final status; null until then. A finished run
+   * whose charged time is null counts the time from its creation to its end.
+   * Not exposed in the run API.
+   */
+  charged_ms: number | null;
+  /**
+   * Operator-only: whether the run holds the right to a pooled machine. Set by
+   * the admission (`admitRun`), false otherwise; taken back once, by
+   * `returnPoolRight`, when the run's machine is ready and no pooled machine
+   * was taken for the run. Not exposed in the run API.
+   */
+  pool_entitled: boolean;
+}
+
+/**
+ * What an account deletion has to remove from object storage, read before the
+ * database is touched (`DbAdapter.planUserDeletion`).
+ */
+export interface UserDeletionPlan {
+  /** The account's username — the namespace its agents live under. */
+  username: string;
+  /** The `bundle_key` of every version of every agent the account owns. */
+  bundle_keys: string[];
+  /**
+   * The runs of the deletion's scope whose output objects are still waiting
+   * for their purge (`purge_after` set, `outputs_purged_at` not yet): the
+   * object keys are rebuilt from `files`.
+   */
+  pending_outputs: Array<Pick<Run, "id" | "files">>;
+  /**
+   * True when another account carries the same username, or when an agent of
+   * that namespace is owned by another account: the namespace's storage prefix
+   * is then not the deleted account's alone.
+   */
+  namespace_shared: boolean;
+}
+
+/** What an account deletion did, as `DbAdapter.deleteUser` reports it. */
+export interface UserDeletionResult {
+  /** Agents deleted with the account. */
+  agents: number;
+  /** Versions deleted with those agents. */
+  versions: number;
+  /** API keys deleted with the account. */
+  api_keys: number;
+  /** The runs whose content was cleared, in no particular order. */
+  cleared_run_ids: string[];
+  /**
+   * Runs of the scope whose output objects are still waiting for their purge
+   * and were not among `purged_output_run_ids` — typically a run that
+   * completed between the plan and the deletion. Read before their `files`
+   * were cleared, so the object keys can still be rebuilt from them.
+   */
+  late_outputs: Array<Pick<Run, "id" | "files">>;
+  /** The `bundle_key` of every version deleted, read inside the deletion. */
+  bundle_keys: string[];
 }
 
 export interface Environment {

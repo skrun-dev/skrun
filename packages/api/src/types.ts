@@ -45,7 +45,7 @@ export interface RegistryErrorResponse {
 }
 
 /**
- * The scope context of the `sk_live` API key that authenticated the request,
+ * The scope context of the API key that authenticated the request,
  * attached by the auth middleware. `null`/absent means the caller used a
  * session cookie or `dev-token` — an unrestricted "master credential".
  *
@@ -72,7 +72,7 @@ export interface UserContext {
   avatar_url?: string;
   plan?: string;
   /**
-   * API-key scope context (sk_live only). `null` for session/dev-token =
+   * API-key scope context (API keys only). `null` for session/dev-token =
    * unrestricted master credential. Populated by the auth middleware.
    */
   key?: KeyContext | null;
@@ -80,8 +80,18 @@ export interface UserContext {
    * Instance-level privilege. The auth middleware populates this from the
    * User row (`'user'` default, `'admin'` after a manual SQL promotion).
    * Dev-token mode maps to `'admin'` to preserve single-user self-host UX.
-   * Routes gating on `user.role === 'admin'` (the per-version verify
-   * endpoint, the DELETE admin override) read this field.
+   * Never read alone to widen past the caller's own account: those routes ask
+   * `isInstanceAdmin` (`services/key-scope.ts`), the role on a master
+   * credential. The write routes that read it directly — the namespace
+   * overrides (visibility, deletes, creator LLM keys) and the deletion of
+   * another account — each pair it with their own master-credential check.
    */
   role: "admin" | "user";
+  /**
+   * Set only by the dev-token fallback when the dev account could not be
+   * recorded: `id` is then derived from the token and names no `users` row.
+   * Such a caller can run agents but has no identity to keep state under
+   * (`stateCaller` returns `null`). Absent everywhere else.
+   */
+  syntheticAccount?: true;
 }

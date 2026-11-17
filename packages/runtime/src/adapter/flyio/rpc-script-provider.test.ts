@@ -1,6 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { TOOL_RESPONSE_MAX_BYTES } from "../../files/output-rules.js";
 import type { ToolDefinition } from "../../tools/types.js";
-import { RpcScriptToolProvider } from "./rpc-script-provider.js";
+import { RpcScriptToolProvider, TOOL_ANSWER_REFUSED } from "./rpc-script-provider.js";
 
 const SAMPLE_TOOLS: ToolDefinition[] = [
   { name: "search", description: "search the web", parameters: {} },
@@ -66,7 +69,7 @@ describe("RpcScriptToolProvider", () => {
     });
   });
 
-  describe("callTool — RPC auth (SEC-2026-002)", () => {
+  describe("callTool — RPC auth", () => {
     it("sends Authorization: Bearer <token> when a token is configured", async () => {
       const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ content: "ok", isError: false }));
       const provider = new RpcScriptToolProvider("http://machine:9000", SAMPLE_TOOLS, {
@@ -175,5 +178,217 @@ describe("RpcScriptToolProvider", () => {
       const provider = new RpcScriptToolProvider("http://machine:9000", SAMPLE_TOOLS);
       await expect(provider.disconnect()).resolves.toBeUndefined();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The answer to a tool call comes from the sandbox, where the agent's code
+// runs: it is read up to 1 MiB — the most the runner answers once it has cut a
+// result — and a redirect is never followed.
+// ---------------------------------------------------------------------------
+
+const KIB = 1024;
+const MIB = 1024 * KIB;
+
+/**
+ * A body in memory that counts what its reader took: one chunk per read, none
+ * read ahead. It ends by itself.
+ */
+function countedBody(text: string, chunk = 4 * KIB) {
+  const bytes = Buffer.from(text);
+  const state = { delivered: 0, cancelled: false };
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        if (state.delivered >= bytes.length) {
+          controller.close();
+          return;
+        }
+        const end = Math.min(bytes.length, state.delivered + chunk);
+        controller.enqueue(new Uint8Array(bytes.subarray(state.delivered, end)));
+        state.delivered = end;
+      },
+      cancel() {
+        state.cancelled = true;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return { stream, state };
+}
+
+/** A tool answer, as the runner serializes it, of exactly `size` bytes. */
+function toolAnswer(size: number): string {
+  const head = JSON.stringify({ isError: false, content: "" });
+  return `${head.slice(0, -2)}${"r".repeat(size - head.length)}"}`;
+}
+
+describe("RpcScriptToolProvider — the sandbox's answer is read up to 1 MiB", () => {
+  it("takes an answer of exactly 1 MiB, as the runner sends it once it has cut a result", async () => {
+    const answer = toolAnswer(MIB);
+    expect(Buffer.byteLength(answer)).toBe(MIB);
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(answer, { status: 200 }));
+    const provider = new RpcScriptToolProvider("http://machine:9000", SAMPLE_TOOLS, {
+      // biome-ignore lint/suspicious/noExplicitAny: vitest mock
+      fetchImpl: fetchImpl as any,
+    });
+
+    const result = await provider.callTool("search", {});
+
+    const envelope = Buffer.byteLength(JSON.stringify({ isError: false, content: "" }));
+    expect(result.isError).toBe(false);
+    expect(result.content).toHaveLength(MIB - envelope);
+  });
+
+  it("refuses an answer one byte past 1 MiB — a runner that did not cut it — as a tool result in error, past which it reads nothing", async () => {
+    const body = countedBody(toolAnswer(MIB + 1));
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(body.stream, { status: 200 }));
+    const provider = new RpcScriptToolProvider("http://machine:9000", SAMPLE_TOOLS, {
+      // biome-ignore lint/suspicious/noExplicitAny: vitest mock
+      fetchImpl: fetchImpl as any,
+    });
+
+    const result = await provider.callTool("search", {});
+
+    expect(result).toEqual({
+      content: TOOL_ANSWER_REFUSED,
+      isError: true,
+    });
+    expect(body.state.delivered).toBeLessThanOrEqual(MIB + 4 * KIB);
+    expect(body.state.cancelled).toBe(true);
+  });
+
+  it("names in its refusal the bound it reads to: the constant's, never a copy of it", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(new Response(toolAnswer(TOOL_RESPONSE_MAX_BYTES + 1), { status: 200 }));
+    const provider = new RpcScriptToolProvider("http://machine:9000", SAMPLE_TOOLS, {
+      // biome-ignore lint/suspicious/noExplicitAny: vitest mock
+      fetchImpl: fetchImpl as any,
+    });
+
+    const result = await provider.callTool("search", {});
+
+    expect(result.isError).toBe(true);
+    const named = /more than (\d+) (MiB|KiB|bytes)\./.exec(result.content);
+    const unit = { MiB: MIB, KiB: KIB, bytes: 1 }[named?.[2] as "MiB" | "KiB" | "bytes"];
+    expect(named && Number(named[1]) * unit).toBe(TOOL_RESPONSE_MAX_BYTES);
+  });
+
+  it("reads 4 KiB of a 1 MiB error answer", async () => {
+    const body = countedBody("e".repeat(MIB));
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(new Response(body.stream, { status: 502, statusText: "Bad Gateway" }));
+    const provider = new RpcScriptToolProvider("http://machine:9000", SAMPLE_TOOLS, {
+      // biome-ignore lint/suspicious/noExplicitAny: vitest mock
+      fetchImpl: fetchImpl as any,
+    });
+
+    const result = await provider.callTool("search", {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toBe(`RPC failed: HTTP 502 Bad Gateway ${"e".repeat(4 * KIB)}`);
+    expect(body.state.delivered).toBeLessThanOrEqual(4 * KIB + 4 * KIB);
+    expect(body.state.cancelled).toBe(true);
+  });
+
+  it("cuts an answer still coming at the call's bound, as the timeout it is", async () => {
+    // The head of an answer at once, then one byte every 20 ms, ending by itself
+    // after 3 s; a bound of 200 ms — ten intervals.
+    let headSent = false;
+    let ticks = 0;
+    const state = { cancelled: false };
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          if (!headSent) {
+            headSent = true;
+            controller.enqueue(new TextEncoder().encode('{"isError":false,"content":"'));
+            return;
+          }
+          return new Promise<void>((resolve) => {
+            setTimeout(() => {
+              if (!state.cancelled) {
+                ticks += 1;
+                if (ticks > 150) controller.close();
+                else controller.enqueue(new Uint8Array([0x72]));
+              }
+              resolve();
+            }, 20);
+          });
+        },
+        cancel() {
+          state.cancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(stream, { status: 200 }));
+    const provider = new RpcScriptToolProvider("http://machine:9000", SAMPLE_TOOLS, {
+      // biome-ignore lint/suspicious/noExplicitAny: vitest mock
+      fetchImpl: fetchImpl as any,
+      timeoutMs: 200,
+    });
+    const startedAt = Date.now();
+
+    const result = await provider.callTool("search", {});
+
+    expect(result).toEqual({
+      content: 'RPC failed: tool "search" exceeded 200ms timeout',
+      isError: true,
+    });
+    expect(state.cancelled).toBe(true);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+});
+
+describe("RpcScriptToolProvider — a redirect from the sandbox is never followed", () => {
+  const servers: Server[] = [];
+  afterEach(async () => {
+    await Promise.all(
+      servers.splice(0).map(
+        (server) =>
+          new Promise<void>((resolve) => {
+            // Stop accepting first, then end every connection: the order Node documents.
+            server.close(() => resolve());
+            server.closeAllConnections();
+          }),
+      ),
+    );
+  });
+
+  async function listen(handler: (req: IncomingMessage, res: ServerResponse) => void) {
+    const hits: string[] = [];
+    const server = createServer((req, res) => {
+      hits.push(req.url ?? "");
+      res.on("error", () => {});
+      handler(req, res);
+    });
+    server.on("connection", (socket) => socket.on("error", () => {}));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    servers.push(server);
+    return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, hits };
+  }
+
+  it("turns a redirect into a tool result in error, and the address it points at is never asked", async () => {
+    const target = await listen((_req, res) =>
+      res.end(JSON.stringify({ content: "an internal answer", isError: false })),
+    );
+    const runner = await listen((_req, res) => {
+      res.writeHead(302, { Location: `${target.url}/internal` });
+      res.end();
+    });
+    // No fetch given: the provider's own, on the loopback address.
+    const provider = new RpcScriptToolProvider(runner.url, SAMPLE_TOOLS);
+
+    const result = await provider.callTool("search", {});
+
+    expect(target.hits).toEqual([]);
+    expect(result).toEqual({
+      content: "RPC failed: /tool answered with a redirect, which is never followed",
+      isError: true,
+    });
+    expect(runner.hits).toEqual(["/tool"]);
   });
 });

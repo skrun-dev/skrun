@@ -1,5 +1,5 @@
 import { SkrunApiError, SkrunFileUploadError } from "./errors.js";
-import { parseSSEStream } from "./sse.js";
+import { collectRunResult, parseSSEStream } from "./sse.js";
 import type {
   AgentIdentifier,
   AgentMetadata,
@@ -16,9 +16,57 @@ import type {
   SdkRunResult,
   SdkUploadedFileInfo,
   SkrunClientOptions,
+  UsageResponse,
 } from "./types.js";
 
 const DEFAULT_TIMEOUT = 60_000;
+
+/**
+ * The deadline of a streamed call: it bounds a silence, not the whole call.
+ * Armed when the request leaves, re-armed when the answer arrives and on every
+ * chunk of the stream read after it; when it expires, its signal aborts the
+ * request, and with it the body being read. The server sends a heartbeat about
+ * every 30 s during each wait of a run — the machine, the model, a tool, the
+ * upload of its files — as it ticks, so a run as long as it takes never meets
+ * a deadline longer than that cadence. The default below stays above it: a
+ * test reads both numbers (`wire-parity.test.ts`).
+ */
+class SilenceDeadline {
+  private readonly controller = new AbortController();
+  private timer: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(private readonly ms: number) {
+    this.arm();
+  }
+
+  get signal(): AbortSignal {
+    return this.controller.signal;
+  }
+
+  get expired(): boolean {
+    return this.controller.signal.aborted;
+  }
+
+  /** Start the silence over. */
+  arm(): void {
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
+      this.controller.abort(new DOMException(`No response for ${this.ms}ms`, "TimeoutError"));
+    }, this.ms);
+  }
+
+  /** Stop counting: the call is over, one way or another. */
+  clear(): void {
+    clearTimeout(this.timer);
+  }
+
+  /** Abort the request now: its reader left before the end of the stream. */
+  cancel(): void {
+    if (!this.expired) {
+      this.controller.abort(new DOMException("The stream was left before its end", "AbortError"));
+    }
+  }
+}
 
 export class SkrunClient {
   private readonly baseUrl: string;
@@ -40,21 +88,37 @@ export class SkrunClient {
 
   // --- Execution methods ---
 
-  /** Run an agent synchronously. Blocks until completion. */
+  /**
+   * Run an agent and wait for its result. Blocks until completion.
+   *
+   * The run is read from its event stream and collected into the result a
+   * synchronous call returns, with the same shape — which is what lets it run
+   * on every runtime, the cloud one included, where only a stream is served. A
+   * run that fails once started returns `status: "failed"` with its `error`; a
+   * request refused before the run starts throws `SkrunApiError`, as before.
+   *
+   * The timeout bounds a silence — the wait for the answer, then the gap
+   * between two chunks of the stream — never the length of the run.
+   */
   async run(agent: AgentIdentifier, input: RunInput, options?: RunOptions): Promise<SdkRunResult> {
-    const { namespace, name } = this.parseAgent(agent);
-    const resolvedInput = await this.uploadBinaryInputs(input);
-    const res = await this.request(`/api/agents/${namespace}/${name}/run`, {
-      method: "POST",
-      headers: this.buildHeaders(options),
-      body: JSON.stringify(this.buildRunBody(resolvedInput, options)),
-      timeout: options?.timeout,
-    });
-    return (await res.json()) as SdkRunResult;
+    return collectRunResult(this.streamRun(agent, input, options));
   }
 
-  /** Stream agent execution via SSE. Returns an async iterable of RunEvent objects. */
+  /**
+   * Stream agent execution via SSE. Returns an async iterable of RunEvent
+   * objects. The timeout bounds a silence — the wait for the answer, then the
+   * gap between two chunks of the stream — never the length of the run.
+   */
   async *stream(
+    agent: AgentIdentifier,
+    input: RunInput,
+    options?: RunOptions,
+  ): AsyncGenerator<RunEvent> {
+    yield* this.streamRun(agent, input, options);
+  }
+
+  /** The event stream of a run, under a silence deadline instead of a total one. */
+  private async *streamRun(
     agent: AgentIdentifier,
     input: RunInput,
     options?: RunOptions,
@@ -64,14 +128,35 @@ export class SkrunClient {
     const headers = this.buildHeaders(options);
     headers.Accept = "text/event-stream";
 
-    const res = await this.request(`/api/agents/${namespace}/${name}/run`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(this.buildRunBody(resolvedInput, options)),
-      timeout: options?.timeout,
-    });
-
-    yield* parseSSEStream(res);
+    const timeoutMs = options?.timeout ?? this.timeout;
+    const deadline = new SilenceDeadline(timeoutMs);
+    let ended = false;
+    try {
+      const res = await this.request(
+        `/api/agents/${namespace}/${name}/run`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(this.buildRunBody(resolvedInput, options)),
+          timeout: timeoutMs,
+        },
+        deadline.signal,
+      );
+      deadline.arm();
+      try {
+        yield* parseSSEStream(res, () => deadline.arm());
+        ended = true;
+      } catch (err) {
+        if (deadline.expired) throw SkrunApiError.timeout(timeoutMs);
+        throw err;
+      }
+    } finally {
+      deadline.clear();
+      // A consumer that leaves early (a `break`, a `return`) or a failure
+      // ends the call: the connection closes instead of staying open until the
+      // run ends on the server.
+      if (!ended) deadline.cancel();
+    }
   }
 
   /** Run an agent asynchronously. Returns immediately with a run ID. Result delivered via webhook. */
@@ -125,23 +210,52 @@ export class SkrunClient {
   }
 
   /**
+   * Delete an input file uploaded to `/api/files` (`DELETE /api/files/:id`):
+   * on a server that bounds an account's live uploads, its place frees at
+   * once. A full-access credential deletes any upload of its account; any
+   * other key, only the files it uploaded itself. Throws `SkrunApiError` —
+   * `FILE_NOT_FOUND` (404) for an unknown or expired file, `FORBIDDEN` (403)
+   * for an upload the caller may not use, `DELETE_OUTPUT_FORBIDDEN` (403) for
+   * a run's output file.
+   *
+   * The binary inputs that `run()`, `stream()` and `runAsync()` upload are
+   * never deleted by them: upload with `uploadFile()`, run with its
+   * reference, then delete it, to free its place before it expires.
+   */
+  async deleteFile(fileId: string): Promise<void> {
+    await this.request(`/api/files/${encodeURIComponent(fileId)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
+  }
+
+  /**
    * Walk `input` for binary values (Blob/File/Uint8Array), upload each via
    * POST /api/files, and substitute the value with the wire-format file
    * reference shape `{type: "file", source: "id", file_id}`. Plain values
-   * pass through unchanged.
+   * pass through unchanged. Each field of the copy is defined, not assigned: a
+   * field named `__proto__` stays a field, where an assignment would set the
+   * copy's prototype and leave it out of the request.
    */
   private async uploadBinaryInputs(input: RunInput): Promise<Record<string, unknown>> {
     const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(input)) {
+      let sent: unknown;
       if (Array.isArray(value)) {
         const arr: unknown[] = [];
         for (const item of value) {
           arr.push(await this.maybeUploadValue(item));
         }
-        out[key] = arr;
+        sent = arr;
       } else {
-        out[key] = await this.maybeUploadValue(value);
+        sent = await this.maybeUploadValue(value);
       }
+      Object.defineProperty(out, key, {
+        value: sent,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
     return out;
   }
@@ -295,6 +409,23 @@ export class SkrunClient {
     return (await res.json()) as AgentMetadata;
   }
 
+  /**
+   * What the caller's account consumes now, against the quotas its plan gives
+   * it on the server: its runs in progress, its compute time in the current
+   * window, and its fast runs of the rolling hour while the server's pre-warm
+   * pool runs. `quotas` is `null` on a server that sets none. Takes a
+   * full-access credential — a session, the dev token, or an account-wide key
+   * that carries every operation; any other key gets a `SkrunApiError` with
+   * code `KEY_SCOPE_FORBIDDEN` (403).
+   */
+  async usage(): Promise<UsageResponse> {
+    const res = await this.request("/api/usage", {
+      method: "GET",
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
+    return (await res.json()) as UsageResponse;
+  }
+
   // --- Private helpers ---
 
   private parseAgent(agent: AgentIdentifier): { namespace: string; name: string } {
@@ -332,7 +463,20 @@ export class SkrunClient {
     return headers;
   }
 
-  private async request(path: string, init: RequestInit & { timeout?: number }): Promise<Response> {
+  /**
+   * Send a request under `signal`, by default a total deadline of the call's
+   * timeout — which covers reading the body too. A streamed call passes its own
+   * silence deadline instead.
+   *
+   * No redirect is followed: a `3xx` — or a browser's opaque redirect — throws
+   * `REDIRECT_REFUSED`, and its target receives nothing, neither the token nor
+   * a model key nor the body.
+   */
+  private async request(
+    path: string,
+    init: RequestInit & { timeout?: number },
+    signal?: AbortSignal,
+  ): Promise<Response> {
     const url = `${this.baseUrl}${path}`;
     const timeoutMs = init.timeout ?? this.timeout;
 
@@ -340,13 +484,20 @@ export class SkrunClient {
     try {
       response = await fetch(url, {
         ...init,
-        signal: AbortSignal.timeout(timeoutMs),
+        redirect: "manual",
+        signal: signal ?? AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
       if (err instanceof Error && err.name === "TimeoutError") {
         throw SkrunApiError.timeout(timeoutMs);
       }
       throw SkrunApiError.networkError(this.baseUrl, err instanceof Error ? err : undefined);
+    }
+
+    // 3xx → refused, never followed: read before anything else of the answer
+    if (response.type === "opaqueredirect" || (response.status >= 300 && response.status <= 399)) {
+      await response.body?.cancel().catch(() => {});
+      throw SkrunApiError.redirectRefused(this.baseUrl, response, url);
     }
 
     // 2xx → return response for caller to parse

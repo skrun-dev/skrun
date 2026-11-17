@@ -32,12 +32,17 @@
 		header_up X-Forwarded-For {remote_host}
 	}
 
-	# Sensible defaults for self-host: 50 MB request bodies (above the
-	# bundle decompression cap default of 50 MB compressed). Adjust to
-	# match BUNDLE_MAX_DECOMPRESSED_MB / INPUT_FILES_MAX_SIZE_MB if you
-	# bumped them.
+	# Sensible defaults for self-host: request bodies up to 50 MiB, the API's
+	# 50 MB. Caddy sees each body as it is sent: a push's is the COMPRESSED
+	# bundle, which the API bounds at SKRUN_PUSH_MAX_BODY_MB (default 50); an
+	# upload's is the file plus its multipart framing, bounded at
+	# INPUT_FILES_MAX_SIZE_MB plus 1 MB. If you raise either, raise this with
+	# it, in MiB: the API counts a MB as 1,048,576 bytes, as Caddy counts a
+	# MiB, while Caddy's MB is 1,000,000 — 50MB here would refuse a push the
+	# API's default cap accepts. BUNDLE_MAX_DECOMPRESSED_MB bounds what the API
+	# unpacks a bundle to: Caddy never sees that size.
 	request_body {
-		max_size 50MB
+		max_size 50MiB
 	}
 
 	# Structured access log to stdout. Caddy auto-formats as JSON;

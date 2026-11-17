@@ -1,5 +1,5 @@
 /**
- * Cold-start benchmark logic — SC-2 / VT-2.
+ * Cold-start benchmark logic.
  *
  * The actual benchmark function. Re-exported via `cold-start.test.ts`
  * (vitest wrapper) and used directly by `scripts/run-cold-start-bench.ts`
@@ -39,7 +39,7 @@ export interface BenchmarkOptions {
  * fails). Returns the collected durations + percentiles.
  *
  * Caller is responsible for env gating + asserting the result against
- * the threshold (SC-2 says P95 < 10_000 ms).
+ * the threshold (a P95 below 10_000 ms).
  */
 export async function runColdStartBenchmark(opts: BenchmarkOptions): Promise<BenchmarkResult> {
   const api = new FlyMachinesApi(opts.token, opts.appName);
@@ -57,8 +57,6 @@ export async function runColdStartBenchmark(opts: BenchmarkOptions): Promise<Ben
     const config = buildMachineConfig({
       runId,
       image: opts.image,
-      bundleUrl: "https://example.com/dummy-bundle.tar.gz",
-      outputsPutUrl: "https://example.com/dummy-outputs",
       allowedHosts: [],
     });
 
@@ -93,7 +91,7 @@ export async function runColdStartBenchmark(opts: BenchmarkOptions): Promise<Ben
 
   // Warm-up: prime the region's image cache so the first MEASURED spawn
   // isn't dominated by Fly's per-region tag pull (~1 min for ~750MB).
-  // SC-2 measures the steady-state cold-start (= cache warm, instance
+  // The benchmark measures the steady-state cold-start (= cache warm, instance
   // cold) which is what production runs experience on every spawn after
   // the first deploy.
   log("warm-up spawn (priming region image cache)...");

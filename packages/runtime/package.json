@@ -1,6 +1,6 @@
 {
   "name": "@skrun-dev/runtime",
-  "version": "1.2.1",
+  "version": "2.0.0",
   "type": "module",
   "exports": {
     ".": {
@@ -18,7 +18,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "tsc --watch"
@@ -26,18 +26,18 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.92.0",
     "@google/generative-ai": "^0.24.1",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "@skrun-dev/schema": "workspace:*",
     "ajv": "^8.20.0",
     "openai": "^6.35.0",
     "pino": "^10.3.1",
-    "undici": "8.10.0",
-    "zod": "^4.4.1"
+    "undici": "^8.12.3",
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   },
   "publishConfig": {
     "access": "public"
@@ -56,6 +56,6 @@
     "ai-agents"
   ],
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.19.0"
   }
 }

@@ -14,7 +14,16 @@
  */
 
 import { join } from "node:path";
-import { postRun, REGISTRY, ROOT, results, skrun, TOKEN, verifyLatestVersion } from "./_ctx.js";
+import {
+  postRun,
+  pushFixture,
+  REGISTRY,
+  ROOT,
+  results,
+  skrun,
+  TOKEN,
+  verifyLatestVersion,
+} from "./_ctx.js";
 
 function parseSSEText(text: string): Array<{ event: string; data: Record<string, unknown> }> {
   const out: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -44,11 +53,7 @@ export async function run(): Promise<void> {
     // Build + push the fixture. 409 (version already pushed) is fine — the
     // version is pinned at 1.0.0 and reused across runs.
     skrun(["build"], fixtureDir);
-    try {
-      skrun(["push"], fixtureDir);
-    } catch {
-      // 409 VERSION_EXISTS — fixture already in registry from a prior run.
-    }
+    await pushFixture(fixtureDir);
     await verifyLatestVersion("dev", "audit-fixture-tool-error");
 
     // SSE call: the LLM is forced via tool_choice to invoke `always_fails`,

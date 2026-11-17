@@ -5,18 +5,13 @@ import { isExcludedEntry, packAgentTar } from "@skrun-dev/schema";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import type { DbAdapter } from "../db/adapter.js";
+import { PATH_SEGMENT_REGEX } from "../db/namespace.js";
 import { getUser } from "../middleware/auth.js";
-import { assertKeyCanPushOrThrow } from "../services/key-scope.js";
+import type { QuotaConfig } from "../quotas/thresholds.js";
+import { assertKeyCanPushOrThrow, assertMasterReadOrThrow } from "../services/key-scope.js";
 import type { RegistryService } from "../services/registry.js";
-import { dispatchRegistryError } from "./_helpers.js";
-
-/**
- * Same segment shape the registry routes enforce on `:name` (nine routes) and
- * `agent-llm-keys` (two). A superset of the schema's own AGENT_NAME_REGEX, so
- * every directory with a legal agent name still scans and pushes; one that
- * would fail it is already unusable through every other registry route.
- */
-const PATH_SEGMENT_REGEX = /^[a-z0-9-]{1,64}$/;
+import { dispatchPushError, dispatchRegistryError } from "./_helpers.js";
+import { pushLimits } from "./registry.js";
 
 /**
  * Containment check with the trailing separator.
@@ -66,10 +61,22 @@ export function createScanRoutes(
   db: DbAdapter,
   authMiddleware: MiddlewareHandler,
   service: RegistryService,
+  /** The quota settings, read once by the app: this push answers to them like the registry's. */
+  quotaConfig: QuotaConfig,
 ): Hono {
   const router = new Hono();
 
+  // The agents directory is the server's disk: listing it is for a full-access
+  // credential (a session, the dev token, an account-wide key with every
+  // operation), and the answer names no server path — each agent's `path` is
+  // relative to the configured directory, and the directory itself appears
+  // nowhere, not even when it is missing.
   router.get("/agents/scan", authMiddleware, async (c) => {
+    try {
+      assertMasterReadOrThrow(getUser(c));
+    } catch (err) {
+      return dispatchRegistryError(c, err);
+    }
     const agentsDir = process.env.SKRUN_AGENTS_DIR;
 
     if (!agentsDir) {
@@ -82,7 +89,7 @@ export function createScanRoutes(
       return c.json({
         agents: [],
         configured: true,
-        error: `Directory not found: ${agentsDir}`,
+        error: "Directory not found: the configured agents directory",
       });
     }
 
@@ -107,7 +114,9 @@ export function createScanRoutes(
       const agent = await db.getAgent(user.namespace, entry);
       agents.push({
         name: entry,
-        path: entryPath,
+        // Relative to the configured directory: the scan reads one level, so
+        // this is the agent's directory name.
+        path: relative(resolvedDir, entryPath),
         registered: agent !== null,
       });
     }
@@ -115,8 +124,18 @@ export function createScanRoutes(
     return c.json({ agents, configured: true });
   });
 
-  // POST /api/agents/scan/:name/push — build + push agent directly (no CLI)
+  // POST /api/agents/scan/:name/push — build + push agent directly (no CLI).
+  // Building from the agents directory reads the server's disk, like the scan
+  // itself: the same full-access gate, and it runs before anything else, so
+  // every other credential gets one answer whatever the name — a 404 for a
+  // missing directory or a 400 for one without agent.yaml would otherwise tell
+  // it which directories exist there.
   router.post("/agents/scan/:name/push", authMiddleware, async (c) => {
+    try {
+      assertMasterReadOrThrow(getUser(c));
+    } catch (err) {
+      return dispatchRegistryError(c, err);
+    }
     const agentsDir = process.env.SKRUN_AGENTS_DIR;
     if (!agentsDir) {
       return c.json(
@@ -130,7 +149,11 @@ export function createScanRoutes(
     const resolvedDir = resolve(agentsDir);
 
     // `:name` is percent-decoded by Hono, so `..%2fagents-backup` arrives as a
-    // traversal. Validate the segment as the registry routes do, BEFORE joining.
+    // traversal. Validate the segment as the registry routes do, BEFORE joining:
+    // the shape every registry route enforces on `:name` (`db/namespace.ts`), a
+    // superset of the schema's own AGENT_NAME_REGEX, so every directory with a
+    // legal agent name still scans and pushes; one that would fail it is
+    // already unusable through every other registry route.
     if (!PATH_SEGMENT_REGEX.test(name)) {
       return c.json(
         {
@@ -177,7 +200,8 @@ export function createScanRoutes(
     }
 
     // API-key scope (same gate as the regular push route — this is the second
-    // push entrypoint and must not be a bypass).
+    // push entrypoint and must not be a bypass). A full-access credential, the
+    // only one that reaches here, always passes it.
     if (user.key) {
       try {
         const existing = await db.getAgent(user.namespace, name);
@@ -191,10 +215,23 @@ export function createScanRoutes(
     const bundle = await buildAgentBundle(agentPath);
 
     try {
-      const metadata = await service.push(user.namespace, name, version, bundle, user.id);
+      // The same bounds as the registry push: the server's longest timeout and
+      // the account's storage, checked before anything is stored.
+      const metadata = await service.push(
+        user.namespace,
+        name,
+        version,
+        bundle,
+        user.id,
+        undefined,
+        pushLimits(quotaConfig, user),
+        // As at the registry's push: a client gone while agent.yaml waits to be
+        // read leaves its place, never read.
+        c.req.raw.signal,
+      );
       return c.json(metadata);
     } catch (err) {
-      return dispatchRegistryError(c, err);
+      return dispatchPushError(c, err);
     }
   });
 

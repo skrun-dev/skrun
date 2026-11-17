@@ -1,16 +1,18 @@
 name: meeting-transcript-to-action-items
-version: 0.2.0
+version: 0.4.1
 
+# v0.4.0: one state notebook per caller (scope: per_caller).
+# v0.3.0: Gemini 3.8 Flash, with Gemini 3.5 Flash-Lite as fallback.
 # v0.2.0: audio-native. Accepts a meeting recording directly via Skrun's multimodal-inputs.
 # Gemini transcribes the audio internally then extracts decisions + action items in a single pass.
 # v0.1.0 (text transcript input) is removed — upstream Whisper / VTT extraction is no longer needed.
 
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
   fallback:
     provider: google
-    name: gemini-2.5-flash-lite
+    name: gemini-3.5-flash-lite
 
 tools:
   - name: write_artifact
@@ -66,11 +68,9 @@ outputs:
 environment:
   networking:
     allowed_hosts: []
-  filesystem: read-write
-  secrets: []
   timeout: 240s
-  sandbox: strict
 
 state:
   type: kv
+  scope: per_caller
   ttl: 90d

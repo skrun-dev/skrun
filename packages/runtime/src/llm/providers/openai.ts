@@ -1,6 +1,6 @@
 import OpenAI, { toFile } from "openai";
 import { createLogger } from "../../logger.js";
-import { LLMCapabilityError } from "../errors.js";
+import { LLMCapabilityError, LLMHistoryError } from "../errors.js";
 import { fingerprintBytes, type ProviderFileCache } from "../file-cache.js";
 import type { SkrunPart } from "../parts.js";
 import type { ResolvedToolChoice } from "../tool-choice.js";
@@ -50,6 +50,21 @@ function buildToolChoice(
   }
 }
 
+/**
+ * A token count as an endpoint reported it, when it is one — a whole number,
+ * not negative, within the numbers JavaScript holds exactly. Undefined when
+ * the endpoint reported none, and when it reported anything else — a
+ * fraction, a negative, a string —, whose field is then named in `invalid`.
+ * A count too large for a run's record is bounded where the record is
+ * written, not here.
+ */
+function reportedCount(value: unknown, field: string, invalid: string[]): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+  invalid.push(field);
+  return undefined;
+}
+
 /** Whether this provider name (using OpenAI-compatible client) supports a given media kind. */
 function isMediaSupported(providerName: string, kind: "image" | "document" | "audio"): boolean {
   if (kind === "image") return true; // openai, mistral, groq, xai all support image
@@ -61,13 +76,61 @@ function isMediaSupported(providerName: string, kind: "image" | "document" | "au
 }
 
 /**
+ * An assistant message as it goes back, with the one field outside the Chat
+ * Completions spec that it may carry (see `assistantMessageOf`).
+ */
+type AssistantTurn = OpenAI.ChatCompletionAssistantMessageParam & {
+  reasoning_content?: string;
+};
+
+/**
+ * The assistant message as Chat Completions accepts it back as input, by an
+ * allowlist: its role; its content as returned (its text, or the list of
+ * chunks a provider returns — Mistral puts its reasoning there, and asks for
+ * it back); its function tool calls with their `arguments` in the string the
+ * model wrote — never parsed and re-serialized; and `reasoning_content`, when
+ * the response carries one (a string), exactly as returned. That field is not
+ * in the Chat Completions spec: DeepSeek and Kimi return the model's reasoning
+ * there, and refuse with a 400 a request with tools whose earlier assistant
+ * turns do not carry it back. Every other field a response carries and a
+ * request may refuse (refusal, annotations, audio, another provider's
+ * extension) is left out.
+ */
+function assistantMessageOf(message: OpenAI.ChatCompletionMessage | undefined): AssistantTurn {
+  const toolCalls = (message?.tool_calls ?? []).flatMap((tc) =>
+    tc.type === "function"
+      ? [
+          {
+            id: tc.id,
+            type: "function" as const,
+            function: { name: tc.function.name, arguments: tc.function.arguments },
+          },
+        ]
+      : [],
+  );
+  const reasoning = (message as { reasoning_content?: unknown } | undefined)?.reasoning_content;
+  return {
+    role: "assistant",
+    content: message?.content ?? null,
+    ...(typeof reasoning === "string" && { reasoning_content: reasoning }),
+    ...(toolCalls.length > 0 && { tool_calls: toolCalls }),
+  };
+}
+
+/** Whether an assistant message carries text, content chunks or a call. */
+function carriesSomething(message: OpenAI.ChatCompletionAssistantMessageParam): boolean {
+  if (message.tool_calls?.length) return true;
+  const content = message.content;
+  return typeof content === "string" ? content.length > 0 : (content?.length ?? 0) > 0;
+}
+
+/**
  * Cache behavior config for the OpenAI-compatible factory variants.
  *
- * Each factory tunes one of the 4 cache-related dimensions independently:
- * - `passPromptCacheKey`: pass `prompt_cache_key` body field (OpenAI; xAI Responses)
+ * Each factory tunes one of the 3 cache-related dimensions independently:
+ * - `passPromptCacheKey`: pass `prompt_cache_key` body field (OpenAI, Mistral; xAI Responses)
  * - `setGrokConvIdHeader`: set `x-grok-conv-id` HTTP header (xAI Chat Completions)
  * - `extractCachedTokens`: parse `prompt_tokens_details.cached_tokens` from response
- * - `skipCaching`: log structured no-op event and skip all cache behavior (Mistral)
  *
  * Defaults are deliberately conservative (no passing of cache_key, no header set,
  * but DO extract — extraction is harmless when fields are absent and gives free
@@ -77,7 +140,6 @@ export interface CacheBehavior {
   passPromptCacheKey?: boolean;
   setGrokConvIdHeader?: boolean;
   extractCachedTokens?: boolean;
-  skipCaching?: boolean;
 }
 
 export class OpenAICompatibleProvider implements LLMProvider {
@@ -107,37 +169,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
   }
 
   async call(request: LLMCallRequest): Promise<LLMCallResponse> {
-    const userContentParts = await this.translateUserContent(
-      request.userContent,
-      request._fileCache,
-    );
-
-    const messages: OpenAI.ChatCompletionMessageParam[] = [
-      { role: "system", content: request.systemPrompt },
-      { role: "user", content: userContentParts },
-    ];
-
-    if (request.toolResults?.length) {
-      messages.push({
-        role: "assistant",
-        content: null,
-        tool_calls: request.toolResults.map((tr, i) => ({
-          id: tr.id ?? tr.name,
-          type: "function" as const,
-          function: {
-            name: tr.name,
-            arguments: JSON.stringify(request.toolCalls?.[i]?.args ?? {}),
-          },
-        })),
-      });
-      for (const tr of request.toolResults) {
-        messages.push({
-          role: "tool",
-          tool_call_id: tr.id ?? tr.name,
-          content: tr.result,
-        });
-      }
-    }
+    const messages = await this.buildMessages(request);
 
     const tools: OpenAI.ChatCompletionTool[] | undefined = request.tools?.map((t) => ({
       type: "function" as const,
@@ -151,28 +183,15 @@ export class OpenAICompatibleProvider implements LLMProvider {
     const toolChoice = buildToolChoice(request.toolChoice, this.name);
 
     // Cache routing: pass `prompt_cache_key` body field when the factory
-    // variant opts in (OpenAI, xAI Responses) and the router gave us a
-    // hashed key. Mistral factory has `skipCaching: true` — we explicitly
-    // emit a structured no-op event and don't pass cache params.
+    // variant opts in (OpenAI, Mistral, xAI Responses) and the router gave us
+    // a hashed key; the `x-grok-conv-id` header for xAI Chat Completions.
     const requestOptions: { headers?: Record<string, string> } = {};
     let promptCacheKey: string | undefined;
-
-    if (this.cacheBehavior.skipCaching) {
-      log.debug(
-        {
-          event: "cache_skipped",
-          provider: this.name,
-          reason: "no_native_caching",
-        },
-        `${this.name} does not support prompt caching; skipping cache primitives`,
-      );
-    } else {
-      if (this.cacheBehavior.passPromptCacheKey && request.cacheKey) {
-        promptCacheKey = request.cacheKey;
-      }
-      if (this.cacheBehavior.setGrokConvIdHeader && request.cacheKey) {
-        requestOptions.headers = { "x-grok-conv-id": request.cacheKey };
-      }
+    if (this.cacheBehavior.passPromptCacheKey && request.cacheKey) {
+      promptCacheKey = request.cacheKey;
+    }
+    if (this.cacheBehavior.setGrokConvIdHeader && request.cacheKey) {
+      requestOptions.headers = { "x-grok-conv-id": request.cacheKey };
     }
 
     const response = await this.client.chat.completions.create(
@@ -211,19 +230,25 @@ export class OpenAICompatibleProvider implements LLMProvider {
       }
     }
 
-    // Cache usage extraction. OpenAI / xAI / Groq all share the
+    // Cache usage extraction. OpenAI / xAI / Groq / Mistral all share the
     // `usage.prompt_tokens_details.cached_tokens` shape on Chat Completions,
     // OR `usage.input_tokens_details.cached_tokens` on the Responses API
     // (verified May 2026). Try Chat shape first, fall back to Responses
-    // shape — same field semantically. Skipped entirely when the factory
-    // has `skipCaching: true` (Mistral).
+    // shape — same field semantically.
     //
-    // Apply gross→net normalization: OpenAI / xAI / Groq report
+    // Apply gross→net normalization: OpenAI / xAI / Groq / Mistral report
     // `prompt_tokens` as GROSS (cached + uncached). Subtract cached portion
     // so the uniform `promptTokens` is the FULL-RATE residual.
-    const grossPromptTokens = response.usage?.prompt_tokens ?? 0;
+    //
+    // Each count is taken only when it is one — a whole number, not negative
+    // (`reportedCount`): an endpoint an agent declares (`model.base_url`)
+    // answers what it likes. Anything else counts nothing, and one line names
+    // the fields.
+    const invalid: string[] = [];
+    const grossPromptTokens =
+      reportedCount(response.usage?.prompt_tokens, "prompt_tokens", invalid) ?? 0;
     let cacheReadTokens: number | undefined;
-    if (this.cacheBehavior.extractCachedTokens && !this.cacheBehavior.skipCaching) {
+    if (this.cacheBehavior.extractCachedTokens) {
       // Chat Completions native shape (current runtime usage).
       const chatCachedTokens = response.usage?.prompt_tokens_details?.cached_tokens;
       // Responses API shape — kept for forward-compat when the runtime adds
@@ -231,8 +256,20 @@ export class OpenAICompatibleProvider implements LLMProvider {
       const responsesCachedTokens = (
         response.usage as { input_tokens_details?: { cached_tokens?: number } } | undefined
       )?.input_tokens_details?.cached_tokens;
-      const cached = chatCachedTokens ?? responsesCachedTokens;
+      const cached = reportedCount(
+        chatCachedTokens ?? responsesCachedTokens,
+        "cached_tokens",
+        invalid,
+      );
       if (cached !== undefined && cached > 0) cacheReadTokens = cached;
+    }
+    const completionTokens =
+      reportedCount(response.usage?.completion_tokens, "completion_tokens", invalid) ?? 0;
+    if (invalid.length > 0) {
+      log.warn(
+        { event: "llm_usage_invalid", provider: this.name, fields: invalid },
+        `${this.name} reported a usage that is not a token count; it counts nothing`,
+      );
     }
 
     const promptTokens = Math.max(0, grossPromptTokens - (cacheReadTokens ?? 0));
@@ -240,15 +277,75 @@ export class OpenAICompatibleProvider implements LLMProvider {
     return {
       content,
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+      assistantTurn: { provider: this.name, content: assistantMessageOf(choice?.message) },
       usage: {
         promptTokens,
-        completionTokens: response.usage?.completion_tokens ?? 0,
+        completionTokens,
         ...(cacheReadTokens !== undefined && { cacheReadTokens }),
-        // OpenAI / xAI / Groq don't have a separate write surcharge — implicit
-        // caching is free beyond the normal input bill. cacheWriteTokens stays
-        // undefined for these providers.
+        // cacheWriteTokens stays undefined: this adapter reads no written
+        // count. OpenAI bills a cache write at 1.25× input on GPT-6.1, GPT-6
+        // and GPT-5.6 (its pricing page, noted in cost.ts); not modelled, the
+        // written part is estimated at the input rate.
       },
     };
+  }
+
+  /**
+   * The conversation as Chat Completions messages: the system prompt, the
+   * input, then each entry of the history in order — an assistant message as
+   * the model returned it, restricted when it was stored (`assistantMessageOf`:
+   * its text, or its content chunks, its function calls with their
+   * `arguments` in the model's own string, and the `reasoning_content` the
+   * response carried, if any), the results of its calls as `tool`
+   * messages paired by `tool_call_id`, a later user message. A user message
+   * that follows a user message joins it, after its parts.
+   *
+   * An assistant message with neither text nor a call is left out: Chat
+   * Completions requires one or the other, and such a turn carried nothing to
+   * send back.
+   *
+   * Throws `LLMHistoryError` on a turn another provider produced — another
+   * OpenAI-compatible one included: a turn goes back to the provider that
+   * wrote it, whatever its shape.
+   */
+  private async buildMessages(
+    request: LLMCallRequest,
+  ): Promise<OpenAI.ChatCompletionMessageParam[]> {
+    const input = await this.translateUserContent(request.userContent, request._fileCache);
+    const messages: OpenAI.ChatCompletionMessageParam[] = [
+      { role: "system", content: request.systemPrompt },
+      { role: "user", content: input },
+    ];
+
+    for (const entry of request.history ?? []) {
+      switch (entry.kind) {
+        case "assistant": {
+          if (entry.turn.provider !== this.name) {
+            throw new LLMHistoryError(this.name, entry.turn.provider);
+          }
+          const turn = entry.turn.content as OpenAI.ChatCompletionAssistantMessageParam;
+          if (carriesSomething(turn)) messages.push(turn);
+          break;
+        }
+        case "tool_results":
+          for (const r of entry.results) {
+            messages.push({ role: "tool", tool_call_id: r.id ?? r.name, content: r.result });
+          }
+          break;
+        case "user": {
+          const later = await this.translateUserContent(entry.parts, request._fileCache);
+          const last = messages[messages.length - 1];
+          if (last.role === "user" && Array.isArray(last.content)) {
+            messages[messages.length - 1] = { role: "user", content: [...last.content, ...later] };
+          } else {
+            messages.push({ role: "user", content: later });
+          }
+          break;
+        }
+      }
+    }
+
+    return messages;
   }
 
   /**
@@ -387,13 +484,14 @@ export function createMistralProvider(apiKey?: string): OpenAICompatibleProvider
     apiKey ?? process.env.MISTRAL_API_KEY ?? "",
     "https://api.mistral.ai/v1",
     {
-      // Mistral has no native prompt-caching API as of May 2026 (verified
-      // docs.mistral.ai). The adapter is a no-op for cache primitives:
-      // emit a structured `cache_skipped` log on every call so operators
-      // can observe (or silence) the gap without runtime overhead, don't
-      // pass any cache parameters, and don't extract cache fields. Flip
-      // these flags when Mistral ships a caching primitive.
-      skipCaching: true,
+      // Mistral caches a repeated prompt prefix and bills the cached part at
+      // a tenth of the input rate (models.dev and LiteLLM, 2026-10). Same
+      // Chat Completions path as OpenAI: the
+      // `prompt_cache_key` body field routes the run's calls to the same
+      // cache, and `usage.prompt_tokens_details.cached_tokens` says how much
+      // was read from it.
+      passPromptCacheKey: true,
+      extractCachedTokens: true,
     },
   );
 }

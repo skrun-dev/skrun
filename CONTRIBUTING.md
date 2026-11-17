@@ -48,9 +48,11 @@ Monorepo (pnpm workspaces):
 
 ## Local E2E Testing
 
-1. Copy `.env.example` to `.env`, set at least one LLM API key
-2. `pnpm dev:registry` — starts API on localhost:4000
-3. `pnpm test:e2e` — runs all demo agents against the real LLM
+- `pnpm test:e2e` — the end-to-end suite of the quality gate: the API, the SDK and the CLI together, in process, with the model simulated. No key and no server needed; CI runs it on every push.
+- `pnpm test:e2e:live` — the demo agents against a real LLM:
+  1. Copy `.env.example` to `.env`, set at least one LLM API key
+  2. `pnpm test:e2e:live` — starts its own registry on localhost:4000 (it stops whatever holds that port, a `pnpm dev:registry` included) and calls the real model providers
+  3. The registry runs on SQLite unless `DATABASE_URL` is set, and the suite refuses to start unless that URL names a Postgres on this machine whose database ends in `_test` (e.g. `postgres://postgres:postgres@127.0.0.1:55432/skrun_test`, a container started for the purpose) — the registry writes to it and applies its migrations
 
 ## Questions?
 

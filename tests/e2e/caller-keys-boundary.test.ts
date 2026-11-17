@@ -1,19 +1,19 @@
 /**
- * E2E: caller-provided LLM keys — boundary invariants (#15, VT-19 + VT-20).
+ * E2E: caller-provided LLM keys — boundary invariants.
  *
- * VT-19 (self-host): a caller key supplied via `X-LLM-API-Key` reaches the
+ * Self-host: a caller key supplied via `X-LLM-API-Key` reaches the
  * `LLMRouter.call` invocation for the run, but never persists anywhere
  * (DB state row, structured logs, dashboard, exported events).
  *
- * VT-20 (cloud): the same caller key reaches the harness `LLMRouter.call`
+ * Cloud: the same caller key reaches the harness `LLMRouter.call`
  * but NEVER appears in the env block of the spawned sandbox machine
- * (ADR-014 — credentials never enter the sandbox). The harness-side
+ * (credentials never enter the sandbox). The harness-side
  * `buildMachineConfig` runs through its env allowlist + forbidden-substring
  * guards, refusing to forward any LLM key shape.
  *
- * VT-18 (startup fail-fast for SKRUN_RUNTIME=flyio without FLY_API_TOKEN)
- * is verified by the 5 startup-gate tests in `packages/api/src/index.test.ts`
- * (shipped with task 5.1); this file does NOT re-test it.
+ * The startup fail-fast for SKRUN_RUNTIME=flyio without FLY_API_TOKEN
+ * is verified by the 5 startup-gate tests in `packages/api/src/index.test.ts`;
+ * this file does NOT re-test it.
  */
 import { describe, expect, it, vi } from "vitest";
 import type { FlyMachinesApi, Machine } from "../../packages/runtime/src/adapter/flyio/index.js";
@@ -42,11 +42,9 @@ function makeRunRequest(overrides?: Partial<RunRequest>): RunRequest {
       mcp_servers: [],
       environment: {
         networking: { allowed_hosts: ["api.anthropic.com"] },
-        filesystem: "read-only",
         secrets: [],
         timeout: "30s",
         max_cost: 1.0,
-        sandbox: "strict",
       },
       state: { type: "kv" },
       context_mode: "skill",
@@ -67,7 +65,7 @@ async function collect(gen: AsyncGenerator<RunEvent>): Promise<RunEvent[]> {
   return events;
 }
 
-describe("VT-19: caller key reaches the LLM router in self-host mode but never persists", () => {
+describe("caller key reaches the LLM router in self-host mode but never persists", () => {
   /**
    * The router's normal resolveProvider path is to mint an EPHEMERAL provider
    * with the caller's key (bypassing any registered provider) — which would
@@ -129,7 +127,7 @@ describe("VT-19: caller key reaches the LLM router in self-host mode but never p
   });
 });
 
-describe("VT-20: caller key NEVER enters the cloud sandbox env (ADR-014)", () => {
+describe("caller key NEVER enters the cloud sandbox env", () => {
   /**
    * Builds a FlyioAdapter wired to mocked Fly + storage + fetch so we can
    * spawn a (virtual) machine and intercept the env block that would be
@@ -223,21 +221,23 @@ describe("VT-20: caller key NEVER enters the cloud sandbox env (ADR-014)", () =>
 
     const env = ctx.capturedEnv ?? {};
     const keys = Object.keys(env).sort();
+    // No URL of the run: they travel in the body of /init, signed once the
+    // machine answers.
     expect(keys).toEqual([
-      "BUNDLE_URL",
-      "MAX_RUN_TIMEOUT_MS",
-      "OUTPUTS_PUT_URL",
       // Harness-controlled infra hostnames (object store + install registries)
       // the runner's egress allowlist must permit — hostnames, not credentials.
       // RUNNER_HARNESS_6PN is NOT here: it is gated on process.env.FLY_PRIVATE_IP
       // (unset in this test), so it is only present on a real Fly machine.
       "RUNNER_INFRA_HOSTS",
+      // The machine's lifetime, in whole seconds — a duration, not a credential.
+      "RUNNER_LIFETIME_S",
       "RUNNER_PORT",
       // Per-run RPC auth token — an infrastructure param consumed by the runner
       // supervisor to authenticate the harness→runner RPC. It is NOT forwarded to
       // the agent script env (buildSpawnEnv only passes SKRUN_* + SCRIPT_SAFE vars
-      // — proven by VT-5/SC-2c in script-provider.test.ts), so it does not weaken
-      // the ADR-014 "no credentials in the sandbox" boundary this test guards.
+      // — proven in script-provider.test.ts: a spawned script cannot read it), so
+      // it does not weaken the "no credentials in the sandbox" boundary this test
+      // guards.
       "RUNNER_RPC_TOKEN",
       "SKRUN_ALLOWED_HOSTS",
       "SKRUN_CONTAINER_MODE",
@@ -269,9 +269,9 @@ describe("VT-20: caller key NEVER enters the cloud sandbox env (ADR-014)", () =>
   });
 });
 
-describe("VT-18 reference: SKRUN_RUNTIME=flyio fail-fast at startup", () => {
-  it("is verified by packages/api/src/index.test.ts (5 startup-gate tests, shipped in 5.1)", () => {
-    // VT-18 is structurally satisfied by:
+describe("SKRUN_RUNTIME=flyio fail-fast at startup", () => {
+  it("is verified by packages/api/src/index.test.ts (5 startup-gate tests)", () => {
+    // The fail-fast is structurally satisfied by:
     //   - `createApp` calling `selectRuntimeMode()` at boot,
     //   - which calls `buildFlyioDeps()` when mode === "flyio",
     //   - which throws naming every missing env var.

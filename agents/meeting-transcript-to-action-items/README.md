@@ -3,7 +3,7 @@
 > **Persona**: Yann (engineering manager / PM at a scale-up)
 > **Artifacts**: `actions.csv` (importable to Linear/Asana/Notion) + `recap.md` (paste into Slack)
 > **Skrun strengths shown**: persistent state across runs · multi-step LLM orchestration · Files API · multimodal audio input
-> **Version**: 0.2.0 (audio-native — see [CHANGELOG](#version-history))
+> **Version**: 0.4.1 (audio-native — see [CHANGELOG](#version-history))
 
 ## Purpose
 
@@ -14,7 +14,7 @@ This agent does that for you — takes the meeting **audio** directly, transcrib
 ## Prerequisites
 
 - Skrun running (`pnpm dev:registry` from the repo root)
-- One LLM API key — **Google Gemini** (the agent's model `gemini-2.5-flash` reads audio natively; the free tier is fine for the bundled fixture)
+- One LLM API key — **Google Gemini** (the agent's model `gemini-3.8-flash` reads audio natively; the free tier is fine for the bundled fixture)
 - An audio recording of the meeting — WAV, MP3, M4A, OGG, or WebM, up to ~30 minutes of typical compression (25 MB cap)
 
 ## How to run
@@ -25,7 +25,7 @@ From the repo root:
 # 1. Push the agent to your local registry
 cd agents/meeting-transcript-to-action-items
 skrun build && skrun push
-skrun verify dev/meeting-transcript-to-action-items@0.2.0   # admin step; dev-token = auto-admin
+skrun verify dev/meeting-transcript-to-action-items@0.4.1   # admin step; dev-token = auto-admin
 
 # 2. Upload the recording and capture the file_id
 RECORDING=$(curl -s -X POST http://localhost:4000/api/files \
@@ -103,9 +103,9 @@ Any meeting audio recording works — Zoom local recording, Teams export, a phon
 
 ## State semantics
 
-State is keyed by the agent name (`dev/meeting-transcript-to-action-items`). All calls share the same ledger. The state TTL is 90 days — actions older than that are dropped automatically.
+The agent keeps **one ledger per caller** (`scope: per_caller`). Your own credentials — a dashboard session, `dev-token`, an account-wide key with every operation — share your account's ledger; any other key has a ledger of its own. So for **per-team** ledgers, give each team its own key restricted to this agent (`skrun keys create --name team-a --agent <ns>/meeting-transcript-to-action-items --run-only`): each team's runs resolve only that team's actions, and revoking its key deletes its ledger.
 
-If you want **per-team** ledgers, deploy a copy of this agent under a different namespace (e.g., `your-org/meeting-transcript-to-action-items`) — Skrun keys state by full agent name, so each deployment gets its own ledger.
+For one ledger shared by every caller, set `scope: shared` under `state:` in `agent.yaml`. Either way, the ledger is deleted with the agent. The agent declares `ttl: 90d`: the whole ledger expires 90 days after the last run that wrote it — not action by action — and the next run starts with an empty one (see [Concepts → State](../../docs/concepts.md#state)).
 
 ## What you'd customize for production
 
@@ -113,3 +113,12 @@ If you want **per-team** ledgers, deploy a copy of this agent under a different 
 - Push action items to Linear/Asana via their API — same caveat.
 - Add an `assigned_to_filter` input so a per-person view of open actions can be queried via state.
 - Swap the LLM-as-judge for a small fine-tuned classifier for the "is this action resolved?" decision — would reduce false positives at scale.
+
+## Version history
+
+- **0.4.1** — the retired `filesystem` field and the empty `secrets` list removed from `agent.yaml`.
+- **0.4.0** — one ledger per caller: `agent.yaml` declares `scope: per_caller`. Before, every caller of the agent read and wrote the same ledger. Needs a Skrun server ≥ 2.0.0, where per-caller state is also the default; an earlier server ignores the field and keeps one ledger for every caller.
+- **0.3.0** — the model is Gemini 3.8 Flash, with Gemini 3.5 Flash-Lite as fallback: Google opens Gemini 2.5 only to accounts that have used it before.
+- **0.2.1** — the retired `sandbox` field removed from `agent.yaml`.
+- **0.2.0** (2026-05-01) — audio-native. Accepts a meeting recording directly via Skrun's multimodal file inputs; Gemini transcribes the audio and extracts decisions and action items in a single pass.
+- **0.1.0** — text transcript input, removed in 0.2.0: an upstream Whisper or VTT extraction step was needed.

@@ -52,10 +52,19 @@ export async function* withGeneratorTimeout<T>(
         throw new TimeoutError(timeoutMs);
       }
       const nextPromise = gen.next();
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const timerPromise = new Promise<typeof timeoutSentinel>((resolve) => {
-        setTimeout(() => resolve(timeoutSentinel), remainingMs);
+        timer = setTimeout(() => resolve(timeoutSentinel), remainingMs);
       });
-      const winner = await Promise.race([nextPromise, timerPromise]);
+      let winner: IteratorResult<T> | typeof timeoutSentinel;
+      try {
+        winner = await Promise.race([nextPromise, timerPromise]);
+      } finally {
+        // Cleared as soon as the race is decided, whoever won — the event, the
+        // deadline, or a source that failed: a timer left armed holds its
+        // promise, and through the race the event, until the run's deadline.
+        clearTimeout(timer);
+      }
       if (winner === timeoutSentinel) {
         throw new TimeoutError(timeoutMs);
       }

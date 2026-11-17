@@ -1,6 +1,6 @@
 {
   "name": "@skrun-dev/cli",
-  "version": "1.2.1",
+  "version": "2.0.0",
   "type": "module",
   "bin": {
     "skrun": "./bin/skrun.js"
@@ -18,7 +18,7 @@
     "bin"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "tsc --watch"
@@ -28,14 +28,15 @@
     "@skrun-dev/runtime": "workspace:*",
     "@skrun-dev/schema": "workspace:*",
     "commander": "^14.0.3",
-    "picocolors": "^1.1.1"
+    "picocolors": "^1.1.1",
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
     "@types/tar-stream": "3.1.4",
     "tar-stream": "3.2.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   },
   "publishConfig": {
     "access": "public"
@@ -54,6 +55,6 @@
     "ai-agents"
   ],
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.19.0"
   }
 }

@@ -20,7 +20,9 @@
 #   SKRUN_ALLOWED_HOSTS       CSV of hosts the agent is allowed to reach
 #                             (runner mode only). Resolved via getent at
 #                             boot and ACCEPT'd by ip. Empty list = no
-#                             egress except loopback + DNS.
+#                             egress except loopback + DNS. `*` = every
+#                             address outside the blocked ranges, TCP/25
+#                             refused (setup_iptables, net-lib.sh).
 #
 # Exit codes:
 #   0   success — exec'd into runner-start.sh or api-server-start.sh
@@ -30,182 +32,16 @@
 
 set -euo pipefail
 
-# Shared egress helpers (is_private_ip) — kept in sync with
-# packages/runtime/src/security/network.ts. Defines the function; the egress
-# allowlist (runner mode) uses it to refuse a resolved private/link-local IP.
+# Shared egress helpers: setup_iptables (the egress rules, runner mode) and
+# is_private_ip (the blocked-range check it and the re-resolve loop apply to each
+# resolved address), both reading the ranges file the image build writes from the
+# runtime's own list.
 source /usr/local/bin/net-lib.sh
 
 MODE="${SKRUN_CONTAINER_MODE:-api-server}"
 
 log() {
   echo "[skrun-entrypoint] $*" >&2
-}
-
-setup_iptables() {
-  local hosts_csv="${SKRUN_ALLOWED_HOSTS:-}"
-  log "configuring iptables egress allowlist (mode=runner)"
-
-  # Default-DROP on OUTPUT. INPUT stays default-ACCEPT — we trust the
-  # Fly.io / Docker layer to firewall ingress.
-  iptables -P OUTPUT DROP
-
-  # Loopback (agent script may bind localhost — Playwright MCP debugger,
-  # local Hono server, etc.)
-  iptables -A OUTPUT -o lo -j ACCEPT
-
-  # Established / related (return packets for the connections we ACCEPT
-  # below). Without this rule, even ACCEPTed outbound connections never
-  # see their response — kernel drops the reply.
-  iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-  # IPv6 egress: mirror the v4 policy. The runner sits on an IPv6 private
-  # network — without this, outbound IPv6 is unrestricted and bypasses the
-  # allowlist. INPUT stays default-ACCEPT (the inbound RPC is authenticated,
-  # not network-gated). ESTABLISHED,RELATED keeps the RPC return path alive.
-  ip6tables -P OUTPUT DROP
-  ip6tables -A OUTPUT -o lo -j ACCEPT
-  # ICMPv6 is MANDATORY for IPv6 to function: Neighbor Discovery resolves the
-  # next-hop link-layer address for EVERY unicast, and Router Solicitation gets
-  # the default route. Under -P OUTPUT DROP without this, the runner can't
-  # ND-resolve any peer, so NO IPv6 packet is ever delivered — the RPC reply,
-  # DNS, and allowed_hosts all silently fail. This is the classic ip6tables
-  # egress-DROP mistake and the real cause of the early boot-probe failures.
-  # ICMPv6 is not a data-egress channel, so this doesn't widen the box.
-  ip6tables -A OUTPUT -p ipv6-icmp -j ACCEPT
-  # Return path for the inbound RPC (harness → runner) + any egress we ACCEPT
-  # below. Once ICMPv6/ND works, the kernel DOES track IPv6 connections, so
-  # ESTABLISHED,RELATED is the primary carrier of the runner's RPC reply to the
-  # harness. We ALSO add an explicit per-harness ACCEPT just below as
-  # defense-in-depth — cheap insurance if a future kernel update regressed IPv6
-  # conntrack, in which case ESTABLISHED alone would silently drop the reply.
-  ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-  # Explicit RPC return path to the harness (api-server), defense-in-depth behind
-  # the ESTABLISHED,RELATED match above. The harness's own 6PN is the trusted
-  # control plane (it already drives the runner), NOT a cross-tenant peer, so this
-  # does not widen the sandbox — sibling runners / Fly internals stay DROPped.
-  # Omitted when RUNNER_HARNESS_6PN is unset (self-host / non-Fly).
-  if [[ -n "${RUNNER_HARNESS_6PN:-}" ]]; then
-    log "  allowing RPC return path to harness ${RUNNER_HARNESS_6PN}"
-    ip6tables -A OUTPUT -d "${RUNNER_HARNESS_6PN}" -j ACCEPT
-  fi
-
-  # DNS: read nameservers from /etc/resolv.conf and ACCEPT UDP 53 to each.
-  # Without this rule, getent / curl can't resolve the allowed hosts.
-  while IFS= read -r ns; do
-    if [[ -n "$ns" ]]; then
-      log "  allowing DNS to $ns:53"
-      # A v6 nameserver (Fly's internal resolver is IPv6) needs ip6tables;
-      # a v4 one needs iptables. Detect by the presence of a colon.
-      if [[ "$ns" == *:* ]]; then
-        ip6tables -A OUTPUT -p udp -d "$ns" --dport 53 -j ACCEPT
-        ip6tables -A OUTPUT -p tcp -d "$ns" --dport 53 -j ACCEPT
-      else
-        iptables -A OUTPUT -p udp -d "$ns" --dport 53 -j ACCEPT
-        iptables -A OUTPUT -p tcp -d "$ns" --dport 53 -j ACCEPT
-      fi
-    fi
-  done < <(awk '/^nameserver/ { print $2 }' /etc/resolv.conf)
-
-  # Seed the dns-reresolve state file with the exact host|ip pairs we ACCEPT at
-  # boot below. dns-reresolve.sh reads this snapshot (it does NOT truncate it) so
-  # its first diff is empty; otherwise the first cycle re-adds every boot rule as
-  # a duplicate, and a later -D for a rotated-away IP removes only one copy,
-  # leaving a ghost ACCEPT until restart. Only agent allowed_hosts are tracked
-  # (infra hosts are not re-resolved). Truncate once here; append after each
-  # ACCEPT below.
-  local state_file="/run/skrun-allowed-ips"
-  : > "$state_file" || log "  WARNING: cannot init dns-reresolve state file $state_file"
-
-  # Resolve each allowed host to its current IPv4(s) and ACCEPT outbound
-  # connections to each. getent supports CSV via xargs splitting.
-  if [[ -n "$hosts_csv" ]]; then
-    log "resolving allowed hosts: $hosts_csv"
-    IFS=',' read -ra hosts <<< "$hosts_csv"
-    for host in "${hosts[@]}"; do
-      host="${host// /}"
-      [[ -z "$host" ]] && continue
-      # getent prints "IP HOSTNAME ALIASES..." one line per address.
-      # We take the first column. May return 0 results — log and continue.
-      local found=0
-      # getent ahostsv4 yields IPv4 only (AF_INET), deterministic + symmetric
-      # with the ahostsv6 arm below. (`getent hosts` is resolver-order-dependent
-      # and can return AAAA-first — or v6-only — leaving no v4 rule; the dev-image
-      # cloud-verify caught exactly this on a runner where `getent hosts
-      # example.com` returned its AAAA.)
-      while IFS= read -r addr; do
-        if [[ -n "$addr" ]]; then
-          # Never ACCEPT a resolved private/link-local IP, even for an
-          # operator-declared allowed_host (DNS-rebinding defense).
-          if is_private_ip "$addr"; then
-            log "  $host → $addr — SKIP (private/link-local)"
-            continue
-          fi
-          log "  $host → $addr — ACCEPT"
-          iptables -A OUTPUT -d "$addr" -j ACCEPT
-          echo "$host|$addr" >> "$state_file" || log "  WARNING: state-file seed failed for $host|$addr"
-          found=1
-        fi
-      done < <(getent ahostsv4 "$host" | awk '{ print $1 }' | sort -u)
-      # IPv6 (AAAA): resolve v6 addresses and ACCEPT each via ip6tables, same
-      # private-IP filter. getent ahostsv6 yields v6 only (multiple socktype
-      # lines per address — sort -u dedups).
-      while IFS= read -r addr6; do
-        if [[ -n "$addr6" ]]; then
-          if is_private_ip "$addr6"; then
-            log "  $host → $addr6 — SKIP (private/link-local)"
-            continue
-          fi
-          log "  $host → $addr6 — ACCEPT (v6)"
-          ip6tables -A OUTPUT -d "$addr6" -j ACCEPT
-          echo "$host|$addr6" >> "$state_file" || log "  WARNING: state-file seed failed for $host|$addr6"
-          found=1
-        fi
-      done < <(getent ahostsv6 "$host" | awk '{ print $1 }' | sort -u)
-      if [[ "$found" -eq 0 ]]; then
-        log "  WARNING: $host did not resolve — no rule added"
-      fi
-    done
-  else
-    log "SKRUN_ALLOWED_HOSTS empty — egress restricted to loopback + DNS only"
-  fi
-
-  # Infra hosts (set by the harness): the object store (the bundle GET at /init —
-  # outputs are harness-pulled via GET /outputs/file, never pushed by the runner,
-  # so the outputs host is present here only as harmless dedup) and the install-
-  # time package registries. These previously rode on the open IPv6 that the
-  # ip6tables policy above now closes, so without an explicit rule every cloud run
-  # fails at /init (bundle fetch). Resolved on BOTH families. They are harness-
-  # controlled + trusted, so — unlike agent allowed_hosts — they are NOT run
-  # through the private-IP filter (a self-host MinIO endpoint may be private).
-  if [[ -n "${RUNNER_INFRA_HOSTS:-}" ]]; then
-    log "resolving infra hosts: ${RUNNER_INFRA_HOSTS}"
-    IFS=',' read -ra infra_hosts <<< "${RUNNER_INFRA_HOSTS}"
-    for ihost in "${infra_hosts[@]}"; do
-      ihost="${ihost// /}"
-      [[ -z "$ihost" ]] && continue
-      local ifound=0
-      while IFS= read -r iaddr; do
-        if [[ -n "$iaddr" ]]; then
-          log "  infra $ihost → $iaddr — ACCEPT"
-          iptables -A OUTPUT -d "$iaddr" -j ACCEPT
-          ifound=1
-        fi
-      done < <(getent ahostsv4 "$ihost" | awk '{ print $1 }' | sort -u)
-      while IFS= read -r iaddr; do
-        if [[ -n "$iaddr" ]]; then
-          log "  infra $ihost → $iaddr — ACCEPT (v6)"
-          ip6tables -A OUTPUT -d "$iaddr" -j ACCEPT
-          ifound=1
-        fi
-      done < <(getent ahostsv6 "$ihost" | awk '{ print $1 }' | sort -u)
-      if [[ "$ifound" -eq 0 ]]; then
-        log "  WARNING: infra host $ihost did not resolve — no rule added"
-      fi
-    done
-  fi
-
-  log "iptables egress allowlist configured"
 }
 
 case "$MODE" in
@@ -237,8 +73,9 @@ case "$MODE" in
     # On a pre-created machine SKRUN_ALLOWED_HOSTS is simply absent, so the loop
     # over agent hosts is skipped and everything that does NOT depend on the agent
     # is still installed now: the default-DROP policy, loopback, established
-    # connections, ICMPv6, the nameservers, the infrastructure hosts and the
-    # control-plane return path. Those are the same for every run, so paying for
+    # connections, ICMPv6, the nameservers, the infrastructure hosts, the
+    # control-plane return path and the blocked-range drops — the agent's hosts,
+    # added at assignment, land after those. Those are the same for every run, so paying for
     # them here costs the caller nothing — and the machine is never open in the
     # meantime.
     egress_start_ms=$(date +%s%3N)

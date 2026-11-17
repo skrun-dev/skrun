@@ -3,8 +3,9 @@
  * Cross-feature flows: dev-token, API keys, namespace isolation.
  */
 import { beforeEach, describe, expect, it } from "vitest";
-import { generateApiKey } from "../../packages/api/src/auth/api-key.js";
+import { generateApiKey, isApiKeyFormat } from "../../packages/api/src/auth/api-key.js";
 import { createSession, sessionCookieName } from "../../packages/api/src/auth/session.js";
+import { validBundle } from "../../packages/api/src/routes/agent-bundle.shared.js";
 import { createTestApp, DEV_TOKEN, pushAgent, verifyVersion } from "./setup.js";
 
 describe("E2E: Auth", () => {
@@ -26,7 +27,7 @@ describe("E2E: Auth", () => {
     // Verify the version (dev-token = admin) so the runtime gate passes
     await verifyVersion(app, { ns: "dev", name: "test-agent", version: "1.0.0" });
 
-    // Run (will fail because fake bundle, but should not be 401 or 403)
+    // Run (refused for want of a model key, but never 401 or 403)
     const runRes = await app.request("/api/agents/dev/test-agent/run", {
       method: "POST",
       headers: { Authorization: `Bearer ${DEV_TOKEN}`, "Content-Type": "application/json" },
@@ -47,7 +48,7 @@ describe("E2E: Auth", () => {
     });
     expect(createRes.status).toBe(201);
     const { key } = await createRes.json();
-    expect(key).toMatch(/^sk_live_/);
+    expect(isApiKeyFormat(key)).toBe(true);
 
     // Use the key to call /api/me — must work (user was auto-created in DB)
     const meRes = await app.request("/api/me", {
@@ -75,14 +76,14 @@ describe("E2E: Auth", () => {
     const pushRes = await app.request("/api/agents/e2euser/my-agent/push?version=1.0.0", {
       method: "POST",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/octet-stream" },
-      body: Buffer.from("fake-bundle"),
+      body: new Uint8Array(await validBundle("my-agent")),
     });
     expect(pushRes.status).toBe(200);
 
     // Verify the version (dev-token = admin) so the runtime gate passes
     await verifyVersion(app, { ns: "e2euser", name: "my-agent", version: "1.0.0" });
 
-    // Run with same API key (will fail at bundle extract, but auth passes)
+    // Run with same API key (refused for want of a model key, but auth passes)
     const runRes = await app.request("/api/agents/e2euser/my-agent/run", {
       method: "POST",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
@@ -108,7 +109,7 @@ describe("E2E: Auth", () => {
     const res = await app.request("/api/agents/bob/my-agent/push?version=1.0.0", {
       method: "POST",
       headers: { Authorization: `Bearer ${keyA}`, "Content-Type": "application/octet-stream" },
-      body: Buffer.from("fake-bundle"),
+      body: new Uint8Array(await validBundle("my-agent")),
     });
     expect(res.status).toBe(403);
   });

@@ -1,7 +1,8 @@
 import Anthropic, { toFile } from "@anthropic-ai/sdk";
 import { createLogger } from "../../logger.js";
-import { LLMCapabilityError } from "../errors.js";
+import { LLMCapabilityError, LLMHistoryError } from "../errors.js";
 import { fingerprintBytes, type ProviderFileCache } from "../file-cache.js";
+import { getCacheMinTokens, getMaxOutputTokens } from "../model-tables.js";
 import type { SkrunPart } from "../parts.js";
 import type { ResolvedToolChoice } from "../tool-choice.js";
 import type { LLMCallRequest, LLMCallResponse, LLMProvider, ToolCallRequest } from "./types.js";
@@ -9,78 +10,92 @@ import type { LLMCallRequest, LLMCallResponse, LLMProvider, ToolCallRequest } fr
 const ANTHROPIC_FILES_BETA = "files-api-2025-04-14";
 /** Above this raw-bytes threshold of non-text parts, pre-upload via Files API. */
 const PRE_UPLOAD_THRESHOLD_BYTES = 20 * 1024 * 1024;
+
+/**
+ * The most `max_tokens` this adapter sends: the model's output limit
+ * (`getMaxOutputTokens`) when it is lower, this bound otherwise — and for a
+ * model the table does not know. The API requires the field; a thinking
+ * model's reasoning counts toward it, so a low value cuts the answer off.
+ *
+ * Kept under the SDK's own guard for a call that does not stream: past
+ * 21 333 tokens it refuses the call ("Streaming is required for operations
+ * that may take longer than 10 minutes"). Going further means streaming.
+ */
+const MAX_TOKENS_BOUND = 16_384;
 const log = createLogger("llm:anthropic");
-
-/**
- * Per-model minimum-tokens threshold for prompt-caching.
- *
- * Anthropic silently no-ops `cache_control` injection on prefixes shorter than
- * the model's threshold. Setting `cache_control` below threshold pays the
- * 1.25× write surcharge with ZERO chance of a cache hit — strictly worse than
- * not injecting at all. The runtime evaluates each prefix (tools, system)
- * independently and only injects when that prefix's own token estimate
- * exceeds the threshold.
- *
- * Source: verified May 2026 against platform.claude.com docs.
- *
- * Default fallback for unmapped IDs is 1024 (the lowest of all current
- * Anthropic thresholds — safe over-injection rather than missed cache hits).
- */
-const MODEL_CACHE_MIN_TOKENS: Record<string, number> = {
-  "claude-opus-4-7": 4096,
-  "claude-opus-4-6": 4096,
-  "claude-opus-4-5": 4096,
-  "claude-opus-4-1": 1024,
-  "claude-opus-4": 1024,
-  "claude-sonnet-4-6": 2048,
-  "claude-sonnet-4-5": 1024,
-  "claude-sonnet-4": 1024,
-  "claude-3-7-sonnet": 1024,
-  "claude-haiku-4-5": 4096,
-  "claude-haiku-4": 4096,
-  "claude-3-5-haiku": 2048,
-  "claude-3-haiku": 2048,
-};
-
-const DEFAULT_CACHE_MIN_TOKENS = 1024;
-
-/**
- * Look up the per-model min-tokens threshold via prefix match against
- * `MODEL_CACHE_MIN_TOKENS`. Mirrors the prefix-match pattern used by
- * `getModelCapabilities` for snapshot/dated model IDs (e.g.
- * `claude-opus-4-7-20260416` resolves to `claude-opus-4-7`).
- */
-function getCacheMinTokens(model: string): number {
-  if (model in MODEL_CACHE_MIN_TOKENS) return MODEL_CACHE_MIN_TOKENS[model];
-  let bestMatch: { key: string; threshold: number } | undefined;
-  for (const [key, threshold] of Object.entries(MODEL_CACHE_MIN_TOKENS)) {
-    if (model.startsWith(`${key}-`) && (!bestMatch || key.length > bestMatch.key.length)) {
-      bestMatch = { key, threshold };
-    }
-  }
-  return bestMatch?.threshold ?? DEFAULT_CACHE_MIN_TOKENS;
-}
 
 /**
  * Heuristic token estimator for prefix-size threshold check.
  *
- * Uses `JSON.stringify(prefix).length / 4` — the industry rule-of-thumb of
- * ~4 chars per token. Direction note: JSON serialization adds quotes,
+ * Uses the length of `JSON.stringify(prefix)`, divided by 4 — the industry
+ * rule-of-thumb of ~4 chars per token. Direction note: JSON serialization adds quotes,
  * braces, and escape chars beyond semantic content, so this heuristic
  * typically OVER-estimates true semantic tokens. That's the safe direction
  * for our purpose: we'll inject `cache_control` when marginally above
- * threshold even if true tokens are slightly below, paying the 1.25× write
- * surcharge in rare borderline cases. The opposite direction (under-
- * estimating) would cause silent missed-cache scenarios. Do NOT replace
- * with a more precise tokenizer that under-estimates without re-evaluating
- * this trade-off.
+ * threshold even if true tokens are slightly below — Anthropic then processes
+ * the request without caching, and no error is returned (Anthropic, "Prompt
+ * caching" § Cache limitations): the point caches nothing and costs nothing.
+ * The opposite direction (under-estimating) would cause silent missed-cache
+ * scenarios. Do NOT replace with a more precise tokenizer that
+ * under-estimates without re-evaluating this trade-off.
  *
  * Returning a true tokenizer (anthropic-tokenizer-typescript) is intentionally
  * deferred — adds a dependency for marginal accuracy gain on a threshold
  * decision where the safe error mode is over-estimation.
+ *
+ * A file sent inline is counted, never serialized. An image or a document
+ * block travels with its file as a base64 string — the `data` of its
+ * `source`, `{ type: "base64", media_type, data }`, the exact shape
+ * `translateUserContent` builds — and base64 needs no escaping: serialized,
+ * it adds its own length and two quotes. The estimate adds that length and
+ * serializes the rest — the same number as serializing everything, without
+ * copying the file into a JSON string, which would cost as much as the file
+ * (inline up to `PRE_UPLOAD_THRESHOLD_BYTES`) at every turn of a tool loop,
+ * the conversation's input included. Only that shape, under an image or a
+ * document block, is counted so: any other `data` — a tool call's arguments
+ * that happen to say `type: "base64"`, a text source — may need escaping, and
+ * is serialized.
+ *
+ * Exported for its tests; the package's entry point does not re-export it.
  */
-function estimatePrefixTokens(prefix: unknown): number {
-  return Math.ceil(JSON.stringify(prefix).length / 4);
+export function estimatePrefixTokens(prefix: unknown): number {
+  let inlineChars = 0;
+  const inlineSources = new WeakSet<object>();
+  const json = JSON.stringify(prefix, function (this: unknown, key: string, value: unknown) {
+    if (key === "source" && isMediaBlock(this) && isInlineSource(value)) {
+      inlineSources.add(value);
+    } else if (
+      key === "data" &&
+      typeof value === "string" &&
+      typeof this === "object" &&
+      this !== null &&
+      inlineSources.has(this)
+    ) {
+      inlineChars += value.length;
+      return "";
+    }
+    return value;
+  });
+  return Math.ceil((json.length + inlineChars) / 4);
+}
+
+/** Whether an object is an image or a document content block. */
+function isMediaBlock(holder: unknown): boolean {
+  if (typeof holder !== "object" || holder === null) return false;
+  const type = (holder as { type?: unknown }).type;
+  return type === "image" || type === "document";
+}
+
+/** Whether a block's source is the inline one: exactly `{ type: "base64", media_type, data }`. */
+function isInlineSource(source: unknown): source is object {
+  if (typeof source !== "object" || source === null) return false;
+  const s = source as { type?: unknown; media_type?: unknown; data?: unknown };
+  return (
+    s.type === "base64" &&
+    typeof s.media_type === "string" &&
+    typeof s.data === "string" &&
+    Object.keys(source).length === 3
+  );
 }
 
 /**
@@ -131,33 +146,7 @@ export class AnthropicProvider implements LLMProvider {
   }
 
   async call(request: LLMCallRequest): Promise<LLMCallResponse> {
-    const { blocks, usedFilesApi } = await this.translateUserContent(
-      request.userContent,
-      request._fileCache,
-    );
-
-    const messages: Anthropic.MessageParam[] = [];
-
-    if (request.toolResults?.length) {
-      messages.push({ role: "user", content: blocks });
-
-      const toolUseBlocks: Anthropic.ContentBlockParam[] = request.toolResults.map((tr, i) => ({
-        type: "tool_use" as const,
-        id: tr.id ?? tr.name,
-        name: tr.name,
-        input: request.toolCalls?.[i]?.args ?? {},
-      }));
-      messages.push({ role: "assistant", content: toolUseBlocks });
-
-      const toolResultContent: Anthropic.ToolResultBlockParam[] = request.toolResults.map((tr) => ({
-        type: "tool_result" as const,
-        tool_use_id: tr.id ?? tr.name,
-        content: tr.result,
-      }));
-      messages.push({ role: "user", content: toolResultContent });
-    } else {
-      messages.push({ role: "user", content: blocks });
-    }
+    const { messages, usedFilesApi } = await this.buildMessages(request);
 
     const tools: Anthropic.Tool[] | undefined = request.tools?.map((t) => ({
       name: t.name,
@@ -169,27 +158,36 @@ export class AnthropicProvider implements LLMProvider {
 
     // Prompt caching: inject `cache_control: { type: "ephemeral" }` on the
     // LAST block of each stable-prefix when that prefix alone exceeds the
-    // model's min-tokens threshold. The runtime auto-places 2 of Anthropic's
-    // 4 allowed breakpoints (last `tools` block + last `system` block); the
-    // remaining 2 are reserved for a future agent.yaml override.
+    // model's min-tokens threshold. The runtime auto-places up to 3 of
+    // Anthropic's 4 allowed breakpoints (last `tools` block, last `system`
+    // block, and the conversation's last message — below); the fourth stays
+    // free for a future agent.yaml override.
     //
-    // Per-prefix threshold check: combined check would pay 1.25× write
-    // surcharge with zero hit potential when each prefix alone is below
-    // threshold but their sum exceeds it. Each block is evaluated
-    // independently.
+    // Per-prefix threshold check: each block is evaluated independently, on
+    // its own estimate. A point on a prefix below the model's threshold
+    // would cache nothing: Anthropic processes the request without caching,
+    // and no error is returned (Anthropic, "Prompt caching" § Cache
+    // limitations).
     //
     // Default TTL is 5m (omit `ttl` field → Anthropic default). The 1h
     // toggle is intentionally not exposed — see "Cost & caching" in
     // docs/concepts.md for the break-even reasoning.
+    //
+    // A third point goes on the conversation itself, when there is one to
+    // grow: see `injectConversationCacheControl`.
     const cacheMinTokens = getCacheMinTokens(request.model);
     const cachedTools = injectToolsCacheControl(tools, cacheMinTokens);
     const cachedSystem = injectSystemCacheControl(request.systemPrompt, cacheMinTokens);
+    const cachedMessages =
+      (tools?.length ?? 0) > 0 || (request.history?.length ?? 0) > 0
+        ? injectConversationCacheControl(messages, cachedTools, cachedSystem, cacheMinTokens)
+        : messages;
 
     const baseParams = {
       model: request.model,
-      max_tokens: 4096,
+      max_tokens: Math.min(getMaxOutputTokens(request.model) ?? MAX_TOKENS_BOUND, MAX_TOKENS_BOUND),
       system: cachedSystem,
-      messages,
+      messages: cachedMessages,
       tools: cachedTools,
       ...(toolChoice !== undefined && { tool_choice: toolChoice }),
       ...(request.temperature !== undefined && { temperature: request.temperature }),
@@ -236,6 +234,9 @@ export class AnthropicProvider implements LLMProvider {
     return {
       content,
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+      // The whole `content` array, untouched: the thinking blocks and their
+      // signatures must go back with the turn that carried them.
+      assistantTurn: { provider: this.name, content: response.content },
       usage: {
         promptTokens: response.usage.input_tokens,
         completionTokens: response.usage.output_tokens,
@@ -243,6 +244,64 @@ export class AnthropicProvider implements LLMProvider {
         ...(cacheWriteTokens !== undefined && cacheWriteTokens > 0 && { cacheWriteTokens }),
       },
     };
+  }
+
+  /**
+   * The conversation as Anthropic messages: the input, then each entry of the
+   * history in order — an assistant turn exactly as the API returned it (its
+   * thinking blocks and their signatures included: they go back with the turn
+   * that carried them), the results of its tool calls as `tool_result` blocks
+   * paired by `tool_use_id`, a later user message. A user message that follows
+   * a user turn — tool results, or the input — joins it, after its blocks. An
+   * assistant turn with no block is left out.
+   *
+   * Throws `LLMHistoryError` on a turn another provider produced.
+   */
+  private async buildMessages(
+    request: LLMCallRequest,
+  ): Promise<{ messages: Anthropic.MessageParam[]; usedFilesApi: boolean }> {
+    const input = await this.translateUserContent(request.userContent, request._fileCache);
+    let usedFilesApi = input.usedFilesApi;
+    const messages: Anthropic.MessageParam[] = [{ role: "user", content: input.blocks }];
+
+    for (const entry of request.history ?? []) {
+      switch (entry.kind) {
+        case "assistant": {
+          if (entry.turn.provider !== this.name) {
+            throw new LLMHistoryError(this.name, entry.turn.provider);
+          }
+          // An empty turn (Claude sometimes ends one with no block at all) is
+          // left out: the API refuses an assistant message with no content
+          // before the last one, and the turn carried nothing to send back.
+          const blocks = entry.turn.content as Anthropic.ContentBlockParam[];
+          if (blocks.length > 0) messages.push({ role: "assistant", content: blocks });
+          break;
+        }
+        case "tool_results":
+          messages.push({
+            role: "user",
+            content: entry.results.map((r) => ({
+              type: "tool_result" as const,
+              tool_use_id: r.id ?? r.name,
+              content: r.result,
+            })),
+          });
+          break;
+        case "user": {
+          const later = await this.translateUserContent(entry.parts, request._fileCache);
+          usedFilesApi ||= later.usedFilesApi;
+          const last = messages[messages.length - 1];
+          if (last.role === "user" && Array.isArray(last.content)) {
+            last.content = [...last.content, ...later.blocks];
+          } else {
+            messages.push({ role: "user", content: later.blocks });
+          }
+          break;
+        }
+      }
+    }
+
+    return { messages, usedFilesApi };
   }
 
   /**
@@ -334,12 +393,13 @@ function guessExt(mime: string): string {
 /**
  * Inject `cache_control: { type: "ephemeral" }` on the LAST tool of the
  * tools array if and only if the array's own token estimate exceeds the
- * model's min-tokens threshold (#68 prompt-caching).
+ * model's min-tokens threshold for prompt caching.
  *
  * Returns the tools array unmodified when:
  * - `tools` is undefined or empty (nothing to cache)
- * - estimated tokens < threshold (silent no-op below threshold; injecting
- *   would just pay the 1.25× write surcharge with no hit potential)
+ * - estimated tokens < threshold (silent no-op below threshold; a point
+ *   there would cache nothing — Anthropic processes the request without
+ *   caching, and no error is returned)
  *
  * Returns a NEW array with the last tool annotated otherwise. Does not
  * mutate the input.
@@ -359,10 +419,72 @@ function injectToolsCacheControl(
   ];
 }
 
+/** Anthropic accepts at most this many `cache_control` points in one request. */
+const MAX_CACHE_POINTS = 4;
+
+/** The `cache_control` points a request already carries. */
+function countCachePoints(
+  tools: Anthropic.Tool[] | undefined,
+  system: string | Array<Anthropic.TextBlockParam>,
+  messages: Anthropic.MessageParam[],
+): number {
+  const marked = (blocks: ReadonlyArray<object>) =>
+    blocks.filter((b) => "cache_control" in b && b.cache_control).length;
+  return (
+    marked(tools ?? []) +
+    (Array.isArray(system) ? marked(system) : 0) +
+    messages.reduce((n, m) => n + (Array.isArray(m.content) ? marked(m.content) : 0), 0)
+  );
+}
+
+/**
+ * The third cache point: `cache_control: { type: "ephemeral" }` on the last
+ * block of the last message, so that the next turn of a tool loop reads the
+ * whole conversation so far — every earlier turn and result — from the cache.
+ * The caller places it only when the request declares tools or carries a
+ * conversation: on a single call, the 1.25× write would have nothing to read
+ * it back.
+ *
+ * Placed when the prefix up to that point — tools, system, messages — reaches
+ * the model's threshold, when the request has a point left under Anthropic's
+ * four, and when the last block can carry one (a thinking block cannot).
+ *
+ * Returns a NEW array whose last message and last block are copies: the other
+ * messages are the conversation's stored turns, sent back exactly as the API
+ * returned them, and they must stay so.
+ */
+function injectConversationCacheControl(
+  messages: Anthropic.MessageParam[],
+  tools: Anthropic.Tool[] | undefined,
+  system: string | Array<Anthropic.TextBlockParam>,
+  minTokens: number,
+): Anthropic.MessageParam[] {
+  const last = messages[messages.length - 1];
+  if (!last) return messages;
+  if (countCachePoints(tools, system, messages) >= MAX_CACHE_POINTS) return messages;
+  if (estimatePrefixTokens([tools, system, messages]) < minTokens) return messages;
+  const blocks: Anthropic.ContentBlockParam[] =
+    typeof last.content === "string" ? [{ type: "text", text: last.content }] : last.content;
+  const lastBlock = blocks[blocks.length - 1];
+  if (!lastBlock || lastBlock.type === "thinking" || lastBlock.type === "redacted_thinking") {
+    return messages;
+  }
+  return [
+    ...messages.slice(0, -1),
+    {
+      ...last,
+      content: [
+        ...blocks.slice(0, -1),
+        { ...lastBlock, cache_control: { type: "ephemeral" } } as Anthropic.ContentBlockParam,
+      ],
+    },
+  ];
+}
+
 /**
  * Inject `cache_control: { type: "ephemeral" }` on the system block if and
  * only if the system content's own token estimate exceeds the model's
- * min-tokens threshold (#68 prompt-caching).
+ * min-tokens threshold for prompt caching.
  *
  * Anthropic accepts `system` as either a string or an array of TextBlockParam.
  * To attach `cache_control`, we MUST convert to the array form (the string

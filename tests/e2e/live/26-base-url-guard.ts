@@ -10,7 +10,7 @@
  * `model.base_url`; an `X-LLM-API-Key` belongs to the caller. When those are two
  * different people, the caller must name the destination.
  *
- * Why a real `sk_live` key is minted rather than reusing the dev-token: the
+ * Why a real API key is minted rather than reusing the dev-token: the
  * exemption is `owner AND master credential`, and a dev-token IS a master
  * credential. Driving this with the dev-token would return 200 and assert
  * nothing — the drafted gate keyed on ownership alone was inert for exactly this
@@ -21,18 +21,34 @@
  *   VT-26c: naming a DIFFERENT origin → 403 (both origins in the message).
  *   VT-26d: a malformed `X-LLM-Base-URL` → 400 INVALID_LLM_BASE_URL_HEADER.
  *
+ * Then a second version of the fixture adds a `fallback` on another provider
+ * (google). Only the key for the primary model's provider goes to the agent's
+ * endpoint — the fallback is called at its own provider's — so the delegated
+ * key sending a google key alone, with no `X-LLM-Base-URL`, gets past the gate
+ * and the run itself is attempted — a refusal of any kind fails the case;
+ * status, code and result printed.
+ *
  * Every assertion fires BEFORE any LLM call, so this phase costs nothing in
- * inference. Self-bootstrapping: pushes its own fixture and DELETEs at the end.
+ * inference. The last case can go further, still for free: past the gate its
+ * primary finds no key (the server never sends its own to an agent-declared
+ * endpoint, which this suite leaves off — phase 28 relies on it too), and the
+ * run may reach the fallback with the fake google key, which the provider
+ * refuses. Self-bootstrapping: pushes its own fixture and DELETEs at the end.
  */
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REGISTRY, results, skrun, TOKEN, verifyLatestVersion } from "./_ctx.js";
+import { API_KEY_PREFIX } from "../../../packages/api/src/auth/api-key.js";
+import { pushFixture, REGISTRY, results, skrun, TOKEN, verifyLatestVersion } from "./_ctx.js";
 
 const NS = "dev";
 const AGENT = "base-url-guard-live";
 const V1 = "9.26.1";
+/** The second version: the same agent, with a fallback on another provider. */
+const V2 = "9.26.2";
+/** That fallback, in the fixture's YAML. */
+const GOOGLE_FALLBACK = "  fallback:\n    provider: google\n    name: gemini-3.8-flash\n";
 /** The endpoint the agent declares — a real third-party OpenAI-compatible host. */
 const DECLARED = "https://api.deepseek.com/v1";
 const DECLARED_ORIGIN = "https://api.deepseek.com";
@@ -44,7 +60,7 @@ async function deleteAgent(): Promise<void> {
   });
 }
 
-function buildAndPush(): string {
+async function buildAndPush(version = V1, fallbackYaml = ""): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), `skrun-live-26-${AGENT}-`));
   writeFileSync(
     join(dir, "SKILL.md"),
@@ -61,12 +77,12 @@ Reply with the literal string "ok".
   writeFileSync(
     join(dir, "agent.yaml"),
     `name: ${AGENT}
-version: ${V1}
+version: ${version}
 model:
   provider: openai
   name: deepseek-chat
   base_url: ${DECLARED}
-inputs:
+${fallbackYaml}inputs:
   - name: task
     type: string
     required: true
@@ -76,11 +92,7 @@ outputs:
 `,
   );
   skrun(["build"], dir);
-  try {
-    skrun(["push"], dir);
-  } catch {
-    // 409 if the version was already pushed in a prior run — proceed.
-  }
+  await pushFixture(dir);
   return dir;
 }
 
@@ -109,8 +121,9 @@ export async function run(): Promise<void> {
   await deleteAgent();
 
   let dir = "";
+  let fallbackDir = "";
   try {
-    dir = buildAndPush();
+    dir = await buildAndPush();
 
     // A run needs a verified version under the default `admin` policy.
     await verifyLatestVersion(NS, AGENT);
@@ -128,7 +141,7 @@ export async function run(): Promise<void> {
       }),
     });
     const delegated = ((await mint.json()) as { key?: string }).key ?? "";
-    if (!delegated.startsWith("sk_live_")) {
+    if (!delegated.startsWith(API_KEY_PREFIX)) {
       record("VT-26 setup: mint a delegated key", false, `mint status=${mint.status}`);
       return;
     }
@@ -206,8 +219,39 @@ export async function run(): Promise<void> {
         `status=${res.status} code=${code}`,
       );
     }
+
+    // ── A key for the fallback's provider alone needs no endpoint named ────
+    {
+      // The same agent, a version with a fallback on google. Only the key for
+      // the primary's provider (openai) would go to the declared endpoint; a
+      // google key alone never does, so the gate lets it through without an
+      // X-LLM-Base-URL. The run may then reach the fallback with this fake key.
+      fallbackDir = await buildAndPush(V2, GOOGLE_FALLBACK);
+      await verifyLatestVersion(NS, AGENT);
+      const res = await runAs(delegated, {
+        "X-LLM-API-Key": JSON.stringify({ google: "caller-google-fake-not-a-real-key" }),
+      });
+      const body = (await res.json()) as ErrorBody & { status?: string };
+      const code = body.error?.code ?? "none";
+      const result = body.status ?? "none";
+      // Past the gate, nothing refuses this run before it starts — its fallback
+      // has a key, the caller's — so the run itself is attempted: a blocking
+      // call answers 200 with its result (failed here, the provider refusing
+      // the fake key), or 502 EXECUTION_FAILED where the runtime reports a
+      // failed run that way. Any refusal before the run — this gate's, or one
+      // unrelated — answers something else, and fails the case.
+      const attempted =
+        (res.status === 200 && (result === "failed" || result === "completed")) ||
+        (res.status === 502 && code === "EXECUTION_FAILED");
+      record(
+        "a key for the fallback's provider alone, no consent header → past the gate, the run attempted",
+        attempted,
+        `status=${res.status} code=${code} result=${result} version=${V2} key_for=google`,
+      );
+    }
   } finally {
     await deleteAgent();
     if (dir) rmSync(dir, { recursive: true, force: true });
+    if (fallbackDir) rmSync(fallbackDir, { recursive: true, force: true });
   }
 }

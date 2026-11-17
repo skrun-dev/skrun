@@ -1,14 +1,15 @@
 name: csv-to-executive-report
-version: 0.2.0
+version: 0.3.1
+# v0.3.0: Gemini 3.8 Flash, with Gemini 3.5 Flash-Lite as fallback.
 # v0.2.0: deps now auto-resolved by Skrun runtime via requirements.txt.
 # v0.1.0 required a manual `pip install -r requirements.txt` before first use.
 
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
   fallback:
     provider: google
-    name: gemini-2.5-flash-lite
+    name: gemini-3.5-flash-lite
 
 tools:
   - name: analyze_csv
@@ -114,10 +115,7 @@ outputs:
 environment:
   networking:
     allowed_hosts: []
-  filesystem: read-write
-  secrets: []
   timeout: 240s
-  sandbox: strict
 
 state:
   type: none

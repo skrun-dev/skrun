@@ -7,12 +7,30 @@
  *
  * The script will:
  *   - Auto-start the registry (kills existing process on port 4000)
+ *   - Sign the CLI in to it from a profile of its own, never the developer's
+ *     configuration
  *   - Patch each agent to dev/ namespace + google provider
  *   - Build and push each agent
  *   - POST /run and verify the response
  *   - Test caller-provided LLM keys
- *   - Test agent verification (script blocking, dev-token bypass)
+ *   - Test agent verification (an unverified version refused under the default policy)
  *   - Test seo-audit stateful behavior (2 runs)
+ *   - Restart the registry with quotas set for one phase (an account's seats and
+ *     compute window), then restart it without them
+ *   - Run a three-step tool chain on every model choice and demo model whose
+ *     provider key is set (the others are skipped, and say so)
+ *   - Run an agent whose tool returns more than a tool's result may be, and read
+ *     the cut in its tool_result event
+ *   - Read the instance's links the dashboard shows (GET /api/instance), and
+ *     its 401 with no credential
+ *   - Restart the registry with local model endpoints allowed for one phase,
+ *     whose agent declares a fake endpoint in model.base_url that crosses each
+ *     bound on what a model returns - one line per code, the code printed -,
+ *     then restart it as the other phases know it
+ *   - On Postgres only, restart the registry with a one-second bound on each
+ *     statement it sends its database, hold a key's row from a connection of
+ *     the phase's own, and read the 503 DATABASE_TIMEOUT the key's revocation
+ *     gets - then restart it as the other phases know it
  *   - Restore original agent.yaml files
  *   - Auto-stop the registry
  *   - Print a summary
@@ -20,13 +38,12 @@
 
 import {
   cleanupDevNamespace,
-  ROOT,
   registryLogPath,
   results,
-  skrun,
+  signInCli,
   startRegistry,
   stopRegistry,
-  TOKEN,
+  toolLoopModels,
 } from "./e2e/live/_ctx.js";
 import { run as runDemos } from "./e2e/live/01-demos.js";
 import { run as runCallerKeys } from "./e2e/live/02-caller-keys.js";
@@ -53,6 +70,34 @@ import { run as runCreatorLlmKey } from "./e2e/live/24-creator-llm-key.js";
 import { run as runDeviceLogin } from "./e2e/live/25-device-login.js";
 import { run as runBaseUrlGuard } from "./e2e/live/26-base-url-guard.js";
 import { run as runRunBoundary } from "./e2e/live/27-run-boundary.js";
+import { run as runAuthorPath } from "./e2e/live/28-author-path.js";
+import { run as runToolLoop } from "./e2e/live/29-tool-loop.js";
+import { run as runAccountDeletion } from "./e2e/live/30-account-deletion.js";
+import { run as runQuotas } from "./e2e/live/31-quotas.js";
+import { run as runToolResultCut } from "./e2e/live/32-tool-result-cut.js";
+import { run as runInstanceLinks } from "./e2e/live/33-instance-links.js";
+import { run as runModelBounds } from "./e2e/live/34-model-bounds.js";
+import { run as runDatabaseTimeout } from "./e2e/live/35-database-timeout.js";
+
+/**
+ * Runs one phase. An error it throws (a push that failed for another reason than
+ * "already there" or "rate-limited", for instance) becomes one FAIL line and the
+ * suite goes on, so the summary and the registry log path still print.
+ */
+async function guarded(name: string, phase: () => Promise<void>): Promise<void> {
+  try {
+    await phase();
+  } catch (err) {
+    results.push({
+      agent: name,
+      feature: "the phase threw before its checks finished",
+      passed: false,
+      duration: 0,
+      cost: 0,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 // Phases 18 (Fly Machines API smoke) + 19 (deployed-cloud E2E) are NOT run
 // here. They exercise live external infra (Fly.io / a DEPLOYED api-server),
@@ -66,8 +111,10 @@ console.log("Starting registry...");
 await startRegistry();
 console.log("Registry OK\n");
 
-// --- Login ---
-skrun(["login", "--token", TOKEN], ROOT);
+// --- Login: `skrun login --registry REGISTRY --token TOKEN`, in the suite's own
+//     profile (never the developer's configuration), checked by `whoami` and
+//     the profile's sign-in file - one line. The profile is removed at exit ---
+await guarded("signInCli", signInCli);
 
 // --- Pre-flight cleanup: purge dev/* so a persistent cloud DB (DATABASE_URL)
 //     doesn't carry stale agent rows whose bundles were lost with the ephemeral
@@ -75,84 +122,134 @@ skrun(["login", "--token", TOKEN], ROOT);
 await cleanupDevNamespace();
 
 // --- Phase 01: demo agents ---
-await runDemos();
+await guarded("runDemos", runDemos);
 
 // --- Phase 02: caller-provided LLM keys ---
-await runCallerKeys();
+await guarded("runCallerKeys", runCallerKeys);
 
 // --- Phase 03: agent verification ---
-await runVerification();
+await guarded("runVerification", runVerification);
 
 // --- Phase 04: streaming (SSE + webhook) ---
-await runStreaming();
+await guarded("runStreaming", runStreaming);
 
 // --- Phase 05: SDK ---
-await runSdk();
+await guarded("runSdk", runSdk);
 
 // --- Phase 06: version pinning (#7) ---
-await runVersionPin();
+await guarded("runVersionPin", runVersionPin);
 
 // --- Phase 07: environment override (#9 + #11) ---
-await runEnvironment();
+await guarded("runEnvironment", runEnvironment);
 
 // --- Phase 08: Files API (#12) ---
-await runFilesApi();
+await guarded("runFilesApi", runFilesApi);
 
 // --- Phase 09: auth (GET /api/me + GET /login) ---
-await runAuth();
+await guarded("runAuth", runAuth);
 
 // --- Phase 10: version notes via --message (#14c) ---
-await runVersionNotes();
+await guarded("runVersionNotes", runVersionNotes);
 
 // --- Phase 11: multimodal direct router calls (#56) ---
-await runMultimodal();
+await guarded("runMultimodal", runMultimodal);
 
 // --- Phase 12: tool-choice directives (#58) ---
-await runToolChoice();
+await guarded("runToolChoice", runToolChoice);
 
 // --- Phase 13: prompt-caching (#68) ---
-await runPromptCaching();
+await guarded("runPromptCaching", runPromptCaching);
 
 // --- Phase 14: audit/002 output validation + tool_call_error + run.files ---
-await runOutputValidation();
+await guarded("runOutputValidation", runOutputValidation);
 
 // --- Phase 15: per-version verify-required-before-run (#83) ---
-await runVerifyRequired();
+await guarded("runVerifyRequired", runVerifyRequired);
 
 // --- Phase 16: simplify-agent-name (#84) ---
-await runSimplifyName();
+await guarded("runSimplifyName", runSimplifyName);
 
 // --- Phase 17: multi-tenant reads — registry GET ownership gate ---
-await runMultiTenantReads();
+await guarded("runMultiTenantReads", runMultiTenantReads);
 
 // (Phases 18 + 19 are cloud-only — see the import-block note above. Run them
 //  on demand via `pnpm fly:smoke` / `pnpm cloud:e2e:smoke`.)
 
 // --- Phase 20: operator dashboard served by the server (#93) ---
-await runDashboardServed();
+await guarded("runDashboardServed", runDashboardServed);
 
 // --- Phase 21: agent visibility (#81) — field round-trips through registry + DB ---
-await runAgentVisibility();
+await guarded("runAgentVisibility", runAgentVisibility);
 
 // --- Phase 22: verification policy (#103) — /api/me policy + admin verify round-trip ---
-await runVerificationPolicy();
+await guarded("runVerificationPolicy", runVerificationPolicy);
 
 // --- Phase 23: API-key scopes (#65) — scoped key mint + run/pull/key-mgmt 403s ---
-await runApiKeyScopes();
+await guarded("runApiKeyScopes", runApiKeyScopes);
 
 // --- Phase 24: creator-attached LLM keys (#102) — attach + keyless run + policy/delegated 403s ---
-await runCreatorLlmKey();
+await guarded("runCreatorLlmKey", runCreatorLlmKey);
 
 // --- Phase 25: CLI device-login flow (#82) — device/code 404 fallback, consent page, poll states ---
-await runDeviceLogin();
+await guarded("runDeviceLogin", runDeviceLogin);
 
 // --- Phase 26: model.base_url guard (SEC-001, audit/006) — a caller's key is not
 //     sent to an endpoint the agent's author chose. Driven with a REAL delegated
-//     sk_live key, because a dev-token is a master credential and would be exempt. ---
-await runBaseUrlGuard();
+//     API key, because a dev-token is a master credential and would be exempt. ---
+await guarded("runBaseUrlGuard", runBaseUrlGuard);
 
 // --- Phase 27: run boundary - rate-limit headers on the real routes, key expiry ---
-await runRunBoundary();
+await guarded("runRunBoundary", runRunBoundary);
+
+// --- Phase 28: the author's path through the real CLI - a retired field's
+//     warning, the post-push note, a run with the author's own key, and a run
+//     refused before it starts when no model key exists ---
+await guarded("runAuthorPath", runAuthorPath);
+
+// --- Phase 31: an account's seats and compute window, on a registry started
+//     again with quotas set - and started again without them, whatever
+//     happens - with a dev token of its own. The restart loses the bundles
+//     pushed so far: the phases after it push their own. ---
+await guarded("runQuotas", runQuotas);
+
+// --- Phase 29: a three-step tool chain only a remembered turn can finish, on
+//     every model choice and on the demos' models - one line per model, a
+//     skip for each one whose key is not set ---
+await guarded("runToolLoop", async () => runToolLoop(await toolLoopModels()));
+
+// --- Phase 30: deleting an account - by itself, then by an administrator - on
+//     the registry's own database, with dev tokens of its own (never the
+//     suite's): what is gone, and the run that stays cleared and detached ---
+await guarded("runAccountDeletion", runAccountDeletion);
+
+// --- Phase 32: a tool result larger than the bound, on the local runtime -
+//     the one it requires, since the cut it reads is the agent loop's own (a
+//     registry on the cloud runtime fails it): the tool_result event carries
+//     the result cut with its marker, and the run completes. Pushes its own
+//     fixture ---
+await guarded("runToolResultCut", runToolResultCut);
+
+// --- Phase 33: the instance's links the dashboard reads - GET /api/instance
+//     with the suite's token, its shape and its three values printed, and 401
+//     with no credential. Pushes nothing ---
+await guarded("runInstanceLinks", runInstanceLinks);
+
+// --- Phase 34: the bounds on what a model returns, on a registry started again
+//     with local model endpoints allowed - and started again as the other
+//     phases know it, whatever happens: an agent whose model.base_url is a fake
+//     endpoint in this process, run four times, each crossing one bound - one
+//     line per code, the code printed. Pushes its own agent, calls no model of
+//     a provider ---
+await guarded("runModelBounds", runModelBounds);
+
+// --- Phase 35: a request whose database does not answer in time, on a
+//     registry started again with a one-second bound on each statement - and
+//     started again without it, whatever happens: a key minted with the
+//     suite's token, its row held by a connection of the phase's own, and its
+//     revocation answered 503 DATABASE_TIMEOUT - status, code, Retry-After and
+//     the wait printed -, then revoked for good once the row is released. On
+//     Postgres only: on SQLite, one SKIP line. Pushes nothing, calls no model ---
+await guarded("runDatabaseTimeout", runDatabaseTimeout);
 
 // --- Summary ---
 console.log(`\n${"=".repeat(70)}`);

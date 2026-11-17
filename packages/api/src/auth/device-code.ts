@@ -13,15 +13,27 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 const DEFAULT_DEVICE_CODE_TTL_S = 600;
 
 /**
+ * The longest TTL `SKRUN_DEVICE_CODE_TTL_S` can set: a hundred years of 365
+ * days. A bound on the date, not a policy, and a margin, not the breaking
+ * point: a hundred years keep the expiry far from both limits of its ISO form.
+ * Past year 9999 the string grows a sign and two more digits — SQLite, which
+ * compares expiries as text, would purge the code as already expired — and
+ * past about year 275760 it is no date at all: issuing the code would throw.
+ */
+const MAX_DEVICE_CODE_TTL_S = 100 * 365 * 86_400;
+
+/**
  * Device-code TTL in seconds, from `SKRUN_DEVICE_CODE_TTL_S` (default 600). A
- * non-numeric / non-positive value falls back to the default. A short TTL shrinks
- * the device-code-phishing window.
+ * non-numeric / non-positive value falls back to the default, and a value past
+ * `MAX_DEVICE_CODE_TTL_S` is read as that bound. A short TTL shrinks the
+ * device-code-phishing window.
  */
 export function ttlSeconds(): number {
   const raw = process.env.SKRUN_DEVICE_CODE_TTL_S;
   if (!raw) return DEFAULT_DEVICE_CODE_TTL_S;
   const n = Number.parseInt(raw, 10);
-  return Number.isNaN(n) || n <= 0 ? DEFAULT_DEVICE_CODE_TTL_S : n;
+  const seconds = Number.isNaN(n) || n <= 0 ? DEFAULT_DEVICE_CODE_TTL_S : n;
+  return Math.min(seconds, MAX_DEVICE_CODE_TTL_S);
 }
 
 /** A high-entropy `device_code` (the CLI's secret; only ever sent by the CLI). */

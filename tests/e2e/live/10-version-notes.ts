@@ -8,7 +8,16 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { patchAgent, REGISTRY, ROOT, restoreAgent, results, skrun, TOKEN } from "./_ctx.js";
+import {
+  patchAgent,
+  pushFixture,
+  REGISTRY,
+  ROOT,
+  restoreAgent,
+  results,
+  skrun,
+  TOKEN,
+} from "./_ctx.js";
 
 /** Best-effort delete of dev/<slug>@<version>. 204/404 OK; anything else logs warn. */
 async function cleanupVersion(agentSlug: string, version: string): Promise<void> {
@@ -35,7 +44,7 @@ export async function run(): Promise<void> {
   const stableVersion = "9.9.8";
   try {
     const dir = join(ROOT, "agents/code-review");
-    const original = patchAgent(dir, "dev", "google", "gemini-2.5-flash");
+    const original = patchAgent(dir, "dev", "google", "gemini-3.8-flash");
 
     // DELETE-first per #77: clean slate before push (handles previous-run crash)
     await cleanupVersion("code-review", stableVersion);
@@ -48,7 +57,8 @@ export async function run(): Promise<void> {
     try {
       skrun(["build"], dir);
       const noteText = "Automated live test note 🚀";
-      skrun(["push", "-m", noteText], dir);
+      // The version was deleted above: a 409 would mean this push stored nothing.
+      await pushFixture(dir, { args: ["-m", noteText], acceptExisting: false });
 
       // Fetch versions and assert the latest one has our note
       const res = await fetch(`${REGISTRY}/api/agents/dev/code-review/versions`, {

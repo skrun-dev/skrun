@@ -1,9 +1,12 @@
 name: web-scraper
-version: 1.0.0
+version: 1.1.1
 
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
+  fallback:
+    provider: google
+    name: gemini-3.5-flash-lite
 
 mcp_servers:
   - name: browser
@@ -41,10 +44,7 @@ environment:
       - "example.com"
       - "kickstarter.com"
       - "www.kickstarter.com"
-  filesystem: read-only
-  secrets: []
   timeout: 120s
-  sandbox: strict
 
 state:
   type: none

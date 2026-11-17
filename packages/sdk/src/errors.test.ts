@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { SkrunApiError, SkrunFileUploadError, SkrunNotVerifiedError } from "./errors.js";
+import {
+  SkrunApiError,
+  SkrunCapacityError,
+  SkrunComputeQuotaError,
+  SkrunConcurrencyLimitError,
+  SkrunFileUploadError,
+  SkrunInputFilesLimitError,
+  SkrunNotVerifiedError,
+  SkrunStorageQuotaError,
+  SkrunTimeoutAboveLimitError,
+} from "./errors.js";
 
 describe("SkrunApiError", () => {
   it("is an instance of Error", () => {
@@ -149,6 +159,94 @@ describe("SkrunApiError.fromResponse dispatch", () => {
     const res = buildResponse(400, { error: { message: "no code field" } });
     const err = await SkrunApiError.fromResponse(res);
     expect(err.code).toBe("UNKNOWN");
+  });
+});
+
+// A run refused for its account's quota or the server's capacity, a push past
+// the account's storage, an upload past its live uploads: each code its class,
+// the server's status, and the wait its Retry-After asks for.
+describe("SkrunApiError.fromResponse — quota and capacity refusals", () => {
+  function refusal(status: number, code: string, retryAfter?: string): Response {
+    return new Response(JSON.stringify({ error: { code, message: `refused: ${code}` } }), {
+      status,
+      headers: retryAfter === undefined ? {} : { "Retry-After": retryAfter },
+    });
+  }
+
+  it.each([
+    [429, "CONCURRENCY_LIMIT_REACHED", "10", SkrunConcurrencyLimitError, 10],
+    [429, "COMPUTE_QUOTA_EXCEEDED", "1834", SkrunComputeQuotaError, 1834],
+    [503, "CAPACITY_EXHAUSTED", "5", SkrunCapacityError, 5],
+    [400, "TIMEOUT_ABOVE_LIMIT", undefined, SkrunTimeoutAboveLimitError, undefined],
+    [413, "STORAGE_QUOTA_EXCEEDED", undefined, SkrunStorageQuotaError, undefined],
+    [429, "INPUT_FILES_LIMIT_REACHED", "85400", SkrunInputFilesLimitError, 85400],
+  ] as const)("%i %s → its class, its status, and retryAfterSeconds from Retry-After", async (status, code, header, Class, seconds) => {
+    const err = await SkrunApiError.fromResponse(refusal(status, code, header));
+    expect(err).toBeInstanceOf(Class);
+    expect(err).toBeInstanceOf(SkrunApiError);
+    expect(err).not.toBeInstanceOf(SkrunNotVerifiedError);
+    expect(err.name).toBe(Class.name);
+    expect(err.code).toBe(code);
+    expect(err.status).toBe(status);
+    expect(err.message).toBe(`refused: ${code}`);
+    expect((err as InstanceType<typeof Class>).retryAfterSeconds).toBe(seconds);
+  });
+
+  it("a Retry-After given as an HTTP date is read as the seconds until it; one that is unreadable, or absent, as none", async () => {
+    const inTwoMinutes = new Date(Date.now() + 120_000).toUTCString();
+    const dated = await SkrunApiError.fromResponse(
+      refusal(429, "COMPUTE_QUOTA_EXCEEDED", inTwoMinutes),
+    );
+    const seconds = (dated as SkrunComputeQuotaError).retryAfterSeconds as number;
+    expect(seconds).toBeGreaterThanOrEqual(118);
+    expect(seconds).toBeLessThanOrEqual(120);
+
+    const unreadable = await SkrunApiError.fromResponse(
+      refusal(429, "CONCURRENCY_LIMIT_REACHED", "soon"),
+    );
+    expect((unreadable as SkrunConcurrencyLimitError).retryAfterSeconds).toBeUndefined();
+    const absent = await SkrunApiError.fromResponse(refusal(503, "CAPACITY_EXHAUSTED"));
+    expect((absent as SkrunCapacityError).retryAfterSeconds).toBeUndefined();
+  });
+
+  it("built by hand, each class carries its code and its usual status", () => {
+    expect(new SkrunConcurrencyLimitError("x")).toMatchObject({
+      code: "CONCURRENCY_LIMIT_REACHED",
+      status: 429,
+    });
+    expect(new SkrunComputeQuotaError("x")).toMatchObject({
+      code: "COMPUTE_QUOTA_EXCEEDED",
+      status: 429,
+    });
+    expect(new SkrunCapacityError("x")).toMatchObject({ code: "CAPACITY_EXHAUSTED", status: 503 });
+    expect(new SkrunTimeoutAboveLimitError("x")).toMatchObject({
+      code: "TIMEOUT_ABOVE_LIMIT",
+      status: 400,
+    });
+    expect(new SkrunStorageQuotaError("x")).toMatchObject({
+      code: "STORAGE_QUOTA_EXCEEDED",
+      status: 413,
+    });
+    expect(new SkrunInputFilesLimitError("x")).toMatchObject({
+      code: "INPUT_FILES_LIMIT_REACHED",
+      status: 429,
+    });
+  });
+
+  it("the not-verified refusal is unchanged — its class, its 403 — and a plan the server does not know stays a generic error", async () => {
+    const notVerified = await SkrunApiError.fromResponse(
+      new Response(JSON.stringify({ error: { code: "AGENT_NOT_VERIFIED", message: "v" } }), {
+        status: 403,
+        headers: { "Retry-After": "10" },
+      }),
+    );
+    expect(notVerified).toBeInstanceOf(SkrunNotVerifiedError);
+    expect(notVerified.status).toBe(403);
+    expect("retryAfterSeconds" in notVerified).toBe(false);
+
+    const unknownPlan = await SkrunApiError.fromResponse(refusal(400, "UNKNOWN_PLAN"));
+    expect(unknownPlan.constructor.name).toBe("SkrunApiError");
+    expect(unknownPlan.code).toBe("UNKNOWN_PLAN");
   });
 });
 

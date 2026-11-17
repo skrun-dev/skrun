@@ -22,7 +22,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REGISTRY, results, skrun, TOKEN } from "./_ctx.js";
+import { pushFixture, REGISTRY, results, skrun, TOKEN } from "./_ctx.js";
 
 const NS = "dev";
 const AGENT = "creator-llm-key-live";
@@ -36,7 +36,7 @@ async function deleteAgent(name: string): Promise<void> {
   });
 }
 
-function buildAndPush(name: string): string {
+async function buildAndPush(name: string): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), `skrun-live-24-${name}-`));
   writeFileSync(
     join(dir, "SKILL.md"),
@@ -56,7 +56,7 @@ Reply with the literal string "ok".
 version: ${V1}
 model:
   provider: ${PROVIDER}
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
 inputs:
   - name: task
     type: string
@@ -67,11 +67,7 @@ outputs:
 `,
   );
   skrun(["build"], dir);
-  try {
-    skrun(["push"], dir);
-  } catch {
-    // 409 if the version was already pushed in a prior run — proceed.
-  }
+  await pushFixture(dir);
   return dir;
 }
 
@@ -87,7 +83,7 @@ export async function run(): Promise<void> {
   await deleteAgent(AGENT);
   const dirs: string[] = [];
   try {
-    dirs.push(buildAndPush(AGENT));
+    dirs.push(await buildAndPush(AGENT));
     // Verify the version (dev-token = admin) so the keyless run (VT-24c) clears the
     // verification gate under the default `admin` policy. That gate sits AFTER the
     // caller-key policy gate, so the 403 cases (VT-24d/e) don't need it.

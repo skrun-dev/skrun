@@ -1,6 +1,6 @@
 import type { Context } from "hono";
 import { describe, expect, it } from "vitest";
-import { externalBaseUrl } from "./external-url.js";
+import { externalBaseUrl, parsePublicUrl } from "./external-url.js";
 
 function ctx(url: string, headers: Record<string, string> = {}): Context {
   const lower: Record<string, string> = {};
@@ -38,5 +38,26 @@ describe("externalBaseUrl", () => {
         ctx("http://fly-internal:8080/x", { "x-forwarded-proto": "https", host: "skrun.sh" }),
       ),
     ).toBe("https://skrun.sh");
+  });
+});
+
+describe("parsePublicUrl — a refused value", () => {
+  // The refusal quotes the value it received; credentials in it are masked, on
+  // each of the three ways a value is refused.
+  it.each([
+    { value: "https://user:secret@api.example.com/v1", why: "a path" },
+    { value: "ftp://user:secret@api.example.com", why: "another scheme" },
+    { value: "https://user:secret@api.example.com:99999", why: "a value no parser reads" },
+  ])("never prints its credentials ($why)", ({ value }) => {
+    let message = "";
+    try {
+      parsePublicUrl(value);
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+
+    expect(message.startsWith("SKRUN_PUBLIC_URL must be ")).toBe(true);
+    expect(message).not.toContain("secret");
+    expect(message).toContain("***@api.example.com");
   });
 });

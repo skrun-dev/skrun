@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { AgentConfigSchema, serializeAgentYaml } from "@skrun-dev/schema";
 import type { Command } from "commander";
+import { exitWith } from "../utils/exit.js";
 import * as format from "../utils/format.js";
 import { askModel, askText } from "../utils/prompts.js";
 import { initFromSkill } from "./init-from-skill.js";
@@ -56,7 +57,7 @@ export async function runInit(dir: string | undefined, opts: InitOptions): Promi
   const skillPath = join(targetDir, "SKILL.md");
   if (existsSync(skillPath) && !opts.force) {
     format.error("SKILL.md already exists. Use --force to overwrite.");
-    process.exit(1);
+    exitWith(1);
   }
 
   // Gather info — interactive or from flags

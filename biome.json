@@ -32,6 +32,55 @@
       }
     }
   },
+  "overrides": [
+    {
+      "includes": [
+        "packages/cli/src/**",
+        "!packages/cli/src/utils/auth.ts",
+        "!**/*.test.ts",
+        "!**/*.shared.ts"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedGlobals": {
+              "level": "error",
+              "options": {
+                "deniedGlobals": {
+                  "fetch": "Send requests through the single sender in utils/auth.ts.",
+                  "WebSocket": "Send requests through the single sender in utils/auth.ts."
+                }
+              }
+            },
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "paths": {
+                  "node:http": {
+                    "importNames": ["request", "get", "Agent", "ClientRequest"],
+                    "message": "Send requests through the single sender in utils/auth.ts."
+                  },
+                  "http": {
+                    "importNames": ["request", "get", "Agent", "ClientRequest"],
+                    "message": "Send requests through the single sender in utils/auth.ts."
+                  },
+                  "node:https": "Send requests through the single sender in utils/auth.ts.",
+                  "https": "Send requests through the single sender in utils/auth.ts.",
+                  "node:http2": "Send requests through the single sender in utils/auth.ts.",
+                  "http2": "Send requests through the single sender in utils/auth.ts.",
+                  "node:net": "Send requests through the single sender in utils/auth.ts.",
+                  "net": "Send requests through the single sender in utils/auth.ts.",
+                  "node:tls": "Send requests through the single sender in utils/auth.ts.",
+                  "tls": "Send requests through the single sender in utils/auth.ts.",
+                  "undici": "Send requests through the single sender in utils/auth.ts."
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "files": {
     "includes": [
       "**",

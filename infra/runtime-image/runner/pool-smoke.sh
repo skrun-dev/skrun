@@ -4,11 +4,12 @@
 # assigned to a run.
 #
 # WHY HERE AND NOT IN zero-trust.test.sh
-# Every case in that suite overrides the entrypoint and re-implements its logic in
-# bash. That is a sound way to assert a firewall rule in isolation, and completely
-# wrong here: what needs proving is the SHIPPED boot path — the command channel it
-# creates, the privileged helper waiting on it, and the server's own view of which
-# routes it will answer. Re-implementing any of that would test the copy.
+# Most cases in that suite override the entrypoint and re-implement a rule in bash
+# — a sound way to assert a firewall rule in isolation — and the few that boot the
+# entrypoint do so for a single run. What needs proving here is the SHIPPED boot
+# path of a machine that waits: the command channel it creates, the privileged
+# helper waiting on it, and the server's own view of which routes it will answer.
+# Re-implementing any of that would test the copy.
 #
 # So this boots the real image, unmodified, and talks to it over HTTP — the same
 # shape as runner/smoke.sh and runner/init-smoke.sh.
@@ -277,6 +278,155 @@ docker exec "$NAME" sh -c '! grep -q "private-target|" /run/skrun-allowed-ips' \
 echo "POOL-SMOKE: a declared host resolving to a private address was refused (rebinding defence intact)"
 
 # ---------------------------------------------------------------------------
+# '*' at assignment: every public address, and no blocked one
+#
+# '*' names no host, so it cannot be resolved: the helper must apply it as a rule
+# of its own, behind the blocked-range drops the boot installed. Refusing it here
+# would lose the machine — the caller discards a machine whose assignment failed.
+# ---------------------------------------------------------------------------
+PORT=$((PORT_BASE + 6))
+NAME="skrun-pool-smoke-star-$$"
+boot_pool_runner "$NAME" "$PORT"
+BASE="http://localhost:$PORT"
+
+RESPONSE=$(curl -sS -X POST "$BASE/claim" \
+  -H "Authorization: Bearer $CLAIM_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"rpcToken\":\"$RUN_TOKEN\",\"allowedHosts\":[\"*\"]}" 2>&1 || true)
+case "$RESPONSE" in
+  *'"ok":true'*) ;;
+  *) fail "/claim with allowedHosts [\"*\"] was not accepted: $RESPONSE" "$NAME" ;;
+esac
+echo "POOL-SMOKE: assignment with '*' accepted"
+
+docker exec "$NAME" curl -4 -fsS -m 15 -o /dev/null https://example.com \
+  || fail "a public host is unreachable after an assignment with '*'" "$NAME"
+echo "POOL-SMOKE: a public host is reached under '*'"
+
+# A reserved literal: refused, and refused BY the drop of its range — an address
+# with no route fails to connect too, so only the counter proves the rule did it.
+drop_count() {
+  docker exec "$1" iptables -L OUTPUT -v -n -x 2>/dev/null |
+    awk -v r="$2" '$3 == "DROP" && $NF == r { print $1; exit }'
+}
+BEFORE=$(drop_count "$NAME" 198.18.0.0/15 || true)
+if docker exec "$NAME" curl -4 -s -o /dev/null -m 3 http://198.18.0.1/; then
+  fail "a reserved address (198.18.0.1) was reached under '*'" "$NAME"
+fi
+AFTER=$(drop_count "$NAME" 198.18.0.0/15 || true)
+[ -n "$BEFORE" ] && [ -n "$AFTER" ] && [ "$AFTER" -gt "$BEFORE" ] \
+  || fail "198.18.0.1 was not counted by the DROP of 198.18.0.0/15 (before '${BEFORE}', after '${AFTER}')" "$NAME"
+echo "POOL-SMOKE: a reserved literal is dropped by its range under '*' ($BEFORE -> $AFTER)"
+
+echo "POOL-SMOKE PASS: '*' is applied at assignment, behind the blocked ranges."
+
+# ---------------------------------------------------------------------------
+# The order of the rules after an assignment, on both families
+#
+# The verdicts above say that a blocked address is refused, not why. What makes it
+# so is an order: the boot installs the infrastructure hosts, then a DROP per
+# blocked range; everything the assignment adds is appended after those drops. An
+# IPv6 Docker network, so that the IPv6 half has addresses and a route; stub names
+# for an infrastructure host on private addresses and for two agent hosts.
+# ---------------------------------------------------------------------------
+NET3="skrun-pool-smoke-net3-$$"
+NETWORKS+=("$NET3")
+docker network create --ipv6 "$NET3" >/dev/null || fail "could not create an IPv6 Docker network"
+PORT=$((PORT_BASE + 7))
+NAME="skrun-pool-smoke-order-$$"
+CONTAINERS+=("$NAME")
+docker run -d --name "$NAME" --network "$NET3" --cap-add=NET_ADMIN \
+  --add-host "infra.test:192.168.77.7" --add-host "infra.test:fd00:77::7" \
+  --add-host "agent.test:93.184.216.34" --add-host "agent6.test:2001:4860:4860::8888" \
+  -p "$PORT:9000" \
+  -e SKRUN_CONTAINER_MODE=runner \
+  -e RUNNER_PORT=9000 \
+  -e RUNNER_CLAIM_TOKEN="$CLAIM_TOKEN" \
+  -e RUNNER_INFRA_HOSTS=infra.test \
+  -e SKRUN_DNS_RESOLVE_INTERVAL=2 \
+  "$TAG" >/dev/null
+for _ in $(seq 1 60); do
+  curl -fsS "http://localhost:$PORT/healthz" >/dev/null 2>&1 && break
+  sleep 1
+done
+BASE="http://localhost:$PORT"
+curl -fsS "$BASE/healthz" >/dev/null || fail "order-case runner never became healthy" "$NAME"
+RESPONSE=$(curl -sS -X POST "$BASE/claim" \
+  -H "Authorization: Bearer $CLAIM_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"rpcToken\":\"$RUN_TOKEN\",\"allowedHosts\":[\"agent.test\",\"agent6.test\"]}" 2>&1 || true)
+case "$RESPONSE" in
+  *'"ok":true'*) ;;
+  *) fail "/claim with two named hosts was not accepted: $RESPONSE" "$NAME" ;;
+esac
+
+# Line numbers in `-S OUTPUT` (line 1 is the policy): the last infrastructure
+# ACCEPT, the first blocked-range DROP, the first ACCEPT of an agent address —
+# `none` for a rule that is absent.
+order_of() {
+  local tool="$1" infra="$2" agent="$3" rules a b c
+  rules=$(docker exec "$NAME" "$tool" -S OUTPUT)
+  a=$(grep -n -F -x -- "-A OUTPUT -d $infra -j ACCEPT" <<< "$rules" | tail -1 | cut -d: -f1 || true)
+  b=$(grep -n -E -- '^-A OUTPUT -d [^ ]+ -j DROP$' <<< "$rules" | head -1 | cut -d: -f1 || true)
+  c=$(grep -n -F -x -- "-A OUTPUT -d $agent -j ACCEPT" <<< "$rules" | head -1 | cut -d: -f1 || true)
+  echo "${a:-none} ${b:-none} ${c:-none}"
+}
+is_num() { [[ "$1" =~ ^[0-9]+$ ]]; }
+for spec in "iptables 192.168.77.7/32 93.184.216.34/32" "ip6tables fd00:77::7/128 2001:4860:4860::8888/128"; do
+  read -r tool infra agent <<< "$spec"
+  read -r L_INFRA L_DROP L_AGENT <<< "$(order_of "$tool" "$infra" "$agent")"
+  { is_num "$L_INFRA" && is_num "$L_DROP" && is_num "$L_AGENT" &&
+    [ "$L_INFRA" -lt "$L_DROP" ] && [ "$L_DROP" -lt "$L_AGENT" ]; } ||
+    fail "$tool: expected infrastructure < first DROP < agent, got infrastructure $L_INFRA, first DROP $L_DROP, agent $L_AGENT" "$NAME"
+  echo "POOL-SMOKE: $tool order after assignment — infrastructure $L_INFRA < first DROP $L_DROP < agent $L_AGENT"
+done
+ICMP6=$(docker exec "$NAME" ip6tables -S OUTPUT | grep -n -x -- '-A OUTPUT -p ipv6-icmp -j ACCEPT' | cut -d: -f1 || true)
+read -r _ DROP6 _ <<< "$(order_of ip6tables fd00:77::7/128 none)"
+{ is_num "$ICMP6" && is_num "$DROP6" && [ "$ICMP6" -lt "$DROP6" ]; } ||
+  fail "ICMPv6 is not accepted before the first IPv6 DROP (ICMPv6 '${ICMP6}', first DROP $DROP6)" "$NAME"
+
+# The state file the re-resolve loop diffs against: one line per agent host and
+# address, the same set as the agent's ACCEPT rules, nothing for infrastructure,
+# no duplicate — then a few re-resolve cycles, which must add and remove nothing.
+STATE=$(docker exec "$NAME" cat /run/skrun-allowed-ips)
+[ "$(sort <<< "$STATE")" = "$(printf 'agent.test|93.184.216.34\nagent6.test|2001:4860:4860::8888\n' | sort)" ] ||
+  fail "the re-resolve state is not exactly one line per agent host/address: $STATE" "$NAME"
+AGENT_RULES=$(docker exec "$NAME" sh -c 'iptables -S OUTPUT; ip6tables -S OUTPUT' |
+  awk '/^-P / { d = 0; next } / -j DROP$/ { d = 1; next } d && /^-A OUTPUT -d [^ ]+ -j ACCEPT$/' | wc -l)
+[ "$AGENT_RULES" -eq "$(wc -l <<< "$STATE")" ] ||
+  fail "$AGENT_RULES ACCEPT rules after the drops, for $(wc -l <<< "$STATE") state lines" "$NAME"
+RULES_BEFORE=$(docker exec "$NAME" sh -c 'iptables -S OUTPUT; ip6tables -S OUTPUT')
+sleep 5
+RULES_AFTER=$(docker exec "$NAME" sh -c 'iptables -S OUTPUT; ip6tables -S OUTPUT')
+[ "$RULES_BEFORE" = "$RULES_AFTER" ] || fail "the re-resolve loop changed the rules of an unchanged host list" "$NAME"
+if docker logs "$NAME" 2>&1 | grep -qE '^\[skrun-dns-reresolve\] (ADD|DEL) '; then
+  fail "the re-resolve loop re-added or removed a rule on its first cycles" "$NAME"
+fi
+echo "POOL-SMOKE: the re-resolve state is one line per agent address, and its cycles change nothing"
+
+# An ACCEPT for a blocked address, appended the way an assignment or a re-resolve
+# would append it had its filter failed: the DROP of its range counts the probe,
+# the ACCEPT never does.
+count_of() {
+  docker exec "$NAME" "$1" -L OUTPUT -v -n -x |
+    awk -v t="$2" -v r="$3" '$3 == t && ($NF == r || $NF == r "/32" || $NF == r "/128") { print $1; exit }'
+}
+for spec in "iptables 10.0.0.0/8 10.0.0.5 4" "ip6tables fc00::/7 fd00::5 6"; do
+  read -r tool range addr fam <<< "$spec"
+  docker exec "$NAME" "$tool" -A OUTPUT -d "$addr" -j ACCEPT || fail "could not append the probe ACCEPT" "$NAME"
+  url="http://$addr/"
+  [ "$fam" = 6 ] && url="http://[$addr]/"
+  D0=$(count_of "$tool" DROP "$range" || true); A0=$(count_of "$tool" ACCEPT "$addr" || true)
+  if docker exec "$NAME" curl "-$fam" -s -o /dev/null -m 3 "$url"; then
+    fail "$addr was reached through an appended ACCEPT" "$NAME"
+  fi
+  D1=$(count_of "$tool" DROP "$range" || true); A1=$(count_of "$tool" ACCEPT "$addr" || true)
+  { [ -n "$D0" ] && [ -n "$D1" ] && [ -n "$A0" ] && [ -n "$A1" ] && [ "$D1" -gt "$D0" ] && [ "$A1" -eq "$A0" ]; } ||
+    fail "$tool: $addr — DROP $range '${D0}' -> '${D1}', ACCEPT '${A0}' -> '${A1}': the DROP did not take it" "$NAME"
+  echo "POOL-SMOKE: $tool — $addr taken by the DROP of $range ($D0 -> $D1), its appended ACCEPT untouched ($A0 -> $A1)"
+done
+
+echo "POOL-SMOKE PASS: after an assignment, infrastructure < blocked ranges < agent hosts on both families, and the state file is exact."
+
+# ---------------------------------------------------------------------------
 # Fail closed: no confirmation, no run
 #
 # If the privileged helper cannot confirm the rules, the run credential must NOT
@@ -482,3 +632,112 @@ fi
 echo "POOL-SMOKE: the self-host branch takes no firewall, no privilege drop, no channel"
 
 echo "POOL-SMOKE PASS: runtimes resolve in the pre-created posture, and self-host is untouched."
+
+# ---------------------------------------------------------------------------
+# The lifetime an assignment carries ends the machine
+#
+# A pre-created machine waits for its run with no lifetime of its own. The
+# assignment hands it one, which the server passes on with the host list to the
+# privileged loop; the loop arms it and, once it is reached, ends the server — the
+# machine's main process — so the machine stops. An assignment without one, from
+# an older caller, arms nothing. A host that would break the channel's one-line
+# framing is refused by the server before anything is written to the loop.
+# A one-second re-resolve cycle keeps the deadline's reading prompt.
+# ---------------------------------------------------------------------------
+boot_lifetime_pool_runner() {
+  local name="$1" port="$2"
+  CONTAINERS+=("$name")
+  docker run -d --name "$name" --cap-add=NET_ADMIN \
+    -p "$port:9000" \
+    -e SKRUN_CONTAINER_MODE=runner \
+    -e RUNNER_PORT=9000 \
+    -e RUNNER_CLAIM_TOKEN="$CLAIM_TOKEN" \
+    -e SKRUN_DNS_RESOLVE_INTERVAL=1 \
+    "$TAG" >/dev/null
+  for _ in $(seq 1 60); do
+    curl -fsS "http://localhost:$port/healthz" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  fail "runner never became healthy for the lifetime case" "$name"
+}
+
+LIFE_S=8
+LIFE_PORT=$((PORT_BASE + 8))
+LIFE_NAME="skrun-pool-smoke-lifetime-$$"
+NONE_PORT=$((PORT_BASE + 9))
+NONE_NAME="skrun-pool-smoke-nolifetime-$$"
+SEMI_PORT=$((PORT_BASE + 10))
+SEMI_NAME="skrun-pool-smoke-semicolon-$$"
+boot_lifetime_pool_runner "$NONE_NAME" "$NONE_PORT"
+boot_lifetime_pool_runner "$SEMI_NAME" "$SEMI_PORT"
+boot_lifetime_pool_runner "$LIFE_NAME" "$LIFE_PORT"
+
+# An older caller: no lifetime in the assignment, nothing armed, the reason said.
+RESPONSE=$(curl -sS -X POST "http://localhost:$NONE_PORT/claim" \
+  -H "Authorization: Bearer $CLAIM_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"rpcToken\":\"$RUN_TOKEN\",\"allowedHosts\":[]}" 2>&1 || true)
+case "$RESPONSE" in
+  *'"ok":true'*) ;;
+  *) fail "/claim without a lifetime was not accepted: $RESPONSE" "$NONE_NAME" ;;
+esac
+sleep 2
+NONE_LOGS=$(docker logs "$NONE_NAME" 2>&1)
+grep -q "lifetime_invalid from=channel reason=absent" <<< "$NONE_LOGS" ||
+  fail "an assignment without a lifetime did not say it armed nothing" "$NONE_NAME"
+if grep -q "lifetime_armed" <<< "$NONE_LOGS"; then
+  fail "an assignment without a lifetime armed one" "$NONE_NAME"
+fi
+echo "POOL-SMOKE: an assignment without a lifetime is accepted, nothing armed (lifetime_invalid reason=absent)"
+
+# A host carrying ';' would end the lifetime field early: refused by the server,
+# before the loop hears anything — no assignment, nothing armed.
+CODE=$(status -X POST "http://localhost:$SEMI_PORT/claim" \
+  -H "Authorization: Bearer $CLAIM_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"rpcToken\":\"$RUN_TOKEN\",\"allowedHosts\":[\"a;b.example\"],\"lifetimeS\":$LIFE_S}")
+[ "$CODE" = "500" ] || fail "a host carrying ';' should fail the assignment (got $CODE)" "$SEMI_NAME"
+sleep 1
+SEMI_LOGS=$(docker logs "$SEMI_NAME" 2>&1)
+if grep -qE "lifetime_|assignment applied|assignment refused" <<< "$SEMI_LOGS"; then
+  fail "a host carrying ';' reached the privileged loop" "$SEMI_NAME"
+fi
+echo "POOL-SMOKE: a host carrying ';' is refused before anything reaches the loop (500, the loop still waiting)"
+
+# The lifetime the assignment carries: armed by the loop, and the machine ends.
+LIFE_START=$(date +%s)
+RESPONSE=$(curl -sS -X POST "http://localhost:$LIFE_PORT/claim" \
+  -H "Authorization: Bearer $CLAIM_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"rpcToken\":\"$RUN_TOKEN\",\"allowedHosts\":[],\"lifetimeS\":$LIFE_S}" 2>&1 || true)
+case "$RESPONSE" in
+  *'"ok":true'*) ;;
+  *) fail "/claim with a lifetime was not accepted: $RESPONSE" "$LIFE_NAME" ;;
+esac
+sleep 1
+LIFE_LOGS=$(docker logs "$LIFE_NAME" 2>&1)
+grep -q "lifetime_armed from=channel lifetime_s=$LIFE_S " <<< "$LIFE_LOGS" ||
+  fail "the lifetime the assignment carried was not armed" "$LIFE_NAME"
+# Armed, the loop starts its guardian, which names itself and the server it watches.
+grep -q "lifetime_guardian pid=[0-9]* runner_pid=[0-9]* " <<< "$LIFE_LOGS" ||
+  fail "the lifetime was armed, but no guardian said it watches the server" "$LIFE_NAME"
+echo "POOL-SMOKE: the lifetime the assignment carried ($LIFE_S s) is armed by the privileged loop, its guardian started"
+ENDED=no
+for _ in $(seq 1 90); do
+  if [ "$(docker inspect -f '{{.State.Running}}' "$LIFE_NAME" 2>/dev/null)" != "true" ]; then
+    ENDED=yes
+    break
+  fi
+  sleep 0.5
+done
+LIFE_ELAPSED=$(( $(date +%s) - LIFE_START ))
+[ "$ENDED" = yes ] || fail "the machine still runs ${LIFE_ELAPSED}s after an assignment of ${LIFE_S}s" "$LIFE_NAME"
+[ "$LIFE_ELAPSED" -ge "$LIFE_S" ] || fail "the machine ended ${LIFE_ELAPSED}s after an assignment of ${LIFE_S}s — before its lifetime" "$LIFE_NAME"
+LIFE_LOGS=$(docker logs "$LIFE_NAME" 2>&1)
+grep -q "lifetime_reached runner_pid=[0-9]* comm=node " <<< "$LIFE_LOGS" ||
+  fail "the machine ended, but not by its lifetime reached on the server's own process" "$LIFE_NAME"
+echo "POOL-SMOKE: the machine stopped ${LIFE_ELAPSED}s after its assignment, its server ended by the guardian (lifetime_reached, comm=node)"
+
+# The machine assigned without a lifetime outlived it.
+[ "$(docker inspect -f '{{.State.Running}}' "$NONE_NAME" 2>/dev/null)" = "true" ] ||
+  fail "the machine assigned without a lifetime has ended" "$NONE_NAME"
+echo "POOL-SMOKE: the machine assigned without a lifetime still runs"
+
+echo "POOL-SMOKE PASS: an assignment's lifetime is armed and ends the machine; none arms nothing; a ';' never reaches the loop."

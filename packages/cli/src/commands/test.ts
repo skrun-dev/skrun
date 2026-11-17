@@ -1,14 +1,16 @@
 import { validateAgent } from "@skrun-dev/schema";
 import type { Command } from "commander";
 import { evalAssert } from "../utils/assert-eval.js";
+import { exitWith } from "../utils/exit.js";
 import * as format from "../utils/format.js";
 import { mockRun } from "../utils/mock-runner.js";
 import { getValidatedConfig } from "../utils/validated-config.js";
+import { printValidationWarnings } from "../utils/validation-output.js";
 
 export function registerTestCommand(program: Command): void {
   program
     .command("test")
-    .description("Run tests defined in agent.yaml")
+    .description("Check tests against simulated outputs (no model call)")
     .action(async () => {
       await runTests();
     });
@@ -24,18 +26,24 @@ async function runTests(): Promise<void> {
       format.error(`${err.file ?? ""}: ${err.message}`);
     }
     format.error("Fix errors before testing.");
-    process.exit(1);
+    exitWith(1);
   }
+  printValidationWarnings(result);
 
   const config = getValidatedConfig(result);
   const tests = config.tests;
 
   if (tests.length === 0) {
     format.info("No tests defined in agent.yaml. Add tests to the 'tests' section.");
-    process.exit(0);
+    exitWith(0);
   }
 
   format.info(`Running ${tests.length} test(s) for ${config.name}...`);
+  format.info(
+    "Outputs are simulated — no model is called. Each test checks that its input carries each " +
+      "input the agent requires — null, or an empty list for a file input, counts as missing —, " +
+      "then its assertion against placeholder outputs. For a real run: skrun deploy, then skrun run.",
+  );
 
   let passed = 0;
   let failed = 0;
@@ -69,5 +77,5 @@ async function runTests(): Promise<void> {
     format.error(`${passed} passed, ${failed} failed`);
   }
 
-  process.exit(failed > 0 ? 1 : 0);
+  exitWith(failed > 0 ? 1 : 0);
 }

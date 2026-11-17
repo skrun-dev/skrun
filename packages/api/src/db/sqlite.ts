@@ -1,6 +1,25 @@
 import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
-import type { DbAdapter } from "./adapter.js";
+import {
+  type AccountUsage,
+  admissionIsBounded,
+  admissionVerdict,
+  type DbAdapter,
+  type FinalRunWrite,
+  fastRunsSince,
+  RUN_CONTENT_FIELDS,
+  type RunAdmission,
+  type RunAdmissionResult,
+  type RunWrite,
+  releasingFastRunOffset,
+  SHUTDOWN_RUN_ERROR,
+} from "./adapter.js";
+import {
+  derivedNamespace,
+  NAMESPACE_MAX_ATTEMPTS,
+  NamespaceUnavailableError,
+  namespaceBase,
+} from "./namespace.js";
 import {
   type Agent,
   type AgentLlmKeyInfo,
@@ -16,11 +35,17 @@ import {
   type Run,
   type RunStatus,
   type Session,
+  type StatePartition,
+  type StoredState,
   type User,
+  type UserDeletionPlan,
+  type UserDeletionResult,
 } from "./schema.js";
 
 // FK semantics mirror packages/api/src/db/migrations/001_initial_schema.sql
-//   - Ownership chains: ON DELETE CASCADE (api_keys, agents, agent_versions, agent_state, environments)
+//   - Ownership chains: ON DELETE CASCADE (api_keys, agents, agent_versions, environments).
+//     agent_state cascades too (from its agent, its caller's account, its
+//     caller's key), but is created in migrate(), not in SCHEMA — see there.
 //   - Run history (runs.*): ON DELETE SET NULL — preserves analytics + billing data
 //     after the referenced agent/user/environment is deleted.
 const SCHEMA = `
@@ -75,12 +100,6 @@ CREATE TABLE IF NOT EXISTS agent_versions (
   UNIQUE(agent_id, version)
 );
 
-CREATE TABLE IF NOT EXISTS agent_state (
-  agent_name TEXT PRIMARY KEY,
-  state TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS environments (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -115,7 +134,19 @@ CREATE TABLE IF NOT EXISTS runs (
   phase_timings TEXT,
   files TEXT,
   created_at TEXT NOT NULL,
-  completed_at TEXT
+  completed_at TEXT,
+  -- Output retention (migration 018). Their partial index is created in
+  -- migrate(), never here: on an existing database this SCHEMA runs before
+  -- migrate() adds the columns, and the index would name a missing column.
+  purge_after TEXT,
+  outputs_purged_at TEXT,
+  -- When the run's content was cleared by its account's deletion (migration 020).
+  content_cleared_at TEXT,
+  -- What the run holds of its account's quotas (migration 021). Their two
+  -- indexes are created in migrate(), never here, for the reason given above.
+  deadline_at TEXT,
+  charged_ms INTEGER,
+  pool_entitled INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS device_codes (
@@ -148,15 +179,107 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions (expires_at);
 `;
 
+/**
+ * The agent state table — the SQLite mirror of migration
+ * 019_agent_state_per_caller.sql, created by migrate() (not SCHEMA; see there).
+ *
+ * One row per (agent, partition). `partition_key` is never null — `shared`,
+ * `account:<user id>` or `key:<key id>` — so the primary key holds one row per
+ * partition even though the two reference columns are nullable (a UNIQUE over
+ * nullable columns would accept two `shared` rows). The CHECK ties the key to
+ * the references; each branch states its IS NULL / IS NOT NULL explicitly,
+ * because a bare equality against a NULL column is NULL, and a CHECK that
+ * evaluates to NULL passes.
+ *
+ * Each reference cascades: the row goes with its agent, with the account and
+ * with the key it was written for. The three indexes serve the expiry sweep and
+ * the two cascades (a key revocation must not scan the table); the cascade from
+ * the agent is served by the primary key.
+ */
+const AGENT_STATE_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS agent_state (
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  partition_key TEXT NOT NULL,
+  caller_user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+  caller_key_id TEXT REFERENCES api_keys(id) ON DELETE CASCADE,
+  state TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  PRIMARY KEY (agent_id, partition_key),
+  CHECK (
+    (partition_key = 'shared' AND caller_user_id IS NULL AND caller_key_id IS NULL)
+    OR (caller_user_id IS NOT NULL AND caller_key_id IS NULL
+        AND partition_key = 'account:' || caller_user_id)
+    OR (caller_key_id IS NOT NULL AND caller_user_id IS NULL
+        AND partition_key = 'key:' || caller_key_id)
+  )
+);
+CREATE INDEX IF NOT EXISTS agent_state_expires_at_idx ON agent_state (expires_at);
+CREATE INDEX IF NOT EXISTS agent_state_caller_user_idx ON agent_state (caller_user_id)
+  WHERE caller_user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS agent_state_caller_key_idx ON agent_state (caller_key_id)
+  WHERE caller_key_id IS NOT NULL;
+`;
+
+/**
+ * The partition key of a state row, computed in SQL from the two reference
+ * parameters by the same expression as the table's CHECK — so a write can never
+ * build a key the CHECK refuses, and a read looks a row up by the key its write
+ * produced. Bound by name: `@callerUserId`, `@callerKeyId` (null when absent).
+ */
+const STATE_PARTITION_KEY_SQL =
+  "CASE WHEN @callerUserId IS NOT NULL THEN 'account:' || @callerUserId " +
+  "WHEN @callerKeyId IS NOT NULL THEN 'key:' || @callerKeyId ELSE 'shared' END";
+
+/**
+ * The runs an account deletion clears: those the account launched, every run
+ * of one of its agents, and — when `@leftBehind` is 1, the namespace being the
+ * account's alone — the runs left without an agent whose version names the
+ * namespace `@ns`: runs of an agent it deleted earlier. The namespace is
+ * compared as text, never as a pattern (an older one can hold `_`). Bound by
+ * name: `@userId`, `@ns`, `@leftBehind`.
+ */
+const DELETION_SCOPE_SQL = `(user_id = @userId
+    OR agent_id IN (SELECT id FROM agents WHERE owner_id = @userId)
+    OR (@leftBehind = 1 AND agent_id IS NULL
+        AND substr(agent_version, 1, length(@ns) + 1) = @ns || '/'))`;
+
+/**
+ * Whether the namespace `@ns` of the account `@userId` is someone else's too:
+ * another account with that username, or an agent under it another account
+ * owns.
+ */
+const NAMESPACE_SHARED_SQL = `SELECT EXISTS (SELECT 1 FROM users WHERE username = @ns AND id <> @userId)
+    OR EXISTS (SELECT 1 FROM agents WHERE namespace = @ns AND owner_id <> @userId) AS shared`;
+
+/** The two reference columns of a partition, as named parameters. */
+function statePartitionParams(partition: StatePartition): {
+  callerUserId: string | null;
+  callerKeyId: string | null;
+} {
+  return {
+    callerUserId: partition.kind === "account" ? partition.userId : null,
+    callerKeyId: partition.kind === "key" ? partition.keyId : null,
+  };
+}
+
 export class SqliteDb implements DbAdapter {
   private db: Database.Database;
 
   constructor(dbPath = "skrun.db") {
     this.db = new Database(dbPath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("foreign_keys = ON");
-    this.db.exec(SCHEMA);
-    this.migrate();
+    try {
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("foreign_keys = ON");
+      this.db.exec(SCHEMA);
+      this.migrate();
+    } catch (err) {
+      // An open that refuses the database (a failed migration, an orphan
+      // check) closes the file it opened: left open, the handle outlives the
+      // refusal, and on Windows the file can no longer be removed.
+      this.db.close();
+      throw err;
+    }
   }
 
   /**
@@ -176,7 +299,7 @@ export class SqliteDb implements DbAdapter {
       return rows.length > 0;
     };
 
-    // Migration: add agent_versions.notes (from #14c)
+    // Migration: add agent_versions.notes (version notes)
     if (!hasColumn("agent_versions", "notes")) {
       this.db.exec("ALTER TABLE agent_versions ADD COLUMN notes TEXT");
     }
@@ -203,18 +326,6 @@ export class SqliteDb implements DbAdapter {
     }
     if (!hasColumn("runs", "usage_cache_savings_usd")) {
       this.db.exec("ALTER TABLE runs ADD COLUMN usage_cache_savings_usd REAL NOT NULL DEFAULT 0");
-    }
-
-    // Migration 016: runner cold-start telemetry columns (operator-only).
-    // phase_timings is a JSON object stored as TEXT (SQLite has no jsonb).
-    if (!hasColumn("runs", "machine_id")) {
-      this.db.exec("ALTER TABLE runs ADD COLUMN machine_id TEXT");
-    }
-    if (!hasColumn("runs", "private_ip")) {
-      this.db.exec("ALTER TABLE runs ADD COLUMN private_ip TEXT");
-    }
-    if (!hasColumn("runs", "phase_timings")) {
-      this.db.exec("ALTER TABLE runs ADD COLUMN phase_timings TEXT");
     }
 
     // Migration 007: users.role column + revoke pre-existing verified=true
@@ -321,6 +432,85 @@ export class SqliteDb implements DbAdapter {
         )`,
       );
     }
+
+    // Migration 019: agent state kept per agent id and per caller. Mirrors the
+    // .sql file for Postgres. The table is created HERE, never in SCHEMA, for
+    // the reason api_key_agents and agent_llm_keys are: its foreign keys point
+    // at agents, api_keys and users, and SCHEMA runs before
+    // migrateForeignKeys(), which on an old database drops and rebuilds agents
+    // and api_keys — a child declared in SCHEMA would collide with that
+    // rebuild. A table of the earlier shape (keyed by the agent's name, in an
+    // `agent_name` column) is dropped first, rows included: a row of that
+    // shape names neither the agent's id nor a caller, so none can be carried
+    // over. A table already at the new shape is left as it is.
+    if (tableExists("agent_state") && hasColumn("agent_state", "agent_name")) {
+      this.db.exec("DROP TABLE agent_state");
+    }
+    this.db.exec(AGENT_STATE_TABLE_SQL);
+
+    // Migration 016: runner cold-start telemetry columns (operator-only).
+    // phase_timings is a JSON object stored as TEXT (SQLite has no jsonb).
+    // AFTER migrateForeignKeys(), like 012-014 and 018: on a database from
+    // before 005, its rebuild re-creates runs from a fixed column list that
+    // does not declare these columns, then copies every column of the old
+    // table by name. Added before it, as 1.0.0 to 1.2.1 did, they made that
+    // copy fail ("table runs has no column named machine_id") and the database
+    // would not open. The failed start left them in place; the rebuild now
+    // carries such columns over (rebuildWithFks), so that database opens too.
+    if (!hasColumn("runs", "machine_id")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN machine_id TEXT");
+    }
+    if (!hasColumn("runs", "private_ip")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN private_ip TEXT");
+    }
+    if (!hasColumn("runs", "phase_timings")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN phase_timings TEXT");
+    }
+
+    // Migration 018: output retention — the purge deadline and the purge mark
+    // on runs. Mirrors the .sql file for Postgres. AFTER migrateForeignKeys(),
+    // like 012-014: its rebuild of runs re-creates the table from a fixed column
+    // list, and a column added before it would reach the new table only through
+    // the rebuild's carry-over, which keeps a name and a type and nothing else
+    // of the column's declaration. The partial index follows the columns, here
+    // and never in SCHEMA (on an existing database SCHEMA runs before the
+    // columns exist); it has the Postgres index's shape, so the two schemas
+    // read side by side.
+    if (!hasColumn("runs", "purge_after")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN purge_after TEXT");
+    }
+    if (!hasColumn("runs", "outputs_purged_at")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN outputs_purged_at TEXT");
+    }
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS runs_output_purge_due_idx ON runs (purge_after) WHERE outputs_purged_at IS NULL AND purge_after IS NOT NULL",
+    );
+
+    // Migration 020: the date a run's content was cleared. Mirrors the .sql
+    // file for Postgres; after migrateForeignKeys() for the reason 018 gives.
+    // No index: no query selects runs by it.
+    if (!hasColumn("runs", "content_cleared_at")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN content_cleared_at TEXT");
+    }
+
+    // Migration 021: a run's seat deadline, its charged time and its right to
+    // the pool. Mirrors the .sql file for Postgres; after migrateForeignKeys()
+    // for the reason 018 gives — pool_entitled's NOT NULL and default would be
+    // lost by the rebuild's carry-over. The two indexes follow the columns,
+    // with the Postgres indexes' shapes (the second one partial).
+    if (!hasColumn("runs", "deadline_at")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN deadline_at TEXT");
+    }
+    if (!hasColumn("runs", "charged_ms")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN charged_ms INTEGER");
+    }
+    if (!hasColumn("runs", "pool_entitled")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN pool_entitled INTEGER NOT NULL DEFAULT 0");
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_runs_user_created ON runs (user_id, created_at)");
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_runs_running_deadline ON runs (deadline_at) WHERE status = 'running'",
+    );
   }
 
   /** Number of FK rows the table is expected to have post-migration. */
@@ -501,7 +691,7 @@ export class SqliteDb implements DbAdapter {
     // Duplicate pre-check before rebuilding (per F-3 plan pattern). Extremely
     // rare on self-host (the codebase already guards POST push against version
     // collisions via service-layer 409 VERSION_EXISTS), but a row could exist
-    // from a pre-#77 race or manual SQL.
+    // from a race older than this constraint, or from manual SQL.
     const dupes = this.db
       .prepare(
         "SELECT agent_id, version, COUNT(*) AS n FROM agent_versions GROUP BY agent_id, version HAVING COUNT(*) > 1 LIMIT 5",
@@ -541,6 +731,15 @@ export class SqliteDb implements DbAdapter {
    * https://www.sqlite.org/lang_altertable.html#otheralter.
    * Wrapped in a transaction; foreign_keys pragma is toggled off so the
    * INSERT FROM old doesn't error on the very FKs we're adding.
+   *
+   * The new table comes from a fixed column list, and the rows are copied by
+   * the old table's column names. A column of the old table that the list does
+   * not declare is carried over first, by its name and type only: without it
+   * the copy fails, and the database no longer opens. That is the database a
+   * start of 1.0.0 to 1.2.1 left behind — it added the telemetry columns to
+   * runs before this rebuild, then failed here on them. The rest of such a
+   * column's declaration (NOT NULL, a default, a CHECK) is not carried, which
+   * is why a migration's ALTER still comes after the rebuilds, never before.
    */
   private rebuildWithFks(table: string, createSql: string): void {
     const backup = `${table}_pre_fk_backup`;
@@ -549,10 +748,20 @@ export class SqliteDb implements DbAdapter {
       this.db.exec("BEGIN");
       this.db.exec(`ALTER TABLE ${table} RENAME TO ${backup}`);
       this.db.exec(createSql);
-      // Copy rows (column lists match by name since we kept identical columns).
-      const cols = (this.db.pragma(`table_info(${backup})`) as Array<{ name: string }>)
-        .map((c) => c.name)
-        .join(", ");
+      const declared = new Set(
+        (this.db.pragma(`table_info(${table})`) as Array<{ name: string }>).map((c) => c.name),
+      );
+      const oldColumns = this.db.pragma(`table_info(${backup})`) as Array<{
+        name: string;
+        type: string;
+      }>;
+      for (const column of oldColumns) {
+        if (!declared.has(column.name)) {
+          this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column.name} ${column.type}`);
+        }
+      }
+      // Copy rows: every column of the old table now exists in the new one.
+      const cols = oldColumns.map((c) => c.name).join(", ");
       this.db.exec(`INSERT INTO ${table} (${cols}) SELECT ${cols} FROM ${backup}`);
       this.db.exec(`DROP TABLE ${backup}`);
       this.db.exec("COMMIT");
@@ -620,6 +829,8 @@ export class SqliteDb implements DbAdapter {
       usage_cache_savings_usd: (row.usage_cache_savings_usd as number | undefined) ?? 0,
       // Defensive fallback for legacy rows not yet migrated to 013.
       api_key_id: (row.api_key_id as string | null) ?? null,
+      // SQLite has no boolean: the column holds 0 or 1.
+      pool_entitled: row.pool_entitled === 1,
     } as Run;
   }
 
@@ -808,6 +1019,16 @@ export class SqliteDb implements DbAdapter {
     };
   }
 
+  /**
+   * Never unknown: SQLite writes in this process, so a write that throws has
+   * done all it will do. What it wrote before failing is there to be read —
+   * `createVersion` inserts the row, then updates the agent, in two statements —:
+   * the caller's read decides.
+   */
+  writeOutcomeUnknown(_err: unknown): boolean {
+    return false;
+  }
+
   async getVersions(agentId: string): Promise<AgentVersion[]> {
     const rows = this.db
       .prepare("SELECT * FROM agent_versions WHERE agent_id = ? ORDER BY pushed_at")
@@ -837,6 +1058,17 @@ export class SqliteDb implements DbAdapter {
       .run(agentId, version);
   }
 
+  async sumBundleBytesByOwner(ownerId: string): Promise<number> {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(v.size), 0) AS total
+           FROM agent_versions v JOIN agents a ON a.id = v.agent_id
+          WHERE a.owner_id = ?`,
+      )
+      .get(ownerId) as { total: number };
+    return Number(row.total);
+  }
+
   async listVersionsMissingHash(): Promise<Array<{ id: string; bundle_key: string }>> {
     return this.db
       .prepare("SELECT id, bundle_key FROM agent_versions WHERE bundle_sha256 IS NULL")
@@ -851,24 +1083,50 @@ export class SqliteDb implements DbAdapter {
 
   // ── Agent State ───────────────────────────────────────────────────────
 
-  async getState(agentName: string): Promise<Record<string, unknown> | null> {
+  async getState(agentId: string, partition: StatePartition): Promise<StoredState | null> {
     const row = this.db
-      .prepare("SELECT state FROM agent_state WHERE agent_name = ?")
-      .get(agentName) as { state: string } | undefined;
-    return row ? (this.jsonParse(row.state) as Record<string, unknown>) : null;
+      .prepare(
+        `SELECT state, expires_at FROM agent_state
+         WHERE agent_id = @agentId AND partition_key = (${STATE_PARTITION_KEY_SQL})`,
+      )
+      .get({ agentId, ...statePartitionParams(partition) }) as
+      | { state: string; expires_at: string }
+      | undefined;
+    if (!row) return null;
+    return {
+      state: this.jsonParse(row.state) as Record<string, unknown>,
+      expires_at: row.expires_at,
+    };
   }
 
-  async setState(agentName: string, state: Record<string, unknown>): Promise<void> {
-    const now = new Date().toISOString();
+  async setState(
+    agentId: string,
+    partition: StatePartition,
+    state: Record<string, unknown>,
+    expiresAt: string,
+  ): Promise<void> {
     this.db
       .prepare(
-        "INSERT OR REPLACE INTO agent_state (agent_name, state, updated_at) VALUES (?, ?, ?)",
+        `INSERT INTO agent_state
+           (agent_id, partition_key, caller_user_id, caller_key_id, state, updated_at, expires_at)
+         VALUES
+           (@agentId, (${STATE_PARTITION_KEY_SQL}), @callerUserId, @callerKeyId, @state, @updatedAt, @expiresAt)
+         ON CONFLICT (agent_id, partition_key) DO UPDATE SET
+           state = excluded.state,
+           updated_at = excluded.updated_at,
+           expires_at = excluded.expires_at`,
       )
-      .run(agentName, JSON.stringify(state), now);
+      .run({
+        agentId,
+        ...statePartitionParams(partition),
+        state: JSON.stringify(state),
+        updatedAt: new Date().toISOString(),
+        expiresAt,
+      });
   }
 
-  async deleteState(agentName: string): Promise<void> {
-    this.db.prepare("DELETE FROM agent_state WHERE agent_name = ?").run(agentName);
+  async purgeExpiredState(): Promise<void> {
+    this.db.prepare("DELETE FROM agent_state WHERE expires_at < ?").run(new Date().toISOString());
   }
 
   // ── Users ─────────────────────────────────────────────────────────────
@@ -891,6 +1149,46 @@ export class SqliteDb implements DbAdapter {
     email?: string;
     avatar_url?: string;
   }): Promise<User> {
+    return this.insertUser(data);
+  }
+
+  async createOAuthUser(data: {
+    github_id: string;
+    login: string;
+    email?: string;
+    avatar_url?: string;
+  }): Promise<{ user: User; derived: number | null }> {
+    const findByGithubId = this.db.prepare("SELECT * FROM users WHERE github_id = ?");
+    const isTaken = this.db.prepare("SELECT 1 FROM users WHERE username = ?");
+    // `users.username` has no UNIQUE here: the explicit read is the guarantee.
+    // `immediate` takes the write lock at BEGIN, so another connection to the
+    // same file cannot slip an insert between the read and ours.
+    const pick = this.db.transaction((): { user: User; derived: number | null } => {
+      const existing = findByGithubId.get(data.github_id) as User | undefined;
+      if (existing) return { user: existing, derived: null };
+      const base = namespaceBase(data.login);
+      for (let n = 1; n <= NAMESPACE_MAX_ATTEMPTS; n++) {
+        const username = derivedNamespace(base, n);
+        if (isTaken.get(username)) continue;
+        const user = this.insertUser({
+          github_id: data.github_id,
+          username,
+          email: data.email,
+          avatar_url: data.avatar_url,
+        });
+        return { user, derived: n === 1 ? null : n };
+      }
+      throw new NamespaceUnavailableError(NAMESPACE_MAX_ATTEMPTS);
+    });
+    return pick.immediate();
+  }
+
+  private insertUser(data: {
+    github_id: string;
+    username: string;
+    email?: string;
+    avatar_url?: string;
+  }): User {
     const id = randomUUID();
     const now = new Date().toISOString();
     const user: User = {
@@ -947,6 +1245,157 @@ export class SqliteDb implements DbAdapter {
     const result = this.db.prepare(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
     if (result.changes === 0) return null;
     return this.getUserById(id);
+  }
+
+  // ── Account deletion ──────────────────────────────────────────────────
+
+  async planUserDeletion(userId: string): Promise<UserDeletionPlan | null> {
+    const user = this.db.prepare("SELECT username FROM users WHERE id = ?").get(userId) as
+      | { username: string }
+      | undefined;
+    if (!user) return null;
+    const bundleKeys = this.db
+      .prepare(
+        "SELECT bundle_key FROM agent_versions WHERE agent_id IN (SELECT id FROM agents WHERE owner_id = ?)",
+      )
+      .all(userId) as Array<{ bundle_key: string }>;
+    const shared =
+      (
+        this.db.prepare(NAMESPACE_SHARED_SQL).get({ ns: user.username, userId }) as {
+          shared: number;
+        }
+      ).shared === 1;
+    const pending = this.db
+      .prepare(
+        `SELECT id, files FROM runs
+         WHERE ${DELETION_SCOPE_SQL} AND purge_after IS NOT NULL AND outputs_purged_at IS NULL`,
+      )
+      .all({ userId, ns: user.username, leftBehind: shared ? 0 : 1 }) as Array<{
+      id: string;
+      files: string | null;
+    }>;
+    return {
+      username: user.username,
+      bundle_keys: bundleKeys.map((r) => r.bundle_key),
+      pending_outputs: pending.map((r) => ({
+        id: r.id,
+        files: this.jsonParse(r.files) as Record<string, unknown>[] | null,
+      })),
+      namespace_shared: shared,
+    };
+  }
+
+  async deleteUser(
+    userId: string,
+    opts: { purged_output_run_ids: string[]; at: string },
+  ): Promise<UserDeletionResult | null> {
+    const purged = new Set(opts.purged_output_run_ids);
+    // `immediate` takes the write lock at BEGIN: no other connection to the
+    // file writes between the reads below and the deletion.
+    const remove = this.db.transaction((): UserDeletionResult | null => {
+      const user = this.db.prepare("SELECT username FROM users WHERE id = ?").get(userId) as
+        | { username: string }
+        | undefined;
+      if (!user) return null;
+      const agents = (
+        this.db.prepare("SELECT COUNT(*) AS n FROM agents WHERE owner_id = ?").get(userId) as {
+          n: number;
+        }
+      ).n;
+      const apiKeys = (
+        this.db.prepare("SELECT COUNT(*) AS n FROM api_keys WHERE user_id = ?").get(userId) as {
+          n: number;
+        }
+      ).n;
+      const bundleKeys = (
+        this.db
+          .prepare(
+            "SELECT bundle_key FROM agent_versions WHERE agent_id IN (SELECT id FROM agents WHERE owner_id = ?)",
+          )
+          .all(userId) as Array<{ bundle_key: string }>
+      ).map((r) => r.bundle_key);
+      const shared =
+        (
+          this.db.prepare(NAMESPACE_SHARED_SQL).get({ ns: user.username, userId }) as {
+            shared: number;
+          }
+        ).shared === 1;
+      const scopeParams = { userId, ns: user.username, leftBehind: shared ? 0 : 1 };
+      // One synchronous body under the write lock: no completion can commit
+      // between this read and the clearing below.
+      const scope = this.db
+        .prepare(
+          `SELECT id, files, purge_after, outputs_purged_at FROM runs WHERE ${DELETION_SCOPE_SQL}`,
+        )
+        .all(scopeParams) as Array<{
+        id: string;
+        files: string | null;
+        purge_after: string | null;
+        outputs_purged_at: string | null;
+      }>;
+      const lateOutputs = scope
+        .filter((r) => r.purge_after != null && r.outputs_purged_at == null && !purged.has(r.id))
+        .map((r) => ({
+          id: r.id,
+          files: this.jsonParse(r.files) as Record<string, unknown>[] | null,
+        }));
+
+      // Cleared while the scope can still be selected: once the account and
+      // its agents are gone, these runs no longer name them.
+      this.db
+        .prepare(
+          `UPDATE runs SET
+             input = NULL, output = NULL, error = NULL, files = '[]',
+             content_cleared_at = @at,
+             agent_version = CASE
+               WHEN substr(agent_version, 1, length(@ns) + 1) = @ns || '/'
+                 AND (agent_id IS NULL OR agent_id IN (SELECT id FROM agents WHERE owner_id = @userId))
+               THEN CASE WHEN instr(agent_version, '@') > 0
+                 THEN '@' || substr(agent_version, instr(agent_version, '@') + 1)
+                 ELSE '@' END
+               ELSE agent_version END
+           WHERE ${DELETION_SCOPE_SQL}`,
+        )
+        .run({ ...scopeParams, at: opts.at });
+      const markPurged = this.db.prepare(
+        "UPDATE runs SET outputs_purged_at = ? WHERE id = ? AND outputs_purged_at IS NULL",
+      );
+      for (const id of purged) markPurged.run(opts.at, id);
+
+      // The foreign keys do the rest (`foreign_keys = ON`).
+      this.db.prepare("DELETE FROM users WHERE id = ?").run(userId);
+      return {
+        agents,
+        versions: bundleKeys.length,
+        api_keys: apiKeys,
+        cleared_run_ids: scope.map((r) => r.id),
+        late_outputs: lateOutputs,
+        bundle_keys: bundleKeys,
+      };
+    });
+    return remove.immediate();
+  }
+
+  async namespaceInUse(namespace: string): Promise<boolean> {
+    const row = this.db
+      .prepare(
+        `SELECT EXISTS (SELECT 1 FROM users WHERE username = @ns)
+             OR EXISTS (SELECT 1 FROM agents WHERE namespace = @ns) AS used`,
+      )
+      .get({ ns: namespace }) as { used: number };
+    return row.used === 1;
+  }
+
+  async referencedBundleKeys(keys: string[], exceptOwnerId?: string): Promise<string[]> {
+    if (keys.length === 0) return [];
+    const placeholders = keys.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT v.bundle_key FROM agent_versions v JOIN agents a ON a.id = v.agent_id
+         WHERE v.bundle_key IN (${placeholders}) AND a.owner_id IS NOT ?`,
+      )
+      .all(...keys, exceptOwnerId ?? null) as Array<{ bundle_key: string }>;
+    return rows.map((r) => r.bundle_key);
   }
 
   // ── API Keys ──────────────────────────────────────────────────────────
@@ -1250,6 +1699,174 @@ export class SqliteDb implements DbAdapter {
     input?: Record<string, unknown>;
     created_at?: string;
   }): Promise<Run> {
+    return this.insertRun(data, { deadline_at: null, pool_entitled: false });
+  }
+
+  async admitRun(admission: RunAdmission): Promise<RunAdmissionResult> {
+    const insert = (poolEntitled: boolean): Run =>
+      this.insertRun(
+        { ...admission.run, status: "running", created_at: admission.now },
+        { deadline_at: admission.deadlineAt, pool_entitled: poolEntitled },
+      );
+    if (!admissionIsBounded(admission)) {
+      // Nothing bounds the run: createRun's plain insert, its deadline and its
+      // right to the pool set — no lock, no read.
+      const poolEntitled = admission.poolRunning;
+      return { admitted: true, run: insert(poolEntitled), poolEntitled, usage: null };
+    }
+    // `immediate` takes the write lock at BEGIN, before the first read: no
+    // other connection to the file can write a run between the sums and the
+    // insert. A refusal returns from the body and commits nothing written.
+    const admit = this.db.transaction((): RunAdmissionResult => {
+      const usage = this.usageOf(admission.run.user_id ?? null, {
+        now: admission.now,
+        windowStart: admission.windowStart,
+        fastSince: fastRunsSince(admission.now),
+        instance: admission.limits.instanceCap !== null,
+      });
+      const verdict = admissionVerdict(admission, usage);
+      if (!verdict.admitted) return { admitted: false, reason: verdict.reason, usage };
+      return {
+        admitted: true,
+        run: insert(verdict.poolEntitled),
+        poolEntitled: verdict.poolEntitled,
+        usage,
+      };
+    });
+    return admit.immediate();
+  }
+
+  async returnPoolRight(id: string): Promise<boolean> {
+    // The condition is in the statement that writes: a row that does not hold
+    // the right is not written.
+    const result = this.db
+      .prepare("UPDATE runs SET pool_entitled = 0 WHERE id = ? AND pool_entitled = 1")
+      .run(id);
+    return result.changes === 1;
+  }
+
+  async getAccountUsage(
+    userId: string | null,
+    at: {
+      now: string;
+      windowStart: string | null;
+      fastSince: string | null;
+      instance?: boolean;
+      fastLimit?: number;
+    },
+  ): Promise<AccountUsage> {
+    const usage = this.usageOf(userId, {
+      now: at.now,
+      windowStart: at.windowStart,
+      fastSince: at.fastSince,
+      instance: at.instance === true,
+    });
+    if (at.fastLimit !== undefined) {
+      usage.releasingFastRunAt = this.releasingFastRunAt(
+        userId,
+        at.fastSince,
+        releasingFastRunOffset(usage.fastRunsUsed, at.fastLimit),
+      );
+    }
+    return usage;
+  }
+
+  /**
+   * The creation of the account's run with the right to a pooled machine,
+   * created strictly after `fastSince`, that `offset` others precede, oldest
+   * first — `null` when there is none. One row, read through the
+   * `(user_id, created_at)` index; a null account or instant matches no row.
+   */
+  private releasingFastRunAt(
+    userId: string | null,
+    fastSince: string | null,
+    offset: number,
+  ): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT created_at FROM runs
+         WHERE user_id = ? AND pool_entitled = 1 AND created_at > ?
+         ORDER BY created_at LIMIT 1 OFFSET ?`,
+      )
+      .get(userId, fastSince, offset) as { created_at: string } | undefined;
+    return row?.created_at ?? null;
+  }
+
+  /**
+   * The sums an admission reads, in SQL. Timestamps are TEXT here: every
+   * comparison is one of two `toISOString()` strings, and a duration is the
+   * difference of two `julianday()`, rounded to the millisecond per row.
+   */
+  private usageOf(
+    userId: string | null,
+    at: { now: string; windowStart: string | null; fastSince: string | null; instance: boolean },
+  ): AccountUsage {
+    const usage: AccountUsage = {
+      seatsInUse: 0,
+      computeUsedMs: 0,
+      fastRunsUsed: 0,
+      // Read apart, and only when asked (`getAccountUsage`).
+      releasingFastRunAt: null,
+      instanceSeatsInUse: null,
+    };
+    if (userId !== null) {
+      // Only the rows that can count: those in flight, and those created since
+      // the earlier of the two instants.
+      const from = [at.windowStart, at.fastSince].filter((t): t is string => t !== null).sort()[0];
+      const row = this.db
+        .prepare(
+          `SELECT
+             COALESCE(SUM(CASE WHEN status = 'running' AND deadline_at > @now THEN 1 ELSE 0 END), 0) AS seats,
+             COALESCE(SUM(CASE WHEN @windowStart IS NOT NULL AND created_at >= @windowStart THEN
+               CASE
+                 WHEN status <> 'running' THEN COALESCE(charged_ms,
+                   CASE WHEN completed_at IS NULL THEN 0
+                     ELSE MAX(0, CAST(ROUND((julianday(completed_at) - julianday(created_at)) * 86400000) AS INTEGER))
+                   END)
+                 WHEN deadline_at IS NULL OR deadline_at <= @now THEN 0
+                 ELSE MAX(0, CAST(ROUND((julianday(@now) - julianday(created_at)) * 86400000) AS INTEGER))
+               END
+             ELSE 0 END), 0) AS compute,
+             COALESCE(SUM(CASE WHEN @fastSince IS NOT NULL AND pool_entitled = 1 AND created_at > @fastSince THEN 1 ELSE 0 END), 0) AS fast
+           FROM runs
+           WHERE user_id = @userId AND (status = 'running' OR (@from IS NOT NULL AND created_at >= @from))`,
+        )
+        .get({
+          userId,
+          now: at.now,
+          windowStart: at.windowStart,
+          fastSince: at.fastSince,
+          from: from ?? null,
+        }) as { seats: number; compute: number; fast: number };
+      usage.seatsInUse = row.seats;
+      usage.computeUsedMs = row.compute;
+      usage.fastRunsUsed = row.fast;
+    }
+    if (at.instance) {
+      const row = this.db
+        .prepare("SELECT COUNT(*) AS n FROM runs WHERE status = 'running' AND deadline_at > ?")
+        .get(at.now) as { n: number };
+      usage.instanceSeatsInUse = row.n;
+    }
+    return usage;
+  }
+
+  /** Write a new run row; the foreign keys refuse a missing account, agent or key. */
+  private insertRun(
+    data: {
+      id: string;
+      agent_id: string | null;
+      agent_version: string;
+      model?: string | null;
+      environment_id?: string | null;
+      user_id?: string | null;
+      api_key_id?: string | null;
+      status: RunStatus;
+      input?: Record<string, unknown>;
+      created_at?: string;
+    },
+    admitted: Pick<Run, "deadline_at" | "pool_entitled">,
+  ): Run {
     const now = new Date().toISOString();
     const run: Run = {
       id: data.id,
@@ -1277,11 +1894,17 @@ export class SqliteDb implements DbAdapter {
       files: null,
       created_at: data.created_at ?? now,
       completed_at: null,
+      purge_after: null,
+      outputs_purged_at: null,
+      content_cleared_at: null,
+      deadline_at: admitted.deadline_at,
+      charged_ms: null,
+      pool_entitled: admitted.pool_entitled,
     };
     this.db
       .prepare(
-        `INSERT INTO runs (id, agent_id, agent_version, model, environment_id, user_id, api_key_id, status, input, output, error, usage_prompt_tokens, usage_completion_tokens, usage_total_tokens, usage_estimated_cost, duration_ms, files, created_at, completed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, agent_id, agent_version, model, environment_id, user_id, api_key_id, status, input, output, error, usage_prompt_tokens, usage_completion_tokens, usage_total_tokens, usage_estimated_cost, duration_ms, files, created_at, completed_at, deadline_at, pool_entitled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         run.id,
@@ -1303,38 +1926,49 @@ export class SqliteDb implements DbAdapter {
         null,
         run.created_at,
         null,
+        run.deadline_at,
+        run.pool_entitled ? 1 : 0,
       );
     return run;
   }
 
-  async updateRun(
+  async updateRun(id: string, data: RunWrite): Promise<Run | null> {
+    return this.writeRunRow(id, data, null);
+  }
+
+  async finishRun(
     id: string,
-    data: Partial<
-      Pick<
-        Run,
-        | "status"
-        | "output"
-        | "error"
-        | "usage_prompt_tokens"
-        | "usage_completion_tokens"
-        | "usage_total_tokens"
-        | "usage_estimated_cost"
-        | "usage_cache_read_tokens"
-        | "usage_cache_write_tokens"
-        | "usage_cache_savings_usd"
-        | "duration_ms"
-        | "files"
-        | "completed_at"
-        | "machine_id"
-        | "private_ip"
-        | "phase_timings"
-      >
-    >,
+    data: FinalRunWrite,
+    options?: { replaceShutdownProvisional?: boolean },
+  ): Promise<Run | null> {
+    return this.writeRunRow(id, data, {
+      // Only a completion replaces the stop's provisional failure, and only when it asks.
+      replaceShutdownProvisional:
+        options?.replaceShutdownProvisional === true && data.status === "completed",
+    });
+  }
+
+  /**
+   * The write of a run row that `updateRun` and `finishRun` share. `finish`
+   * set, the row is written only while it is still running — or, for a
+   * completion that asks, while it holds the stop's provisional failure: the
+   * condition is in the `WHERE` of the statement that writes.
+   */
+  private async writeRunRow(
+    id: string,
+    data: RunWrite,
+    finish: { replaceShutdownProvisional: boolean } | null,
   ): Promise<Run | null> {
     const sets: string[] = [];
     const vals: unknown[] = [];
     for (const [key, val] of Object.entries(data)) {
-      sets.push(`${key} = ?`);
+      // A cleared run keeps its content: the mark is tested in the statement
+      // that writes the rest, and the row is read back in the same body.
+      sets.push(
+        RUN_CONTENT_FIELDS.has(key)
+          ? `${key} = CASE WHEN content_cleared_at IS NULL THEN ? ELSE ${key} END`
+          : `${key} = ?`,
+      );
       if (key === "output" || key === "files" || key === "phase_timings") {
         vals.push(val != null ? JSON.stringify(val) : null);
       } else {
@@ -1343,7 +1977,18 @@ export class SqliteDb implements DbAdapter {
     }
     if (sets.length === 0) return this.getRun(id);
     vals.push(id);
-    const result = this.db.prepare(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
+    let where = "id = ?";
+    if (finish) {
+      if (finish.replaceShutdownProvisional) {
+        where += " AND (status = 'running' OR (status = 'failed' AND error = ?))";
+        vals.push(SHUTDOWN_RUN_ERROR);
+      } else {
+        where += " AND status = 'running'";
+      }
+    }
+    const result = this.db
+      .prepare(`UPDATE runs SET ${sets.join(", ")} WHERE ${where}`)
+      .run(...vals);
     if (result.changes === 0) return null;
     return this.getRun(id);
   }
@@ -1381,6 +2026,44 @@ export class SqliteDb implements DbAdapter {
       .prepare(`SELECT * FROM runs ${where} ORDER BY created_at DESC ${limitClause}`)
       .all(...vals) as Record<string, unknown>[];
     return rows.map((r) => this.toRun(r));
+  }
+
+  async getAgentRunTotals(agentId: string): Promise<{ run_count: number; token_count: number }> {
+    const row = this.db
+      .prepare(
+        "SELECT COUNT(*) AS run_count, COALESCE(SUM(usage_total_tokens), 0) AS token_count FROM runs WHERE agent_id = ?",
+      )
+      .get(agentId) as { run_count: number; token_count: number };
+    return { run_count: Number(row.run_count), token_count: Number(row.token_count) };
+  }
+
+  /**
+   * Timestamps are TEXT here, so `purge_after <= ?` compares strings — correct
+   * only while both sides are `toISOString()` output (fixed width, UTC): the
+   * deadline is written, and `now` passed, in that form.
+   */
+  async listRunsDueForOutputPurge(
+    now: string,
+    limit: number,
+  ): Promise<Array<Pick<Run, "id" | "files">>> {
+    const rows = this.db
+      .prepare(
+        `SELECT id, files FROM runs
+         WHERE purge_after <= ? AND outputs_purged_at IS NULL
+         ORDER BY purge_after
+         LIMIT ?`,
+      )
+      .all(now, limit) as Array<{ id: string; files: string | null }>;
+    return rows.map((r) => ({
+      id: r.id,
+      files: this.jsonParse(r.files) as Record<string, unknown>[] | null,
+    }));
+  }
+
+  async markRunOutputsPurged(id: string, at: string): Promise<void> {
+    this.db
+      .prepare("UPDATE runs SET outputs_purged_at = ? WHERE id = ? AND outputs_purged_at IS NULL")
+      .run(at, id);
   }
 
   // ── Stats ─────────────────────────────────────────────────────────────

@@ -11,12 +11,15 @@
  * When env is present, walks the FlyMachinesApi lifecycle against a real
  * dev Fly.io app:
  *   1. create a tiny machine from the configured image (Fly auto-starts it)
- *   2. list (assert the machine is present), then wait for `started`
+ *   2. list (assert the machine is present, and that its configuration asks the
+ *      platform to destroy it once its process exits), then wait for `started`
  *   3. suspend — pause the machine and snapshot its memory
  *   4. list (assert `suspended`)
  *   5. start — the resume; assert the private address survived it
- *   6. destroy
- *   7. list (assert the machine is absent)
+ *   6. write one key of its metadata — what an assigned pooled machine carries —,
+ *      then find it by a listing filtered on that key, still started
+ *   7. destroy
+ *   8. list (assert the machine is absent)
  *
  * Steps 3-5 exist for the pre-warm pool, which holds suspended machines and
  * wakes one per run. Two things about them can only be proven against the real
@@ -37,7 +40,7 @@
  *
  * Each result is printed in the PASS line per CONSTITUTION D-1 so a human
  * can verify the machine actually existed (e.g., `machine=fdmach_XYZ
- * lifecycle=create→list-present→suspend→list-suspended→resume→destroy→list-absent`).
+ * lifecycle=create→list-present→auto-destroy→suspend→list-suspended→resume→metadata→destroy→list-absent`).
  */
 
 // Import via source path: `@skrun-dev/runtime` isn't resolvable from `tests/`
@@ -62,6 +65,9 @@ const BOOT_TIMEOUT_MS = 180_000;
 const SUSPEND_TIMEOUT_MS = 60_000;
 const RESUME_TIMEOUT_MS = 90_000;
 const DESTROY_TIMEOUT_MS = 30_000;
+// A key of its own: no maintenance of the product reads it, whatever app the
+// smoke runs on.
+const METADATA_KEY = "skrun_smoke_id";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -139,7 +145,7 @@ export async function run(): Promise<void> {
   const machineName = `skrun-smoke-${Date.now()}`;
   const start = Date.now();
   let machineId: string | null = null;
-  // Carried into the failure detail: with seven steps against a live API, which
+  // Carried into the failure detail: with eight steps against a live API, which
   // one broke is the first thing a human needs, and the API error alone rarely
   // says (three of them are the same `POST … 400`).
   let step = "create";
@@ -157,8 +163,10 @@ export async function run(): Promise<void> {
         // step 3 for a reason that has nothing to do with what is under test.
         env: { SKRUN_CONTAINER_MODE: "runner" },
         guest: { cpu_kind: "shared", cpus: 1, memory_mb: 1024 },
-        // Never restarted under us — same as every machine the adapter creates.
+        // Never restarted under us, and destroyed by the platform once its
+        // process exits — same as every machine the adapter creates.
         restart: { policy: "no" },
+        auto_destroy: true,
       },
     });
     machineId = created.id;
@@ -169,6 +177,15 @@ export async function run(): Promise<void> {
     const present = listed.find((m) => m.id === machineId);
     if (!present) {
       throw new Error(`Created machine ${machineId} absent from list`);
+    }
+
+    // Read back from the listing: the flag the client sends is the one the
+    // platform keeps — what no check against hand-written fixtures can say.
+    step = "auto-destroy";
+    if (present.config?.auto_destroy !== true) {
+      throw new Error(
+        `Created machine ${machineId} lists auto_destroy=${String(present.config?.auto_destroy)}, expected true`,
+      );
     }
 
     step = "wait-started";
@@ -205,12 +222,34 @@ export async function run(): Promise<void> {
       );
     }
 
-    // 6. destroy — Fly's DELETE (force) accepts machines in any non-destroyed
+    // 6. metadata — the write an assigned pooled machine gets once its run is
+    // handed over: the platform keeps it, the listing filtered on its key finds
+    // the machine, and the machine is still running — a write that restarted it
+    // would end the run it serves.
+    step = "metadata-write";
+    await api.setMetadata(machineId, METADATA_KEY, machineName);
+    step = "metadata-listed";
+    const labelled = await api.listByLabel(METADATA_KEY, machineName);
+    const found = labelled.find((m) => m.id === machineId);
+    if (!found || labelled.length !== 1) {
+      throw new Error(
+        `the listing filtered on ${METADATA_KEY}=${machineName} returned ` +
+          `${labelled.length} machine(s), ${found ? "this one among them" : "not this one"}`,
+      );
+    }
+    if (found.state !== "started" || (found.private_ip ?? null) !== addressAfter) {
+      throw new Error(
+        `after the metadata write the machine lists state=${found.state} ` +
+          `address=${found.private_ip ?? "(none)"}, expected started at ${addressAfter}`,
+      );
+    }
+
+    // 7. destroy — Fly's DELETE (force) accepts machines in any non-destroyed
     // state, including the resumed one from step 5. No explicit stop required.
     step = "destroy";
     await api.destroy(machineId);
 
-    // 7. list — assert absent
+    // 8. list — assert absent
     step = "list-absent";
     await waitForAbsent(api, machineId, DESTROY_TIMEOUT_MS);
 
@@ -225,7 +264,7 @@ export async function run(): Promise<void> {
       cost: 0,
       detail:
         `machine=${machineId} name=${machineName} address=${addressAfter} ` +
-        `lifecycle=create→list-present→suspend→list-suspended→resume→destroy→list-absent ` +
+        `lifecycle=create→list-present→auto-destroy→suspend→list-suspended→resume→metadata→destroy→list-absent ` +
         `suspend_to_suspended_ms=${suspendMs} resume_to_started_ms=${resumeMs}`,
     });
   } catch (err) {
@@ -239,6 +278,11 @@ export async function run(): Promise<void> {
       }
     }
     const msg = err instanceof Error ? err.message : String(err);
+    // The client's errors carry a fixed sentence; what the platform answered —
+    // the reason a call was refused — is the error's cause. Printed here, on a
+    // throwaway machine of a test app, because it is the one line that says why.
+    const cause =
+      err instanceof Error && err.cause instanceof Error ? ` cause=${err.cause.message}` : "";
     // Actionable hint when the failure looks like an unresolvable image rather
     // than a Fly API/network error — the `:edge` default should always resolve.
     const hint = /manifest|not found|unknown|unauthorized|404|image/i.test(msg)
@@ -250,7 +294,7 @@ export async function run(): Promise<void> {
       passed: false,
       duration: Date.now() - start,
       cost: 0,
-      detail: `machine=${machineId ?? "(not created)"} step=${step} error=${msg}${hint}`,
+      detail: `machine=${machineId ?? "(not created)"} step=${step} error=${msg}${cause}${hint}`,
     });
   }
 }

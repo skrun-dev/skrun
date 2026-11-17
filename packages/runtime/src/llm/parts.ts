@@ -1,6 +1,12 @@
-import { type FileInputField, type WireFileSource, WireFileSourceSchema } from "@skrun-dev/schema";
+import {
+  type FileInputField,
+  isRunInputAbsent,
+  runMissingInputRefusal,
+  type WireFileSource,
+  WireFileSourceSchema,
+} from "@skrun-dev/schema";
 import { isHostAllowed } from "../security/network.js";
-import { SsrfBlockedError, safeFetch } from "../security/safe-fetch.js";
+import { type PrivateResolution, SsrfBlockedError, safeFetch } from "../security/safe-fetch.js";
 
 // ============================================================================
 // SkrunPart — internal multimodal representation
@@ -21,10 +27,18 @@ const URL_FETCH_TIMEOUT_MS = 30_000; // bound on file-input URL fetches
 
 export class ResolveError extends Error {
   readonly code: string;
-  constructor(code: string, message: string) {
+  /**
+   * For a URL refused because a name it reaches resolved to a private or
+   * reserved address: that name, which `message` names too, and that address,
+   * which `message` — the caller's to read — never names. For the server's own
+   * log.
+   */
+  readonly privateResolution: PrivateResolution | undefined;
+  constructor(code: string, message: string, privateResolution?: PrivateResolution) {
     super(message);
     this.name = "ResolveError";
     this.code = code;
+    this.privateResolution = privateResolution;
   }
 }
 
@@ -68,14 +82,21 @@ async function resolveWirePart(
   }
   let res: Awaited<ReturnType<typeof safeFetch>>;
   try {
-    res = await safeFetch(wire.url, undefined, { timeoutMs: URL_FETCH_TIMEOUT_MS });
+    // The check above vets this URL; the guard holds every connection — this
+    // one, and each redirect hop's — to the same list, so a listed host cannot
+    // redirect the fetch off it.
+    res = await safeFetch(wire.url, undefined, {
+      timeoutMs: URL_FETCH_TIMEOUT_MS,
+      allowedHosts: ctx.allowedHosts,
+    });
   } catch (err) {
     // safeFetch throws SsrfBlockedError directly (bad scheme) or rejects with it
-    // as the fetch error's `cause` (host resolves to a private/reserved IP).
+    // as the fetch error's `cause` (a private/reserved address, literal or
+    // resolved, or a host off the list — at the first URL or a redirect hop).
     const cause = err instanceof Error && err.cause instanceof Error ? err.cause : err;
     if (err instanceof SsrfBlockedError || cause instanceof SsrfBlockedError) {
       const blocked = err instanceof SsrfBlockedError ? err : (cause as SsrfBlockedError);
-      throw new ResolveError("URL_NOT_ALLOWED", blocked.message);
+      throw new ResolveError("URL_NOT_ALLOWED", blocked.message, blocked.privateResolution);
     }
     throw new ResolveError(
       "URL_FETCH_FAILED",
@@ -91,6 +112,23 @@ async function resolveWirePart(
   const buffer = await res.arrayBuffer();
   const mediaType = res.headers.get("content-type") ?? "application/octet-stream";
   return { bytes: new Uint8Array(buffer), media_type: mediaType };
+}
+
+/**
+ * The refusal of an element of a file input that is not a file source:
+ * `Input 'photo' item 1 is not a file source (url: Invalid URL)`. The member a
+ * complaint is about comes from the schema's own keys, and its wording names
+ * types and expected values, never the one received.
+ */
+function notAFileSource(
+  field: string,
+  index: number | undefined,
+  issue: { path: PropertyKey[]; message: string } | undefined,
+): ResolveError {
+  const where = index === undefined ? `Input '${field}'` : `Input '${field}' item ${index}`;
+  const member = issue && issue.path.length > 0 ? `${issue.path.map(String).join(".")}: ` : "";
+  const what = issue ? ` (${member}${issue.message})` : "";
+  return new ResolveError("INVALID_INPUT_TYPE", `${where} is not a file source${what}`);
 }
 
 /**
@@ -110,17 +148,20 @@ export async function resolveInput(
   const result = new Map<string, SkrunPart[]>();
 
   for (const schema of fileSchemas) {
-    const raw = input[schema.name];
-    if (raw === undefined || raw === null) {
+    // Absent as the schema defines it — no field of the input's own (a name
+    // only its prototype carries, `toString`, `filter` of an array, is none of
+    // its inputs), null, or an empty list: a required one is refused with the
+    // code and the words the check of the declared inputs gives; an optional
+    // one is left out of the resolved inputs, and the run goes ahead without it.
+    if (isRunInputAbsent(schema, input)) {
       if (schema.required) {
-        throw new ResolveError(
-          "REQUIRED_INPUT_MISSING",
-          `Required file input '${schema.name}' is missing`,
-        );
+        const refusal = runMissingInputRefusal(schema.name);
+        throw new ResolveError(refusal.code, refusal.message);
       }
       continue;
     }
 
+    const raw = input[schema.name];
     const wireArray = Array.isArray(raw) ? raw : [raw];
 
     if (wireArray.length > schema.max_count) {
@@ -131,9 +172,20 @@ export async function resolveInput(
     }
 
     const parts: SkrunPart[] = [];
-    for (const item of wireArray) {
-      const wire = WireFileSourceSchema.parse(item);
-      const { bytes, media_type } = await resolveWirePart(wire, ctx);
+    for (const [index, item] of wireArray.entries()) {
+      // An element that is not a file source is the caller's mistake, refused
+      // as one (400 at the route), never thrown as the schema's own error (a
+      // 500). The message names the field, the element when the field is a
+      // list, and the schema's first complaint — never the value sent.
+      const parsed = WireFileSourceSchema.safeParse(item);
+      if (!parsed.success) {
+        throw notAFileSource(
+          schema.name,
+          Array.isArray(raw) ? index : undefined,
+          parsed.error.issues[0],
+        );
+      }
+      const { bytes, media_type } = await resolveWirePart(parsed.data, ctx);
       parts.push({
         kind: schema.media,
         media_type,

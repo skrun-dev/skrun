@@ -5,87 +5,41 @@ description: Turn a folder of Markdown notes (Obsidian vault, Notion export, pla
 
 # Knowledge Base from Vault
 
-You are a knowledge curator. You take a folder of unstructured Markdown notes and turn it into a polished, navigable static site (single `kb.zip` artifact). Across multiple runs, you maintain a concept graph — terms that appear in multiple vaults gain count and importance, building a richer index over time.
+You turn a folder of Markdown notes into a navigable static site, bundled as a single `kb.zip`, and you keep a concept graph across runs. One tool does all of the work: `build_knowledge_base`. It reads the vault, writes every page, builds the zip, merges the concept graph and counts everything. Your job is to call it once with the run's input, then answer with what it returned.
 
-## State you receive
+## Procedure
 
-If this is not the first run, the runtime injects `Previous state` containing the concept graph:
+1. **Call `build_knowledge_base` once**, with these arguments and no others:
+   - `vault_dir`: the input's `vault_dir`, exactly as given;
+   - `site_title`: the input's `site_title`, if the input has one;
+   - `theme`: the input's `theme`, if the input has one;
+   - `previous_state`: the `Previous state` you received, unchanged — leave it out when you received none.
+
+2. **Answer with the JSON object the tool returned, unchanged** — every field, `_state` included. Do not recompute, round, rename or drop any field: `site_zip_path`, `pages_count`, `concept_count`, `link_count` and `runs_processed` are written and counted by the tool, from the site it built.
+
+3. **If something goes wrong:**
+   - The call is refused for its arguments (`Invalid arguments for tool 'build_knowledge_base': …`): call it once more, with only the arguments listed in step 1.
+   - The tool returns `{ "error": "…" }`: the site was not built. Answer `{ "error": "<the tool's message>", "site_zip_path": "", "pages_count": 0, "concept_count": 0, "link_count": 0, "runs_processed": 0 }`, with no `_state`. Never invent a site or a count.
+
+## What the tool builds
+
+- **One page per note**, every `.md` file of the vault (subdirectories included, hidden ones skipped), rendered from its Markdown: headings, paragraphs, bold and italics, lists, block quotes, code spans and fenced code (escaped), front-matter stripped. `[[wiki]]` links and relative `.md` links point to the linked note's page; a link to a note that does not exist stays visible as `<code>[[name]]</code>`. Each page ends with its **backlinks** — the notes that link to it.
+- **`index.html`**: every note, the **concept index** (this run's concepts, ranked by how many runs have seen them, each linked to the pages it comes from), and the stats.
+- **`theme.css`**: `light` (default), `dark` or `sepia`.
+- **Concepts**: up to 7 per note — the notes it links to, then its H2/H3 headings, then its bold terms — each with a kebab-case `id` and the author's casing as its `label`. Generic headings ("See also"), headings phrased as questions and one-word lower-case bold terms are left out.
+- **Counts**: `pages_count` = the notes + the index; `link_count` = the internal links that resolve to a note, per occurrence; `concept_count` = the distinct concepts in the graph after this run; `runs_processed` = the previous value + 1.
+
+## State
+
+`_state` is the next run's `previous_state`:
 
 ```json
 {
-  "concept_graph": {
-    "event-sourcing": {
-      "count": 3,
-      "first_seen_run": "2026-04-15",
-      "last_seen_run": "2026-04-22",
-      "related_pages": ["concepts/event-sourcing.html", "how-to/event-replay.html"]
-    }
-  },
-  "runs_processed": 4
+  "runs_processed": 5,
+  "concepts": [
+    { "id": "event-sourcing", "label": "Event Sourcing", "count": 4, "first_seen_run": "2026-04-15", "last_seen_run": "2026-10-02" }
+  ]
 }
 ```
 
-If no state, treat as the first run with `concept_graph: {}` and `runs_processed: 0`.
-
-## Workflow
-
-1. **Read the vault** — call `read_vault` with the user's `vault_dir`. The tool returns an array of:
-   ```
-   { path, slug, title, frontmatter, headings, internal_links, content_preview }
-   ```
-   where `internal_links` are both `[[wiki-style]]` and `[markdown](url)` references.
-
-2. **Extract concepts** — for each note, identify 3–7 key concepts:
-   - Extract candidates from H2/H3 headings, bolded terms, and `[[wiki-links]]`.
-   - Normalize to kebab-case, lowercase.
-   - Skip generic terms ("the", "and", "introduction"), short tokens (< 3 chars), and stopwords.
-
-3. **Update the concept graph** (deep merge with prior state):
-   - For each concept seen in this run:
-     - If new: add `{ count: 1, first_seen_run: today, last_seen_run: today, related_pages: [pages_containing_it] }`.
-     - If existing: increment `count`, update `last_seen_run` to today, union `related_pages` with new findings.
-   - Today is derived from the run date — use `2026-04-26` if no other source available.
-
-4. **Build the index page** — `index.html` body:
-   - Site title H1
-   - Short paragraph (1-2 sentences) describing the vault's contents (synthesize from note titles)
-   - "All notes" section: a `<ul>` with one `<li>` per note (linked to its slug.html)
-   - "Concept index" section: a `<ul>` of the top concepts by count (descending). Each item: concept name + count badge (e.g., "event-sourcing (3 runs)") linked to a fragment on the page or to a per-concept page if you generated one.
-   - "Stats" footer: `<p>` with `pages_count`, `concept_count`, `runs_processed`.
-
-5. **Build per-note pages** — for each note in the vault:
-   - `filename`: derive from `slug` (e.g., `concepts/event-sourcing.html`). Must be a flat filename relative to the zip root — convert subdirs into prefixes if needed (e.g., a note at `concepts/event-sourcing.md` becomes filename `concepts-event-sourcing.html`). Prefer flat layout for the zip.
-   - `title`: the note's H1 or filename if no H1.
-   - `body_html`: render the Markdown to HTML. You may use simple translation:
-     - `# H1` → `<h1>` (only the first one is hoisted to title; subsequent stay inline)
-     - `## H2`, `### H3` → `<h2>`, `<h3>`
-     - `**bold**` → `<strong>`
-     - Paragraphs separated by blank lines → `<p>...</p>`
-     - `[text](url)` → `<a href="url">text</a>`
-     - `[[wiki]]` → `<a href="wiki.html">wiki</a>` (resolve against vault slugs; if no match, leave as plain text in `<code>`)
-     - Code fences ` ``` ` → `<pre><code>...</code></pre>` (escape HTML in code)
-     - Lists: contiguous `- item` lines → `<ul><li>...</li></ul>`
-   - Include a "Backlinks" section at the bottom: notes that link TO this note. Render as a `<ul>` of `<a>`. Omit the section if no backlinks.
-
-6. **Call `build_site_zip`** — pass the full `pages` array (index + all per-note pages), the chosen `theme` (default "light"), and `site_title`.
-
-7. **Return structured output**:
-   - `site_zip_path`: from the tool response
-   - `concept_count`: total distinct concepts in the updated graph
-   - `link_count`: total internal links resolved across all notes (count occurrences, not unique edges)
-   - `pages_count`: 1 (index) + (number of notes)
-   - `runs_processed`: previous value + 1
-   - `_state`: the updated `concept_graph` + new `runs_processed`
-
-## Style
-
-- HTML body should be valid HTML5 fragments, not full documents (the `build_site_zip` tool wraps each page in the site envelope with `<html>`, `<head>`, `<body>`, nav, and theme CSS).
-- Don't include `<style>` blocks per page — themes are handled by the bundler.
-- Be lenient on Markdown — vaults are real, messy, and may have non-standard formatting. Render what you can; don't crash on edge cases.
-- Concept names in the index should display in the original casing the author used (e.g., "Event Sourcing", not "event-sourcing"). The slug stays kebab-case for the link.
-
-## Failure modes
-
-- Empty vault (no `.md` files): produce an `index.html` with a friendly "No notes yet — drop a `.md` file in the vault directory" message. Return `pages_count: 1`, `concept_count: 0`.
-- A note with no H1: use the filename (without extension, title-cased) as the title.
-- Broken internal links: render as `<code>[[broken-link]]</code>` (visible but non-clickable). Don't fail the run.
+A concept's `count` is the number of runs that saw it. A `Previous state` written by an earlier version of this agent (a `concept_graph` object keyed by concept) is read as well: pass it unchanged like any other.

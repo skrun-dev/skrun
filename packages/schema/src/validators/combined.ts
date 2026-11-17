@@ -1,13 +1,24 @@
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
+import { acceptsTemperature, getModelCapabilities } from "../capability.js";
 import { ValidationError, type ValidationIssue } from "../errors.js";
 import { detectManifest, hasNonStdlibImports } from "../manifests.js";
 import type { ParsedAgentYaml } from "../parsers/agent-yaml.js";
-import { parseAgentYaml } from "../parsers/agent-yaml.js";
+import { AGENT_YAML_READING, parseAgentYaml } from "../parsers/agent-yaml.js";
 import type { ParsedAgentsMd } from "../parsers/agents-md.js";
 import { parseAgentsMd } from "../parsers/agents-md.js";
 import type { ParsedSkill } from "../parsers/skill-md.js";
 import { parseSkillMd } from "../parsers/skill-md.js";
+import { sandboxRefusalMessage, sandboxRefusedHosts } from "../schemas/environment-config.js";
+import { findRefusedSettings } from "../schemas/refused-settings.js";
+import { findRetiredFields } from "../schemas/retired-fields.js";
+import { findRetiredModels } from "../schemas/retired-models.js";
+import {
+  STATE_TTL_MAX_DAYS,
+  STATE_TTL_MIN_DAYS,
+  stateTtlRawDays,
+} from "../schemas/state-config.js";
 
 export interface ValidationResult {
   valid: boolean;
@@ -104,6 +115,31 @@ export async function validateAgent(dir: string): Promise<ValidationResult> {
     return { valid: false, errors, warnings, parsed: null };
   }
 
+  // The state ttl, refused outside its bounds before anything is published. The
+  // schema accepts any number of days so that a version already published stays
+  // runnable — the server reads it through stateTtlDays, which bounds it without
+  // refusing. Both read the number of days through stateTtlRawDays, so the value
+  // refused here is the one bounded there. Checked whatever the state type: a
+  // declared field is a validated one.
+  const ttl = agentConfig.config.state.ttl;
+  const ttlDays = stateTtlRawDays(ttl);
+  if (!(ttlDays >= STATE_TTL_MIN_DAYS && ttlDays <= STATE_TTL_MAX_DAYS)) {
+    errors.push({
+      code: "STATE_TTL_OUT_OF_RANGE",
+      message: `state.ttl "${ttl}" is outside the allowed range: a notebook is kept between ${STATE_TTL_MIN_DAYS} and ${STATE_TTL_MAX_DAYS} days after its last write (e.g., "30d").`,
+      file: "agent.yaml",
+      field: "state.ttl",
+    });
+  }
+
+  // Settings no code honours — an MCP server's auth, a secret, meta without an
+  // endpoint — and a timeout no timer can hold: refused, by name, before
+  // anything is published. The schema accepts them, so that a version already
+  // published stays readable.
+  for (const issue of findRefusedSettings(agentConfig.config)) {
+    errors.push({ ...issue, file: "agent.yaml" });
+  }
+
   // Check AGENTS.md if context_mode is persistent
   let agentsMd: ParsedAgentsMd | undefined;
   if (agentConfig.config.context_mode === "persistent") {
@@ -126,6 +162,100 @@ export async function validateAgent(dir: string): Promise<ValidationResult> {
           file: "AGENTS.md",
         });
       }
+    }
+  }
+
+  // Retired fields: still valid, ignored, and named — the schema alone would
+  // drop them without a word (it is not strict). Read from the raw document,
+  // which parsed above, before the schema touched it — and read as that parse
+  // reads it (`AGENT_YAML_READING`: YAML 1.2, the core schema). That parse
+  // refused a repeated key: the library's own check, which compares each key
+  // with every earlier one, is left off. Its warnings are that parse's, said
+  // below: this read emits none (`logLevel: "error"`).
+  const raw = parseYaml(agentConfig.raw, {
+    ...AGENT_YAML_READING,
+    uniqueKeys: false,
+    logLevel: "error",
+  });
+  for (const issue of findRetiredFields(raw)) {
+    warnings.push({ ...issue, file: "agent.yaml" });
+  }
+
+  // The yaml library's warnings — an unresolved tag, say: the file reads,
+  // the value may not be the one its author meant. The first few, each by
+  // its line, then how many more.
+  const yamlWarnings = agentConfig.warnings;
+  for (const message of yamlWarnings.first) {
+    warnings.push({ code: "YAML_WARNING", message, file: "agent.yaml" });
+  }
+  const unsaid = yamlWarnings.count - yamlWarnings.first.length;
+  if (unsaid > 0) {
+    warnings.push({
+      code: "YAML_WARNING",
+      message: `${unsaid} more YAML warning${unsaid > 1 ? "s" : ""} of the same file.`,
+      file: "agent.yaml",
+    });
+  }
+
+  // Retired models the list names: still valid. From the day of the
+  // retirement, which may be still to come, a call to one fails at the
+  // provider — or, for an id the provider redirects, is answered by another
+  // model. Said here, by the model's exact id, primary or fallback.
+  warnings.push(...findRetiredModels(agentConfig.config));
+
+  // Allowed hosts the cloud sandbox cannot enforce: valid — a host pattern
+  // honoured by the local runtime, any other such form by none —, refused by the
+  // cloud runtime before any machine. Said here, at build time, not at the first
+  // call, each entry by its form.
+  const hosts = agentConfig.config.environment.networking.allowed_hosts;
+  const refused = sandboxRefusedHosts(hosts);
+  if (refused.length > 0) {
+    warnings.push({
+      code: "EGRESS_HOST_UNSUPPORTED",
+      message: `${sandboxRefusalMessage(hosts, refused)} The cloud runtime refuses the run before any machine.`,
+      file: "agent.yaml",
+      field: "environment.networking.allowed_hosts",
+    });
+  }
+
+  // A temperature the model refuses — or, unlisted and at its provider's own
+  // API, that its provider's default leaves out: valid, and never sent to
+  // that model by the runtime, which uses the model's default instead. Said
+  // here, by the model's name — primary or fallback, each gets the declared
+  // value; only the primary is called at the agent's `base_url`.
+  const { model } = agentConfig.config;
+  if (model.temperature !== undefined) {
+    for (const m of model.fallback ? [model, model.fallback] : [model]) {
+      const baseUrl = m === model ? model.base_url : undefined;
+      if (acceptsTemperature(m.provider, m.name, baseUrl)) continue;
+      const why =
+        getModelCapabilities(m.provider, m.name) === undefined
+          ? `is not in the capability matrix, and the latest ${m.provider} models take no temperature`
+          : "does not accept a temperature";
+      warnings.push({
+        code: "TEMPERATURE_UNSUPPORTED",
+        message: `model ${m.provider}/${m.name} ${why}: model.temperature (${model.temperature}) is not sent to it, which uses its default — remove it, or pick a model that accepts one.`,
+        file: "agent.yaml",
+        field: "model.temperature",
+      });
+    }
+  }
+
+  // A forced tool choice the model refuses: valid, and sent as `auto` to that
+  // model by the runtime — the model may then answer without the tool. A
+  // choice is forced by tool_choice `required` or a tool's name, or by a tool
+  // marked required under `auto`; `none` forces nothing.
+  const { tool_choice: choice, tools } = agentConfig.config;
+  const forced = choice !== "none" && (choice !== "auto" || tools.some((tool) => tool.required));
+  if (forced) {
+    for (const m of model.fallback ? [model, model.fallback] : [model]) {
+      if (getModelCapabilities(m.provider, m.name)?.forcedToolChoice !== false) continue;
+      warnings.push({
+        code: "TOOL_CHOICE_UNSUPPORTED",
+        message: `model ${m.provider}/${m.name} refuses a forced tool choice: it gets tool_choice auto instead of ${choice === "auto" ? "the tools marked required" : `"${choice}"`}, and may answer without calling the tool — remove the forced choice, or pick a model that accepts one.`,
+        file: "agent.yaml",
+        field: "tool_choice",
+      });
     }
   }
 

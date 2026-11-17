@@ -1,12 +1,15 @@
 import type { Agent } from "../db/schema.js";
 import type { UserContext } from "../types.js";
+import { isInstanceAdmin } from "./key-scope.js";
 import { RegistryError } from "./registry.js";
 
 /**
  * Multi-tenant ownership gate for registry GET endpoints.
  *
  * Throws `RegistryError("NOT_FOUND", ..., 404)` indistinguishably whether
- * the agent doesn't exist OR the caller is non-owner non-admin. Both
+ * the agent doesn't exist OR the caller is neither its owner nor the instance
+ * administrator (`isInstanceAdmin`: the admin role on a master credential —
+ * an administrator's reduced or delegated key reads as an ordinary key). Both
  * branches produce the SAME `RegistryError` instance shape (same code,
  * same message, same status) so the eventual JSON response body is
  * byte-identical — opaque to the client and to any timing analysis.
@@ -33,7 +36,7 @@ import { RegistryError } from "./registry.js";
  * @param requestedNs   Namespace path-param requested by the client.
  * @param requestedName Name path-param requested by the client.
  * @throws RegistryError NOT_FOUND (404) if the agent is null OR the caller
- *         is neither the owner nor an admin.
+ *         is neither the owner nor the instance administrator.
  */
 export function assertAgentVisibleOrThrow(
   agent: Agent | null,
@@ -44,7 +47,7 @@ export function assertAgentVisibleOrThrow(
   if (!agent) {
     throw new RegistryError("NOT_FOUND", `Agent ${requestedNs}/${requestedName} not found`, 404);
   }
-  if (agent.owner_id !== user.id && user.role !== "admin") {
+  if (agent.owner_id !== user.id && !isInstanceAdmin(user)) {
     // SAME exception shape as the agent-not-found case — by design.
     // Any divergence here (different message, different code, status
     // 403 vs 404, additional fields) would leak existence to clients
@@ -57,8 +60,10 @@ export function assertAgentVisibleOrThrow(
  * Run-authorization gate for `POST /run`. `public` agents are runnable by any
  * authenticated caller; everything else (`private`, or absent) **delegates to
  * `assertAgentVisibleOrThrow`** so the opaque 404 shape is shared and cannot
- * drift between the read path and the run path. Owner/admin may run a private
- * agent; a non-owner gets a 404 byte-identical to a genuinely-absent agent.
+ * drift between the read path and the run path. The owner, or the instance
+ * administrator on a master credential, may run a private agent; anyone else —
+ * an administrator's reduced or delegated key included — gets a 404
+ * byte-identical to a genuinely-absent agent.
  *
  * This gate answers "may this account reach this agent at all?" (ownership /
  * visibility). API-key scoping is a SEPARATE, narrower restriction layered

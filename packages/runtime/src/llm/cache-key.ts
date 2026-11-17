@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 /**
  * Derive a stable, alphanumeric-safe cache key from the agent context for use
- * with provider-side cache routing primitives (#68 prompt-caching).
+ * with provider-side prompt-cache routing primitives.
  *
  * - **OpenAI** (Chat Completions + Responses): passed as the `prompt_cache_key`
  *   body field — influences routing for higher hit rate.

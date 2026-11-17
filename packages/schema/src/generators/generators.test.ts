@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { MODEL_CHOICES } from "../model-choices.js";
 import { parseAgentYaml } from "../parsers/agent-yaml.js";
 import type { ParsedSkill } from "../parsers/skill-md.js";
 import { AgentConfigSchema } from "../schemas/agent-config.js";
@@ -48,8 +49,10 @@ describe("generateAgentYaml", () => {
       },
     ]);
     expect(result.config.environment?.timeout).toBe("300s");
-    expect(result.config.environment?.sandbox).toBe("strict");
-    expect(result.config.state?.type).toBe("kv");
+    expect(result.config.environment).not.toHaveProperty("sandbox");
+    // An imported skill declares no state: the author turns it on, knowingly.
+    expect(result.config.state?.type).toBe("none");
+    expect(result.config.state?.scope).toBe("per_caller");
     expect(result.config.state?.ttl).toBe("30d");
   });
 
@@ -59,6 +62,13 @@ describe("generateAgentYaml", () => {
     expect(result.prompts[0].field).toBe("model");
     expect(result.prompts[1].field).toBe("inputs");
     expect(result.prompts[2].field).toBe("environment.networking.allowed_hosts");
+  });
+
+  it("offers the shared model choices, the first one as the default", () => {
+    const model = generateAgentYaml(mockSkill).prompts[0];
+    const expected = MODEL_CHOICES.map((c) => `${c.provider} / ${c.name}`);
+    expect(model.options).toEqual(expected);
+    expect(model.default).toBe(expected[0]);
   });
 
   it("should handle skill without allowed-tools", () => {
@@ -98,6 +108,27 @@ describe("serializeAgentYaml", () => {
     expect(roundTripped.config.version).toBe(config.version);
     expect(roundTripped.config.model.provider).toBe(config.model.provider);
     expect(roundTripped.config.environment.timeout).toBe(config.environment.timeout);
+  });
+
+  // parseAgentYaml refuses an alias: an object the configuration holds twice
+  // is written out twice, and the file reads back.
+  it("writes out an object held in two places, never as an alias", () => {
+    const config = AgentConfigSchema.parse({
+      name: "shared",
+      version: "1.0.0",
+      model: { provider: "anthropic", name: "claude-sonnet-4-20250514" },
+      inputs: [{ name: "query", type: "string" }],
+      outputs: [{ name: "result", type: "string" }],
+    });
+    const schema = { type: "object" as const, properties: { q: { type: "string" } } };
+    config.tools = [
+      { name: "first", description: "d", input_schema: schema, required: false },
+      { name: "second", description: "d", input_schema: schema, required: false },
+    ];
+
+    const yaml = serializeAgentYaml(config);
+    expect(yaml).not.toMatch(/[&*]\w/);
+    expect(parseAgentYaml(yaml).config.tools.map((t) => t.input_schema)).toEqual([schema, schema]);
   });
 
   it("should produce human-readable YAML", () => {

@@ -4,13 +4,82 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Node 24 once a week. Every push and pull request runs Node 22, the version
+  # the runtime image ships; a manual run tests both.
+  schedule:
+    - cron: "23 5 * * 3"
+  workflow_dispatch:
+
+# A newer push to a pull request cancels the run of the older one. A push to
+# main, a scheduled run and a manual run each have a group of their own, so
+# none is ever cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Whether the test jobs below have anything to test. A repository may keep, in
+  # `.github/ci-skip-paths`, glob patterns (one per line, `#` for a comment) of
+  # files no test reads; a push or pull request whose changed files ALL match one
+  # of them skips the test jobs. Everything uncertain runs them: no such file, a
+  # first push of a branch, a commit not fetched, a failed diff, an empty diff, a
+  # single changed file outside the patterns. Without the file, nothing is ever
+  # skipped.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: decide
+        name: Decide whether the tests run
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          run=true
+          list=.github/ci-skip-paths
+          range=""
+          case "$EVENT" in
+            push) range="$PUSH_BEFORE..$PUSH_AFTER"; from="$PUSH_BEFORE"; to="$PUSH_AFTER" ;;
+            pull_request) range="$PR_BASE...$PR_HEAD"; from="$PR_BASE"; to="$PR_HEAD" ;;
+            *) from=""; to="" ;;
+          esac
+          if [ -f "$list" ] && [ -n "$from" ] && [ -n "$to" ] \
+            && ! printf '%s' "$from" | grep -qE '^0+$' \
+            && git cat-file -e "$from^{commit}" 2>/dev/null \
+            && git cat-file -e "$to^{commit}" 2>/dev/null \
+            && files=$(git diff --name-only "$range") \
+            && [ -n "$files" ]; then
+            run=false
+            while IFS= read -r file; do
+              matched=false
+              while IFS= read -r pattern; do
+                case "$pattern" in ''|'#'*) continue ;; esac
+                # An unquoted pattern in `case` is a glob, and its `*` also
+                # matches `/`: `dir/**` covers everything under `dir`.
+                # shellcheck disable=SC2254
+                case "$file" in $pattern) matched=true; break ;; esac
+              done < "$list"
+              if [ "$matched" = false ]; then run=true; break; fi
+            done <<< "$files"
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "Tests run: $run"
+
   check:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [22, 24]
+        node-version: ${{ fromJSON(github.event_name == 'schedule' && '[24]' || github.event_name == 'workflow_dispatch' && '[22, 24]' || '[22]') }}
     services:
       # Postgres for the PostgresDb adapter contract. db-contract.shared.ts runs
       # its full contract against the pg backend when DATABASE_URL is set —
@@ -41,9 +110,9 @@ jobs:
       # Activates the PostgresDb contract leg in db-contract.shared.ts.
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/skrun_test
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
           cache: pnpm
@@ -80,6 +149,24 @@ jobs:
       - run: pnpm lint
       - run: pnpm build
       - run: pnpm test
+      # The cross-package suite (tests/e2e): the real app, in memory, with no
+      # network and no model. Some of its files load the built packages, so it
+      # runs after the build.
+      - run: pnpm test:e2e
+      # Last: it needs only the build, and a failure here leaves the results
+      # of the tests above in place.
+      - name: The api accepts, at startup, the environment the quick start gives it
+        run: |
+          # The Docker quick start of docs/self-hosting-docker.md, replayed as
+          # written and rendered without starting anything; the environment it
+          # gives the api service is then the whole environment of a child
+          # process that loads the api built above and creates its app on
+          # in-memory storage and database: the api's own start-up refusals
+          # judge that environment. Only the child's
+          # error output is printed, never the environment: it carries the
+          # generated credentials.
+          bash tests/compose/quickstart-render.sh "$RUNNER_TEMP/quickstart-boot.json"
+          node tests/compose/check-rendered-env.mjs --boot "$RUNNER_TEMP/quickstart-boot.json"
 
   # The self-host compose contract, enforced where Docker exists. Our test
   # strategy already establishes the rule for the runtime
@@ -99,9 +186,38 @@ jobs:
   # "refuses to render" to "refuses to start" — which is the property that
   # actually matters.
   compose:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: The documented quick start, replayed as written
+        # A value the calling shell exports for a name infra/.env also sets
+        # would win over the file wherever the compose file substitutes that
+        # name, so the script unsets each one before it renders. This tag
+        # would pick the api image: the image check below fails if the
+        # script ever stops unsetting it.
+        env:
+          RUNTIME_IMAGE_TAG: from-the-calling-shell
+        run: |
+          # The Docker quick start of docs/self-hosting-docker.md, as an operator
+          # types it: the template copied to infra/.env, the doc's own block of
+          # generated values appended, then lines that try to move, from that
+          # file, what the stack decides itself. The stack is rendered, never
+          # started, and the render is checked: what the operator decides
+          # reaches the api, what the stack decides keeps the stack's value. The
+          # script refuses an infra/.env it did not write and removes its own on
+          # exit, so the steps below still see none. The rendered files carry
+          # the generated credentials: they are never printed.
+          docker compose version
+          bash tests/compose/quickstart-render.sh --probe "$RUNNER_TEMP/quickstart-full.json"
+          node tests/compose/check-rendered-env.mjs --overrides full "$RUNNER_TEMP/quickstart-full.json"
+          bash tests/compose/quickstart-render.sh --probe --minimal "$RUNNER_TEMP/quickstart-minimal.json"
+          node tests/compose/check-rendered-env.mjs --overrides minimal "$RUNNER_TEMP/quickstart-minimal.json"
 
       - name: The MINIMAL self-host stack renders with no credentials
         run: |

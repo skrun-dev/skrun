@@ -36,4 +36,22 @@ describe("key-expiry: resolveDefaultKeyExpiry", () => {
     const iso = resolveDefaultKeyExpiry(NOW, {}) as string;
     expect(iso).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
   });
+
+  // A bound on the date, not a policy: 36 500 days keep the expiry far from the
+  // years where it would leave the four-digit form (past 9999) or stop being a
+  // date (past about 275760). The window is read as 36 500 days; the value at
+  // the cap is taken as it is, the next one is capped. Written in digits —
+  // Number.parseInt reads "1e8" as 1.
+  it.each([
+    ["36499", 36_499],
+    ["36500", 36_500],
+    ["36501", 36_500],
+    ["100000000", 36_500],
+  ] as const)("SKRUN_API_KEY_TTL_DAYS=%s gives a key that expires %i days out", (configured, days) => {
+    const env = { SKRUN_API_KEY_TTL_DAYS: configured };
+    expect(() => resolveDefaultKeyExpiry(NOW, env)).not.toThrow();
+    const iso = resolveDefaultKeyExpiry(NOW, env) as string;
+    expect(iso).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(daysBetween(iso)).toBe(days);
+  });
 });

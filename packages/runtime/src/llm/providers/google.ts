@@ -7,6 +7,7 @@ import {
 } from "@google/generative-ai";
 import { GoogleAIFileManager } from "@google/generative-ai/server";
 import { createLogger } from "../../logger.js";
+import { LLMHistoryError } from "../errors.js";
 import { fingerprintBytes, type ProviderFileCache } from "../file-cache.js";
 import type { SkrunPart } from "../parts.js";
 import type { ResolvedToolChoice } from "../tool-choice.js";
@@ -97,8 +98,13 @@ interface GeminiPart {
   text?: string;
   inlineData?: { mimeType: string; data: string };
   fileData?: { fileUri: string; mimeType: string };
-  functionCall?: { name: string; args: Record<string, unknown> };
-  functionResponse?: { name: string; response: { result: string } };
+  functionCall?: { name: string; args: Record<string, unknown>; id?: string };
+  functionResponse?: { id?: string; name: string; response: { result: string } };
+}
+
+interface GeminiContent {
+  role: string;
+  parts: GeminiPart[];
 }
 
 export class GoogleProvider implements LLMProvider {
@@ -130,24 +136,7 @@ export class GoogleProvider implements LLMProvider {
       tools: functionDeclarations ? [{ functionDeclarations }] : undefined,
     });
 
-    const contents: Array<{ role: string; parts: GeminiPart[] }> = [];
-
-    contents.push({ role: "user", parts: userParts });
-
-    if (request.toolResults?.length) {
-      contents.push({
-        role: "model",
-        parts: request.toolResults.map((tr, i) => ({
-          functionCall: { name: tr.name, args: request.toolCalls?.[i]?.args ?? {} },
-        })),
-      });
-      contents.push({
-        role: "function",
-        parts: request.toolResults.map((tr) => ({
-          functionResponse: { name: tr.name, response: { result: tr.result } },
-        })),
-      });
-    }
+    const contents = await this.buildContents(request, userParts);
 
     const toolConfig = buildToolConfig(request.toolChoice, request.parallelTools);
 
@@ -172,9 +161,14 @@ export class GoogleProvider implements LLMProvider {
         if ("text" in part && part.text) {
           content += part.text;
         } else if ("functionCall" in part && part.functionCall) {
+          // Gemini 3 gives each call an id, to be returned with its response;
+          // earlier models give none, and none is made up. The SDK does not
+          // type the field.
+          const id = (part.functionCall as { id?: unknown }).id;
           toolCalls.push({
             name: part.functionCall.name,
             args: (part.functionCall.args as Record<string, unknown>) ?? {},
+            ...(typeof id === "string" && id !== "" && { id }),
           });
         }
       }
@@ -194,17 +188,95 @@ export class GoogleProvider implements LLMProvider {
     const cachedContentTokens = usage?.cachedContentTokenCount ?? 0;
     const promptTokens = Math.max(0, grossPromptTokens - cachedContentTokens);
 
+    // A thinking model's reasoning is counted apart from the candidates
+    // (totalTokenCount = prompt + thoughts + candidates) and billed at the
+    // output rate, so it adds to completionTokens. The SDK does not type the
+    // field; a model that does not think returns none.
+    const thoughtsTokens =
+      (usage as { thoughtsTokenCount?: number } | undefined)?.thoughtsTokenCount ?? 0;
+
     return {
       content,
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+      // The candidate's `content` as returned, its parts' thought signatures
+      // included. A response with no content (a blocked prompt, a candidate
+      // stopped before any part) gives an empty model content, never nothing:
+      // `buildContents` leaves a content without parts out of the next request.
+      assistantTurn: {
+        provider: this.name,
+        content: candidate?.content ?? { role: "model", parts: [] },
+      },
       usage: {
         promptTokens,
-        completionTokens: usage?.candidatesTokenCount ?? 0,
+        completionTokens: (usage?.candidatesTokenCount ?? 0) + thoughtsTokens,
         ...(cachedContentTokens > 0 && { cacheReadTokens: cachedContentTokens }),
         // Gemini does not have a write surcharge (implicit caching is free
         // beyond the normal input bill). cacheWriteTokens stays undefined.
       },
     };
+  }
+
+  /**
+   * The conversation as Gemini contents: the input, then each entry of the
+   * history in order — a model content exactly as the API returned it (its
+   * parts' thought signatures included: they go back with the turn that
+   * carried them), the results of its function calls as `functionResponse`
+   * parts, each with the id of its call when Gemini returned one (Gemini 3
+   * does) and paired by position otherwise (the router keeps the results in
+   * the order of the calls), a later user message.
+   *
+   * The function responses go back in a `user` content: a content's role is
+   * `user` or `model`, and Gemini 3 answers 400 to a `function` role. A user
+   * message that follows a user content — the input, or function responses —
+   * joins it, after its parts, rather than opening a second user content.
+   *
+   * A model content without parts is left out: Gemini refuses a content with
+   * no parts, and such a turn carried nothing to send back.
+   *
+   * Throws `LLMHistoryError` on a turn another provider produced.
+   */
+  private async buildContents(
+    request: LLMCallRequest,
+    userParts: GeminiPart[],
+  ): Promise<GeminiContent[]> {
+    const contents: GeminiContent[] = [{ role: "user", parts: userParts }];
+
+    for (const entry of request.history ?? []) {
+      switch (entry.kind) {
+        case "assistant": {
+          if (entry.turn.provider !== this.name) {
+            throw new LLMHistoryError(this.name, entry.turn.provider);
+          }
+          const turn = entry.turn.content as Partial<GeminiContent>;
+          if (turn.parts?.length) contents.push(turn as GeminiContent);
+          break;
+        }
+        case "tool_results":
+          contents.push({
+            role: "user",
+            parts: entry.results.map((r) => ({
+              functionResponse: {
+                ...(r.id !== undefined && { id: r.id }),
+                name: r.name,
+                response: { result: r.result },
+              },
+            })),
+          });
+          break;
+        case "user": {
+          const later = await this.translateUserContent(entry.parts, request._fileCache);
+          const last = contents[contents.length - 1];
+          if (last.role === "user") {
+            contents[contents.length - 1] = { role: "user", parts: [...last.parts, ...later] };
+          } else {
+            contents.push({ role: "user", parts: later });
+          }
+          break;
+        }
+      }
+    }
+
+    return contents;
   }
 
   /**

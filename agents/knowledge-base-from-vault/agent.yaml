@@ -1,54 +1,59 @@
 name: knowledge-base-from-vault
-version: 0.2.0
-# v0.2.0: deps now auto-resolved by Skrun runtime via package.json.
-# v0.1.0 hand-rolled a 95-line STORE-method ZIP writer because the runtime
-# could not bundle/resolve npm deps. v0.2.0 declares jszip as a normal Node
-# dep and uses ~5 lines of jszip API instead.
+version: 0.5.1
+# v0.5.0: one state notebook per caller (scope: per_caller).
+# v0.4.0: Gemini 3.8 Flash, with Gemini 3.5 Flash-Lite as fallback.
+# v0.3.0: one script builds the whole site and counts it. The model passes the
+# run's input to build_knowledge_base and answers with what it returns — it
+# writes no HTML and counts nothing. read_vault and build_site_zip are gone.
+# v0.2.0: deps auto-resolved by the Skrun runtime via package.json (jszip).
 
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
   fallback:
     provider: google
-    name: gemini-2.5-flash-lite
+    name: gemini-3.5-flash-lite
+
+# The first model turn must call the one tool that builds the site.
+tool_choice: build_knowledge_base
 
 tools:
-  - name: read_vault
-    description: Scan a directory for `.md` files. Returns each note's path, slug, title (first H1), front-matter, headings, and outgoing links (both Obsidian-style `[[wiki]]` and Markdown `[text](url)`).
+  - name: build_knowledge_base
+    description: Build the whole knowledge base in one call. Reads every `.md` note of the vault, renders one HTML page per note plus `index.html` (all notes, concept index, stats), bundles them with the theme stylesheet as `kb.zip` in the run's output directory, and merges this run's concepts into the concept graph. Returns the agent's answer as one JSON object — site_zip_path, pages_count, concept_count, link_count, runs_processed, file_count, bytes and _state (the state to keep for the next run) — or { "error" } when nothing was built.
     input_schema:
       type: object
       properties:
         vault_dir:
           type: string
-          description: Path to a directory of Markdown notes. Subdirectories are scanned recursively.
-      required: [vault_dir]
-      additionalProperties: false
-  - name: build_site_zip
-    description: Bundle a set of HTML pages plus a generated index into `kb.zip` in the run output directory. Wraps each page in a standard HTML envelope with theme CSS and site nav.
-    input_schema:
-      type: object
-      properties:
-        pages:
-          type: array
-          description: Pages to include. Each item is { filename (must end .html, flat name), title, body_html (raw HTML body, will be wrapped in the site template) }.
-          items:
-            type: object
-            properties:
-              filename:
-                type: string
-              title:
-                type: string
-              body_html:
-                type: string
-            required: [filename, title, body_html]
-            additionalProperties: false
-        theme:
-          type: string
-          description: Visual theme. One of - light, dark, sepia.
+          description: The input's vault_dir, as given — a directory of Markdown notes, scanned recursively.
         site_title:
           type: string
-          description: Site title shown in nav and HTML <title>.
-      required: [pages, theme, site_title]
+          description: The input's site_title, as given. Optional - "Knowledge Base" when omitted.
+        theme:
+          type: string
+          description: The input's theme, as given - light, dark or sepia. Optional - light when omitted.
+        previous_state:
+          type: object
+          description: The Previous state this run received, unchanged. Omit it when the run received none.
+          properties:
+            runs_processed:
+              type: number
+            concepts:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  label:
+                    type: string
+                  count:
+                    type: number
+                  first_seen_run:
+                    type: string
+                  last_seen_run:
+                    type: string
+      required: [vault_dir]
       additionalProperties: false
 
 inputs:
@@ -85,13 +90,11 @@ outputs:
 environment:
   networking:
     allowed_hosts: []
-  filesystem: read-write
-  secrets: []
   timeout: 240s
-  sandbox: strict
 
 state:
   type: kv
+  scope: per_caller
   ttl: 90d
 
 tests:

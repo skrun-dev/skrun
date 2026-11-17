@@ -6,17 +6,23 @@ import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MemoryDb } from "../../packages/api/src/db/memory.js";
 import { createApp } from "../../packages/api/src/index.js";
+import { validBundle } from "../../packages/api/src/routes/agent-bundle.shared.js";
+import { storeVersion } from "../../packages/api/src/routes/stored-version.shared.js";
 import { MemoryStorage } from "../../packages/api/src/storage/memory.js";
+import { packAgentTar } from "../../packages/schema/src/index.js";
 import { SkrunApiError, SkrunClient } from "../../packages/sdk/src/index.js";
 
 let server: Server;
 let port: number;
 let client: SkrunClient;
+let storage: MemoryStorage;
+let db: MemoryDb;
+let app: ReturnType<typeof createApp>;
 
 beforeAll(async () => {
-  const storage = new MemoryStorage();
-  const db = new MemoryDb();
-  const app = createApp(storage, db);
+  storage = new MemoryStorage();
+  db = new MemoryDb();
+  app = createApp(storage, db);
 
   // Start a real HTTP server that delegates to Hono
   server = createServer(async (req, res) => {
@@ -65,7 +71,7 @@ describe("E2E: SDK", () => {
   });
 
   it("push() + getAgent() + getVersions()", async () => {
-    const bundle = Buffer.from("fake-bundle");
+    const bundle = await validBundle("sdk-test");
     const pushResult = await client.push("dev/sdk-test", bundle, "1.0.0");
     expect(pushResult.latest_version).toBe("1.0.0");
 
@@ -97,18 +103,65 @@ describe("E2E: SDK", () => {
     expect(meta.latest_version_verified).toBe(true);
   });
 
-  it("run() on fake bundle returns BUNDLE_CORRUPT (post-verify)", async () => {
-    // Pre-verify so the runtime gate passes — fake bundle still fails at
+  it("run() of a stored bundle that does not unpack returns BUNDLE_CORRUPT (post-verify)", async () => {
+    // A version stored as a push stored one before it refused a bundle that
+    // does not unpack, verified so the runtime gate passes: the run fails at
     // extraction, which is the assertion we care about.
-    await client.verifyVersion("dev/sdk-test", "1.0.0", true);
+    await storeVersion({
+      app,
+      storage,
+      db,
+      token: "dev-token",
+      namespace: "dev",
+      name: "sdk-corrupt",
+      version: "1.0.0",
+      bundle: Buffer.from("fake-bundle"),
+      verified: true,
+    });
     try {
-      await client.run("dev/sdk-test", {});
+      await client.run("dev/sdk-corrupt", {});
       expect.unreachable("should throw");
     } catch (e) {
       expect(e).toBeInstanceOf(SkrunApiError);
       expect((e as SkrunApiError).status).toBe(500);
       expect((e as SkrunApiError).code).toBe("BUNDLE_CORRUPT");
     }
+  });
+
+  it("push() of a bundle whose agent.yaml names a secret → 400 UNSUPPORTED_FIELD, and nothing is published", async () => {
+    // A real bundle: the server judges what its agent.yaml declares, which it
+    // can only do when it reads.
+    const agentYaml = [
+      "name: sdk-secretive",
+      "version: 1.0.0",
+      "model:",
+      "  provider: google",
+      "  name: gemini-2.5-flash",
+      "inputs:",
+      "  - name: q",
+      "    type: string",
+      "outputs:",
+      "  - name: answer",
+      "    type: string",
+      "environment:",
+      "  secrets: [X]",
+    ].join("\n");
+    const bundle = await packAgentTar([
+      { name: "agent.yaml", content: Buffer.from(agentYaml) },
+      { name: "SKILL.md", content: Buffer.from("# sdk-secretive\n") },
+    ]);
+    const refused = await client.push("dev/sdk-secretive", bundle, "1.0.0").catch((e) => e);
+    expect(refused).toBeInstanceOf(SkrunApiError);
+    expect(refused).toMatchObject({
+      status: 400,
+      code: "UNSUPPORTED_FIELD",
+      message:
+        "environment.secrets is not yet supported — no secret is injected into a run. Leave the list empty, or remove it.",
+    });
+
+    const read = await client.getAgent("dev/sdk-secretive").catch((e) => e);
+    expect(read).toBeInstanceOf(SkrunApiError);
+    expect(read).toMatchObject({ status: 404, code: "NOT_FOUND" });
   });
 
   it("getAgent() on nonexistent → NOT_FOUND", async () => {
@@ -127,9 +180,11 @@ describe("E2E: SDK", () => {
   });
 
   it("agent object format works (post-verify so runtime gate passes)", async () => {
-    await client.verifyVersion("dev/sdk-test", "1.0.0", true);
+    // The stored bundle that does not unpack, verified above: the run reaches
+    // its extraction.
     try {
-      await client.run({ namespace: "dev", name: "sdk-test" }, {});
+      await client.run({ namespace: "dev", name: "sdk-corrupt" }, {});
+      expect.unreachable("should throw");
     } catch (e) {
       expect(e).toBeInstanceOf(SkrunApiError);
       expect((e as SkrunApiError).code).toBe("BUNDLE_CORRUPT");
@@ -137,13 +192,13 @@ describe("E2E: SDK", () => {
   });
 
   it("run() with environment option passes it in request body (VT-11)", async () => {
-    // Environment override is passed through to the API. Pre-verify the
-    // version so we reach the bundle-extraction phase (where the fake
-    // bundle fails with BUNDLE_CORRUPT — proves env was accepted).
-    await client.verifyVersion("dev/sdk-test", "1.0.0", true);
+    // Environment override is passed through to the API. The stored bundle
+    // that does not unpack, verified above, takes the run to the
+    // bundle-extraction phase (where it fails with BUNDLE_CORRUPT — proves env
+    // was accepted).
     try {
       await client.run(
-        "dev/sdk-test",
+        "dev/sdk-corrupt",
         {},
         {
           environment: { timeout: "600s", max_cost: 10.0 },

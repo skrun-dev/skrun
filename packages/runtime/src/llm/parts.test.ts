@@ -123,10 +123,12 @@ describe("resolveInput", () => {
     if (parts?.[0]?.kind === "image") {
       expect(Array.from(parts[0].bytes)).toEqual([1, 2, 3]);
     }
+    // The agent's list goes to the guard too: it holds every connection of the
+    // fetch to it, so a listed host cannot redirect the fetch off the list.
     expect(safeFetchMock).toHaveBeenCalledWith(
       "https://example.com/img.jpg",
       undefined,
-      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+      expect.objectContaining({ timeoutMs: expect.any(Number), allowedHosts: ["example.com"] }),
     );
   });
 
@@ -157,21 +159,79 @@ describe("resolveInput", () => {
     ).rejects.toMatchObject({ code: "URL_FETCH_FAILED" });
   });
 
-  it("throws URL_NOT_ALLOWED when safeFetch blocks a host that resolves private", async () => {
+  it("throws URL_NOT_ALLOWED when safeFetch blocks a host that resolves private, the address apart", async () => {
     // safeFetch rejects with SsrfBlockedError carried as the fetch error's cause.
+    const resolution = { host: "x.example.com", address: "127.0.0.1" };
     const blocked = Object.assign(new TypeError("fetch failed"), {
-      cause: new SsrfBlockedError("Blocked 'x.example.com': resolves to 127.0.0.1"),
+      cause: new SsrfBlockedError(
+        "Blocked 'x.example.com': resolves to a private/reserved address",
+        resolution,
+      ),
     });
     safeFetchMock.mockRejectedValue(blocked);
     const schema = makeFileSchema();
     const ctx = makeCtx({ allowedHosts: ["*"] });
+    const err = await resolveInput(
+      { photo: [{ type: "file", source: "url", url: "https://x.example.com/x.jpg" }] },
+      [schema],
+      ctx,
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ResolveError);
+    expect(err).toMatchObject({
+      code: "URL_NOT_ALLOWED",
+      message: "Blocked 'x.example.com': resolves to a private/reserved address",
+      privateResolution: resolution,
+    });
+  });
+
+  it("tells the caller the host a name was refused for, never the address it resolves to — through the real guard", async () => {
+    // The guard itself, on a resolver that answers a private address for any
+    // name: refused at the lookup, before any socket opens.
+    const actual = await vi.importActual<typeof import("../security/safe-fetch.js")>(
+      "../security/safe-fetch.js",
+    );
+    safeFetchMock.mockImplementation((url, init, opts) =>
+      actual.safeFetch(url, init, {
+        ...opts,
+        resolver: async () => [{ address: "10.20.30.40", family: 4 }],
+      }),
+    );
+    const err = await resolveInput(
+      { photo: [{ type: "file", source: "url", url: "https://intranet.example.com/a.jpg?k=v" }] },
+      [makeFileSchema()],
+      makeCtx({ allowedHosts: ["*"] }),
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ResolveError);
+    const refused = err as ResolveError;
+    expect(refused.code).toBe("URL_NOT_ALLOWED");
+    expect(refused.message).toBe(
+      "Blocked 'intranet.example.com': resolves to a private/reserved address",
+    );
+    expect(refused.message).not.toContain("10.20.30.40");
+    expect(refused.privateResolution).toEqual({
+      host: "intranet.example.com",
+      address: "10.20.30.40",
+    });
+  });
+
+  it("throws URL_NOT_ALLOWED, naming the host, when the guard refuses a redirect hop", async () => {
+    // What safeFetch rejects with when an allowed host redirects off the list.
+    const blocked = Object.assign(new TypeError("fetch failed"), {
+      cause: new SsrfBlockedError("Blocked 'internal.example': not in the allowed hosts"),
+    });
+    safeFetchMock.mockRejectedValue(blocked);
+    const schema = makeFileSchema();
+    const ctx = makeCtx({ allowedHosts: ["example.com"] });
     await expect(
       resolveInput(
-        { photo: [{ type: "file", source: "url", url: "https://x.example.com/x.jpg" }] },
+        { photo: [{ type: "file", source: "url", url: "https://example.com/x.jpg" }] },
         [schema],
         ctx,
       ),
-    ).rejects.toMatchObject({ code: "URL_NOT_ALLOWED" });
+    ).rejects.toMatchObject({
+      code: "URL_NOT_ALLOWED",
+      message: "Blocked 'internal.example': not in the allowed hosts",
+    });
   });
 
   it("RT-6 micro: returns empty map when no file inputs declared", async () => {
@@ -217,11 +277,65 @@ describe("resolveInput", () => {
     ).rejects.toMatchObject({ code: "MAX_COUNT_EXCEEDED" });
   });
 
-  it("throws REQUIRED_INPUT_MISSING for required file input not provided", async () => {
-    const schema = makeFileSchema({ required: true });
+  it.each([
+    ["absent", {}],
+    ["null", { photo: null }],
+    ["an empty list", { photo: [] }],
+  ])("refuses a required file input that is %s with MISSING_INPUT, in the words the check of the declared inputs gives", async (_label, input) => {
+    const refused = await resolveInput(
+      input,
+      [makeFileSchema({ required: true })],
+      makeCtx(),
+    ).catch((err: unknown) => err);
+    expect(refused).toBeInstanceOf(ResolveError);
+    expect(refused).toMatchObject({
+      code: "MISSING_INPUT",
+      message: "Missing required input: photo",
+    });
+  });
+
+  it.each([
+    ["absent", {}],
+    ["null", { photo: null }],
+    ["an empty list", { photo: [] }],
+  ])("leaves an optional file input that is %s out of the resolved inputs: the run goes ahead without it", async (_label, input) => {
+    const result = await resolveInput(input, [makeFileSchema({ required: false })], makeCtx());
+    expect(result.has("photo")).toBe(false);
+    expect(result.size).toBe(0);
+  });
+
+  it("resolves one descriptor alone, not in a list, to one part", async () => {
+    const data = Buffer.from("img").toString("base64");
+    const result = await resolveInput(
+      { photo: { type: "file", source: "data", media_type: "image/png", data } },
+      [makeFileSchema()],
+      makeCtx(),
+    );
+    expect(result.get("photo")).toHaveLength(1);
+  });
+
+  it("refuses an element that is not a file source with INVALID_INPUT_TYPE, naming the field and the element, never the value", async () => {
+    const schema = makeFileSchema({ max_count: 2 });
     const ctx = makeCtx();
-    await expect(resolveInput({}, [schema], ctx)).rejects.toMatchObject({
-      code: "REQUIRED_INPUT_MISSING",
+    const png = { type: "file", source: "data", media_type: "image/png", data: "aGk=" };
+
+    const alone = await resolveInput({ photo: 5 }, [schema], ctx).catch((err: unknown) => err);
+    expect(alone).toBeInstanceOf(ResolveError);
+    expect(alone).toMatchObject({
+      code: "INVALID_INPUT_TYPE",
+      message:
+        "Input 'photo' is not a file source (Invalid input: expected object, received number)",
+    });
+
+    const second = await resolveInput(
+      { photo: [png, { type: "file", source: "url", url: "secret-7f3a" }] },
+      [schema],
+      ctx,
+    ).catch((err: unknown) => err);
+    expect(second).toBeInstanceOf(ResolveError);
+    expect(second).toMatchObject({
+      code: "INVALID_INPUT_TYPE",
+      message: "Input 'photo' item 1 is not a file source (url: Invalid URL)",
     });
   });
 
@@ -230,6 +344,11 @@ describe("resolveInput", () => {
     const ctx = makeCtx();
     const result = await resolveInput({}, [schema], ctx);
     expect(result.size).toBe(0);
+  });
+
+  it("skips an optional file input named toString that the input does not carry as a field of its own: the prototype's is none of its inputs", async () => {
+    const schema = makeFileSchema({ name: "toString", required: false });
+    await expect(resolveInput({}, [schema], makeCtx())).resolves.toEqual(new Map());
   });
 
   it("ResolveError exposes a code property", () => {

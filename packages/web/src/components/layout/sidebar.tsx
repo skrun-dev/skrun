@@ -1,11 +1,14 @@
 import { useState } from "react";
 import { NavLink } from "react-router-dom";
+import { instanceLinks, useInstance } from "../../lib/api-client";
 import {
   IconAgents,
   IconBook,
   IconChevLeft,
+  IconDocument,
   IconExternal,
   IconHome,
+  IconLock,
   IconRuns,
   IconSettings,
 } from "../shared/icons";
@@ -21,12 +24,18 @@ const STORAGE_KEY = "skrun-sidebar-collapsed";
 
 export function Sidebar() {
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem(STORAGE_KEY) === "true");
+  // The operator's terms and privacy policy, when set: they arrive after the first paint.
+  const { data: instance } = useInstance();
+  const { terms, privacy } = instanceLinks(instance);
 
   const toggle = () => {
     const next = !collapsed;
     setCollapsed(next);
     localStorage.setItem(STORAGE_KEY, String(next));
   };
+
+  // Every link of the foot looks and reacts as "API Docs" does.
+  const footLinkClass = `flex items-center ${collapsed ? "justify-center" : "gap-2.5 px-2"} h-7 rounded-md text-[12px] text-gray-500 dark:text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-100/70 dark:hover:bg-gray-900/70`;
 
   return (
     <aside
@@ -84,16 +93,39 @@ export function Sidebar() {
       <div
         className={`border-t border-gray-200 dark:border-gray-900 ${collapsed ? "px-2 py-2" : "p-2.5 space-y-0.5"}`}
       >
-        <a
-          href="/docs"
-          target="_blank"
-          rel="noopener noreferrer"
-          className={`flex items-center ${collapsed ? "justify-center" : "gap-2.5 px-2"} h-7 rounded-md text-[12px] text-gray-500 dark:text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-100/70 dark:hover:bg-gray-900/70`}
-        >
+        <a href="/docs" target="_blank" rel="noopener noreferrer" className={footLinkClass}>
           <IconBook className="w-[13px] h-[13px]" />
           {!collapsed && <span className="flex-1">API Docs</span>}
           {!collapsed && <IconExternal className="w-[11px] h-[11px] opacity-60" />}
         </a>
+        {/* The same accessible name in both states: collapsed, the icon is all there is to see. */}
+        {terms && (
+          <a
+            href={terms}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Terms (opens in a new tab)"
+            className={footLinkClass}
+          >
+            <IconDocument className="w-[13px] h-[13px]" />
+            {!collapsed && <span className="flex-1">Terms</span>}
+            {!collapsed && <IconExternal className="w-[11px] h-[11px] opacity-60" />}
+          </a>
+        )}
+        {privacy && (
+          <a
+            href={privacy}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Privacy Policy (opens in a new tab)"
+            className={footLinkClass}
+          >
+            {/* Drawn on a 12-unit grid: a thinner stroke matches the 16-unit icons above at this size. */}
+            <IconLock className="w-[13px] h-[13px]" strokeWidth={1.125} />
+            {!collapsed && <span className="flex-1">Privacy</span>}
+            {!collapsed && <IconExternal className="w-[11px] h-[11px] opacity-60" />}
+          </a>
+        )}
         <button
           type="button"
           onClick={toggle}

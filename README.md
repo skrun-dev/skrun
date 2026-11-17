@@ -64,7 +64,7 @@ You shipped an AI capability. It works on your machine. But every user, every cu
 - ✅ Your skill stays in your repo, in the format you choose. Skrun is a deployment target — your repo stays the source of truth.
 - ✅ Compatible with the [Agent Skills open standard](https://agentskills.io) (`SKILL.md`) and [AGENTS.md](https://agents.md) (Linux Foundation). Your existing skill works.
 - ✅ Users bring their own LLM keys. You're never on the hook for their costs.
-- ✅ Self-host on your infrastructure (Node 22+, SQLite or Postgres). [Self-hosting guide](docs/self-hosting.md). Cloud (coming soon).
+- ✅ Self-host on your infrastructure (Node 22.19+, SQLite or Postgres). [Self-hosting guide](docs/self-hosting.md). Or the managed cloud: [quick start](https://skrun.sh/docs/quickstart).
 - ✅ MIT. Multi-model: Claude, GPT, Gemini, Mistral, Groq, Grok, Ollama.
 - ✅ Wrap existing scripts gradually. No big-bang rewrite required.
 
@@ -73,7 +73,7 @@ You shipped an AI capability. It works on your machine. But every user, every cu
 | | Skrun | CMA / GEAP / Vendor runtimes |
 |--|-------|-----------------|
 | **Models** | Claude, GPT, Gemini, Mistral, Groq, Grok + any OpenAI-compatible endpoint (DeepSeek, Kimi, Qwen, Ollama, vLLM…) | One provider only |
-| **Deployment** | Self-hosted (Node + SQLite/Postgres) or our cloud (coming soon) | Vendor cloud only |
+| **Deployment** | Self-hosted (Node + SQLite/Postgres) or our cloud ([quick start](https://skrun.sh/docs/quickstart)) | Vendor cloud only |
 | **Format** | `SKILL.md` ([agentskills.io](https://agentskills.io), 40+ platforms), `AGENTS.md` ([Linux Foundation](https://agents.md)), or your own | Proprietary |
 | **Streaming** | SSE + async webhooks | Varies |
 | **License** | MIT | Closed |
@@ -134,7 +134,7 @@ curl -X POST http://localhost:4000/api/agents/dev/my-skill/run \
   -d '{"input": {"query": "analyze this"}}'
 ```
 
-> `dev-token` is for local development. In production, authenticate via [GitHub OAuth or API keys](docs/api.md#authentication) — your GitHub username becomes your namespace, and `skrun verify` is governed by the operator [verification policy](docs/self-hosting.md#verification-policy) (admin-only by default; creators can self-attest under `owner`).
+> `dev-token` is for local development. In production, authenticate via [GitHub OAuth or API keys](docs/api.md#authentication) — your GitHub login becomes your namespace by default, and `skrun verify` is governed by the operator [verification policy](docs/self-hosting.md#verification-policy) (admin-only by default; creators can self-attest under `owner`).
 
 → **[10-minute tutorial](docs/getting-started.md)** · **[Concepts](docs/concepts.md)** · **[API reference](docs/api.md)**
 
@@ -148,13 +148,13 @@ curl -X POST http://localhost:4000/api/agents/dev/my-skill/run \
 
 Every Skrun registry ships with a full operator dashboard at `/dashboard`. No separate install, no extra env var.
 
-- **Home** — workspace stats, 24h/7d toggles, recent activity, top agents.
+- **Home** — workspace stats, 24h/7d toggles, the account's usage of the server's quotas, recent activity, top agents.
 - **Agents** — sortable list with run counts, token usage, verification status.
 - **Agent detail** — per-agent metrics, versions with notes, metadata, try-it curl.
 - **Runs** — every execution across all agents, filterable by agent/ID/status/model.
 - **Run detail** — full I/O, tokens, cost, model, event timeline (tool calls, LLM calls).
 - **Playground** — call any agent interactively, watch SSE events live, save outputs.
-- **Settings** — profile + API keys (`sk_live_*`) with one-shot reveal, revocation, and a per-key expiry (or none).
+- **Settings** — profile + API keys (`skrun_sk_…`) with one-shot reveal, revocation, and a per-key expiry (or none).
 
 → **[Screenshot tour of all 7 pages](docs/getting-started.md#6-explore-the-dashboard)**
 
@@ -194,7 +194,7 @@ console.log(pinned.agent_version); // "1.2.0" — always echoed back
 await client.push("dev/code-review", bundle, "1.3.0", { message: "Added retry logic" });
 ```
 
-10 methods: `run`, `stream`, `runAsync`, `push`, `pull`, `list`, `getAgent`, `getVersions`, `verifyVersion`, `setVisibility`. **Zero runtime dependencies**, Node.js 20+.
+10 methods: `run`, `stream`, `runAsync`, `push`, `pull`, `list`, `getAgent`, `getVersions`, `verifyVersion`, `setVisibility`. **Zero runtime dependencies**, Node.js 22+.
 
 ---
 
@@ -204,31 +204,32 @@ await client.push("dev/code-review", bundle, "1.3.0", { message: "Added retry lo
 |---------|-------------|
 | 🤖 **Multi-model** | 6 built-in providers (Anthropic, OpenAI, Google, Mistral, Groq, xAI) + any OpenAI-compatible endpoint (DeepSeek, Kimi, Qwen, Ollama, vLLM…) — with automatic fallback |
 | 🔧 **Tool calling** | Local scripts (`scripts/`) + MCP servers (`npx`) — same ecosystem as Claude Desktop |
-| 💾 **Stateful** | Agents remember across runs via key-value state |
+| 💾 **Stateful** | Agents remember across runs via key-value state — one notebook per caller by default |
 | 📡 **Streaming** | SSE real-time events (`run_start` → `tool_call` → `run_complete`) + async webhooks |
 | 📦 **Typed SDK** | `npm install @skrun-dev/sdk` — `run()`, `stream()`, `runAsync()` + 7 more methods |
 | 📊 **Operator Dashboard** | Web UI at `/dashboard` — agents, runs, stats, settings, integrated playground with SSE streaming |
 | 📖 **Interactive API docs** | OpenAPI 3.1 schema + Scalar explorer at `GET /docs` |
-| 🔐 **Production auth** | GitHub OAuth login + API keys (`sk_live_*`) + multi-tenant namespaces |
+| 🔐 **Production auth** | GitHub OAuth login + API keys (`skrun_sk_…`) + multi-tenant namespaces |
+| ⚖️ **Per-account quotas** | Off until the operator sets them, [per plan](docs/self-hosting.md#quotas-per-plan): an account's runs in progress and its compute time per window, a cap on the runs the whole instance holds at once — the lever that bounds what runs cost —, a longest timeout, and an account's bundle storage and live uploads, checked at the push and at the upload. A refused run gets a typed `429` / `503` / `400` with `Retry-After`, and the account's full-access credentials see its numbers in `X-Quota-*` headers and read them at any time from `GET /api/usage` (`client.usage()` in the SDK); with a pre-warm pool, a plan also sets how many runs an hour are entitled to a ready machine. An admin assigns an account's plan with one request |
 | 🗄️ **Persistent storage** | Pluggable database — SQLite for local dev (zero-config, file-based), any standard Postgres for production (Supabase, Neon, RDS, Fly Postgres… — no vendor lock-in) |
-| 🔑 **Caller keys** | Users bring their own LLM keys via `X-LLM-API-Key` — zero cost for operators. A key only ever goes to an endpoint its **owner** chose: an agent may declare its own `model.base_url`, so running someone else's agent with your key means naming the origin you expect (`X-LLM-Base-URL`), and the server never pairs its own key with an agent-chosen endpoint unless the operator opts in |
-| ✅ **Agent verification** | Verified flag controls script execution — safe for third-party agents |
-| 🔒 **Private by default** | Every agent is `private` — only its owner/admin can `POST /run`; non-owners get an opaque 404 and can't override the agent's declared environment. Agents are private-only for now — `public` is a marketplace capability whose set-path ships later |
+| 🔑 **Caller keys** | Users bring their own LLM keys via `X-LLM-API-Key` — zero cost for operators. A key only ever goes to an endpoint its **owner** chose: an agent may declare its own `model.base_url`, so running someone else's agent with your key for its primary model means naming the origin you expect (`X-LLM-Base-URL`), and the server never pairs its own key with an agent-chosen endpoint unless the operator opts in |
+| ✅ **Agent verification** | Per-version verified flag, governed by the operator's [verification policy](docs/self-hosting.md#verification-policy): by default an unverified version cannot run at all, so an admin vets each version before any caller uses it; under `owner`, creators attest their own |
+| 🔒 **Private by default** | Every agent is `private` — only its owner/admin can `POST /run`; non-owners get an opaque 404 and can't override the agent's declared environment. Agents are private-only for now — setting one `public` is disabled |
 | 📌 **Version pinning + notes** | Pin a specific agent version per call (`version: "1.2.0"`) or attach a note at push (`-m "..."`) — reproducible integrations, visible changelog |
-| 🌍 **Environment separation** | Agent behavior (model, tools) separated from runtime environment (networking, timeout, sandbox). Per-run overrides via POST /run body |
+| 🌍 **Environment separation** | Agent behavior (model, tools) separated from runtime environment (networking, timeout, cost cap). Per-run overrides via POST /run body |
 | 📁 **Files API** | Unified `/api/files` namespace for both directions — upload binary inputs (image/PDF/audio) via `POST /api/files`, download agent-produced artifacts via `GET /api/files/:id/content` |
 | 🖼️ **Multimodal inputs** | Declare `type: file` inputs (image / PDF / audio) in `agent.yaml`. Agents read images directly via vision (no OCR upstream). 3 transports: file_id ref, base64 inline, URL. Capability check at `skrun deploy/push` refuses incompatible model+media. |
-| 📦 **Script dependencies** | Drop a standard `package.json` (Node) or `requirements.txt` / `pyproject.toml` (Python) at the bundle root. Skrun resolves deps on first run, caches at `~/.skrun/deps/<hash>/` for instant subsequent runs. Auto-detects pnpm/yarn/npm + uv/poetry lockfiles for reproducible installs. |
+| 📦 **Script dependencies** | Drop a standard `package.json` (Node) or `requirements.txt` / `pyproject.toml` (Python) at the bundle root. Skrun installs them where your scripts run: a server that runs them itself resolves deps on first run and caches them at `~/.skrun/deps/<hash>/` for instant subsequent runs; the cloud sandbox installs them as each run starts. Auto-detects pnpm/yarn/npm + uv/poetry lockfiles for reproducible installs (npm only in the cloud sandbox). |
 | 🎯 **Tool choice** | Force the LLM to invoke a specific tool (top-level `tool_choice: <name>`), require any tool (`tool_choice: required`), block tool use (`none`), or mark per-tool invariants with `required: true`. Native cross-provider support (Anthropic / Gemini / OpenAI / xAI) with graceful soft-fallback when a directive isn't natively supported. |
-| 💸 **Native prompt caching** | Automatic across 5 providers (Anthropic / OpenAI / Gemini / xAI / Groq) — 30-90% input cost savings on repeated content (system prompts + tools + reference documents). Anthropic gets explicit `cache_control` injection on the system + tools prefixes; OpenAI / xAI / Groq / Gemini benefit from implicit caching. Cost-tracking accuracy improves to ±5% of provider invoice via the new `cache_read_tokens` / `cache_write_tokens` fields in `usage`. Track dollar savings live (`cost.saved`) and on the dashboard. |
+| 💸 **Native prompt caching** | Automatic across all 6 providers (Anthropic / OpenAI / Gemini / xAI / Groq / Mistral) — 30-90% input cost savings on repeated content (system prompts + tools + reference documents). Anthropic gets explicit `cache_control` injection on the system + tools prefixes, and on the conversation as a tool loop grows; OpenAI / Mistral / xAI / Groq / Gemini benefit from implicit caching. Cost-tracking accuracy improves to ±5% of provider invoice via the new `cache_read_tokens` / `cache_write_tokens` fields in `usage`. Track dollar savings live (`cost.saved`) and on the dashboard. |
 | 📊 **Structured logs** | JSON to stdout via pino — pipe to Axiom, Datadog, ELK. `LOG_LEVEL` env var controls verbosity |
-| ☁️ **Cloud deployment** | `SKRUN_RUNTIME=flyio` spawns a dedicated ephemeral sandbox machine per run. The harness drives the LLM loop and holds every credential; the sandbox runs agent code with zero LLM/DB/S3 keys, read-only rootfs, non-root UID, iptables egress allowlist, zero capabilities. Self-host `docker-compose` applies the same container-level hardening (read-only rootfs, non-root, cap-drop, no-new-privileges); the per-run micro-VM + zero-credential sandbox are cloud-only (self-host runs agents in-process). |
+| ☁️ **Cloud deployment** | `SKRUN_RUNTIME=flyio` spawns a dedicated ephemeral sandbox machine per run. The harness drives the LLM loop and holds every credential; the sandbox runs agent code with zero LLM/DB/S3 keys, as a non-root UID with zero capabilities, behind an iptables egress allowlist; its root filesystem is writable, and each machine serves a single run. Self-host `docker-compose` applies container-level hardening (read-only rootfs, non-root, cap-drop, no-new-privileges); the per-run micro-VM + zero-credential sandbox are cloud-only (self-host runs agents in-process). |
 
 ---
 
 ## 🧪 Demo agents
 
-Eight runnable demos under [`agents/`](./agents/) — each produces a real, downloadable artifact (PDF, XLSX, PPTX, ZIP, CSV, MD). All use Google Gemini Flash by default (free tier). Change the `model` section in `agent.yaml` to use any [supported provider](#-features).
+Fourteen runnable demos under [`agents/`](./agents/). The eight below each produce a real, downloadable artifact (PDF, XLSX, PPTX, ZIP, CSV, MD); the six others — code-review, data-analyst, email-drafter, pdf-processing, seo-audit, web-scraper — answer in the run's output. All use Google's Gemini 3.8 Flash by default (free tier), with Gemini 3.5 Flash-Lite as fallback. Change the `model` section in `agent.yaml` to use any [supported provider](#-features).
 
 ### For OSS developers
 
@@ -279,7 +280,7 @@ pnpm dev:registry              # keep this terminal open
 skrun login --token dev-token
 cd agents/changelog-generator
 skrun build && skrun push -m "v1 — first push"
-skrun verify dev/changelog-generator@1.0.0   # admin step; dev-token = auto-admin
+skrun verify dev/changelog-generator@0.3.1   # admin step; dev-token = auto-admin
 
 # 3. Call it (uses the bundled fixture — no real git repo needed)
 skrun run dev/changelog-generator \
@@ -297,7 +298,7 @@ curl http://localhost:4000/api/runs/<run_id>/files/CHANGELOG.md \
 ```
 
 > **Windows (PowerShell):** use `curl.exe` instead of `curl`, and pass `-d "@input.json"` for the body.
-> **Python demos** (slide-deck-generator, csv-to-executive-report, receipts-to-expenses) and the **Node demo** (knowledge-base-from-vault): no manual install. Skrun's runtime auto-resolves each agent's `requirements.txt` / `package.json` on first call and caches at `~/.skrun/deps/<hash>/`. See the [Script dependencies](docs/agent-yaml.md#script-dependencies) reference.
+> **Python demos** (slide-deck-generator, csv-to-executive-report, receipts-to-expenses) and the **Node demo** (knowledge-base-from-vault): no manual install. The local registry resolves each agent's `requirements.txt` / `package.json` on its first call and caches the result on this machine, at `~/.skrun/deps/<hash>/`. See the [Script dependencies](docs/agent-yaml.md#script-dependencies) reference.
 
 </details>
 
@@ -310,17 +311,17 @@ curl http://localhost:4000/api/runs/<run_id>/files/CHANGELOG.md \
 | `skrun init [dir]` | Create a new agent |
 | `skrun init --from-skill <path>` | Import existing skill |
 | `skrun dev` | Local server with POST /run (mock, free) |
-| `skrun test` | Run agent tests (real LLM) |
+| `skrun test` | Check tests against simulated outputs (no model call) |
 | `skrun build` | Package `.agent` bundle |
 | `skrun push -m "note"` | Push with a version note |
 | `skrun verify <ns>/<name>@<v>` | Attest a version (authority per the verification policy — admin by default) |
 | `skrun unverify <ns>/<name>@<v>` | Revoke verification (authority per the verification policy) |
 | `skrun run <ns>/<name>[@<v>]` | Invoke an agent — `-i` inline, `-f` file, `--stdin` pipe |
-| `skrun deploy -m "note"` | Build + push + live URL |
+| `skrun deploy -m "note"` | Build + push + run URL |
 | `skrun pull <agent>` | Download agent bundle |
-| `skrun keys create --agent <ns>/<name> --run-only` | Mint a scoped/restricted API key (e.g. a run-only client key) |
+| `skrun keys create --name <key-name> --agent <ns>/<name> --run-only` | Mint a scoped/restricted API key (e.g. a run-only client key) |
 | `skrun llm-key set <provider> --agent <ns>/<name>` | Attach your LLM key so callers run the agent on your key (key from stdin / `--key-env`) |
-| `skrun login` / `logout` | Authentication (OAuth or token) |
+| `skrun login --registry <url>` / `logout` | Sign in to a server, which the CLI then remembers (OAuth or token); sign out of it |
 | `skrun logs <agent>` | Execution logs (planned) |
 
 → **[Full CLI reference](docs/cli.md)**
@@ -331,19 +332,13 @@ curl http://localhost:4000/api/runs/<run_id>/files/CHANGELOG.md \
 
 Skrun is MIT — deploy anywhere.
 
-```bash
-# Recommended: prod-parity docker compose stack (Postgres + MinIO + Redis + Caddy)
-git clone https://github.com/skrun-dev/skrun.git && cd skrun
-cp .env.example .env   # fill at least one LLM key
-docker compose -f infra/docker-compose.yml up -d
-curl http://localhost/health   # → {"status":"ok"}
-```
+Recommended: the prod-parity Docker Compose stack (Postgres + MinIO + Redis + Caddy) — follow its **[quick start](docs/self-hosting-docker.md#quick-start)**.
 
 - 🐳 **Docker Compose** — `docker compose up` brings the prod-parity stack (Postgres + MinIO + Redis + Caddy) live with every sandbox hardening control on by default. See **[self-hosting with Docker](docs/self-hosting-docker.md)**.
 - **SQLite (bare-metal)** — zero config, file-based, survives restarts. Good for local dev and single-node.
 - **Postgres** — production-grade. Any host works (Supabase, Neon, RDS, Fly Postgres…) via `DATABASE_URL=postgres://…`. No vendor lock-in.
 - **Any cloud** — Fly.io, AWS, GCP, Hetzner, bare metal. Caddy or nginx in front.
-- **GitHub OAuth** — users sign in with GitHub, their username becomes their namespace.
+- **GitHub OAuth** — users sign in with GitHub; their login becomes their namespace by default (`<login>--2` if it is taken).
 
 → **[Self-hosting guide](docs/self-hosting.md)** — step-by-step with env vars, reverse proxy, migrations.
 

@@ -2,7 +2,7 @@
 
 > **Persona**: anyone with a PDF and 30 seconds — researcher, analyst, lawyer, student
 > **Skrun strengths shown**: multimodal document input · zero-tool LLM-only flow · structured output
-> **Version**: 1.1.0 (vision-native — see [CHANGELOG](#version-history))
+> **Version**: 1.2.1 (vision-native — see [CHANGELOG](#version-history))
 
 ## Purpose
 
@@ -11,7 +11,7 @@ Drop a PDF in, ask for `extract` / `summarize` / `analyze`, get the answer back.
 ## Prerequisites
 
 - Skrun running (`pnpm dev:registry` from the repo root)
-- One LLM API key — **Google Gemini** (the agent's model `gemini-2.5-flash` reads PDFs natively; the free tier handles the bundled fixture)
+- One LLM API key — **Google Gemini** (the agent's model `gemini-3.8-flash` reads PDFs natively; the free tier handles the bundled fixture)
 - A PDF up to 25 MB
 
 ## How to run
@@ -22,7 +22,7 @@ From the repo root:
 # 1. Push the agent to your local registry
 cd agents/pdf-processing
 skrun build && skrun push
-skrun verify dev/pdf-processing@1.1.0   # admin step; dev-token = auto-admin
+skrun verify dev/pdf-processing@1.2.1   # admin step; dev-token = auto-admin
 
 # 2. Upload the PDF and capture the file_id
 PDF=$(curl -s -X POST http://localhost:4000/api/files \
@@ -95,5 +95,7 @@ Any PDF up to 25 MB works — scanned docs, born-digital docs, mixed text + imag
 
 ## Version history
 
+- **1.2.1** — the retired `filesystem` field and the empty `secrets` list removed from `agent.yaml`.
+- **1.2.0** — the model is Gemini 3.8 Flash, with Gemini 3.5 Flash-Lite as fallback: Google opens Gemini 2.5 only to accounts that have used it before.
 - **1.1.0** (2026-04-15) — vision-native. Accepts a PDF directly via Skrun's multimodal file inputs; the LLM reads it with its native document capability. No tools, no upstream extraction step.
 - **1.0.0** — text-mode placeholder. The agent declared an `extract_pdf` tool but the script was a stub returning fixed text — kept around as a structural example only.

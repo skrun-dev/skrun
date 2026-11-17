@@ -18,14 +18,24 @@ group "default" {
   targets = ["api-server", "runner"]
 }
 
+# The image's name, printed on the runner's boot line (`image=<value>`). Bake
+# reads it from the environment variable of the same name, so every bake
+# invocation sets it the same way whatever targets it builds:
+#   SKRUN_IMAGE_VERSION=1.2.3 docker buildx bake -f docker-bake.hcl ...
+# Unset, both targets say `unknown`.
+variable "SKRUN_IMAGE_VERSION" {
+  default = "unknown"
+}
+
 target "_common" {
   context    = "."
   dockerfile = "Dockerfile"
   platforms  = ["linux/amd64", "linux/arm64"]
   args = {
-    SCHEMA_TGZ  = "skrun-dev-schema.tgz"
-    RUNTIME_TGZ = "skrun-dev-runtime.tgz"
-    API_TGZ     = "skrun-dev-api.tgz"
+    SCHEMA_TGZ          = "skrun-dev-schema.tgz"
+    RUNTIME_TGZ         = "skrun-dev-runtime.tgz"
+    API_TGZ             = "skrun-dev-api.tgz"
+    SKRUN_IMAGE_VERSION = SKRUN_IMAGE_VERSION
   }
 }
 

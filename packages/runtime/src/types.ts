@@ -1,6 +1,7 @@
 import type { AgentConfig } from "@skrun-dev/schema";
+import type { MachineSpawnPhase } from "./errors.js";
+import type { OutputExclusionReason } from "./files/output-rules.js";
 import type { SkrunPart } from "./llm/parts.js";
-import type { ToolDefinition } from "./tools/types.js";
 
 export interface FileInfo {
   name: string;
@@ -87,6 +88,16 @@ export interface RunRequest {
    * in Hono). `LocalAdapter` ignores it for now.
    */
   abortSignal?: AbortSignal;
+  /**
+   * Whether this run may take a pre-created machine from the runner pool.
+   * Absent means it may — a request that does not say keeps the pool as it
+   * always had it. `false`: the cloud `FlyioAdapter` leaves the pool alone —
+   * it reads none of its counters, takes no machine and asks for no refill —
+   * creates a machine for the run, and counts a skip, never a miss: a pool
+   * passed over on purpose is not a pool that failed to serve. `LocalAdapter`
+   * has no pool and ignores it.
+   */
+  poolEligible?: boolean;
 }
 
 export interface RunResult {
@@ -107,7 +118,26 @@ export interface RunResult {
   durationMs: number;
   error?: string;
   files?: FileInfo[];
+  /** How many of the run's output files were left out, by reason. Set on a completed run. */
+  filesExcluded?: FilesExcluded;
 }
+
+/**
+ * Why one of a run's output files is not among the files the run returns, in
+ * the order a file is judged: its name breaks the output name rule
+ * (`name_refused`), it is past the size limit (`too_large`), the count is
+ * already reached (`over_count`); on the cloud runtime, its pull from the
+ * machine failed (`pull_failed`), or the upload ran out of time before it was
+ * stored (`upload_budget`). One reason per file.
+ */
+export type FileExclusionReason = OutputExclusionReason | "pull_failed" | "upload_budget";
+
+/**
+ * How many of a run's output files were left out, by reason — counts only,
+ * never a name. A reason that left no file out is omitted: `{}` when every file
+ * was kept.
+ */
+export type FilesExcluded = Partial<Record<FileExclusionReason, number>>;
 
 // --- Streaming event types ---
 
@@ -179,6 +209,11 @@ export interface RunCompleteEvent extends BaseRunEvent {
   cost: { estimated: number };
   duration_ms: number;
   files: FileInfo[];
+  /**
+   * How many of the run's output files are not in `files`, by reason; `{}` when
+   * none was left out. Always present.
+   */
+  files_excluded: FilesExcluded;
 }
 
 /**
@@ -198,18 +233,21 @@ export interface OutputValidationWarningEvent extends BaseRunEvent {
 /**
  * Periodic informational event emitted during long waits to keep the SSE
  * stream alive + signal what the harness is doing right now. The runtime
- * fires one every ~30s during LLM calls, tool dispatch, and outputs
- * upload. Existing SSE consumers MUST ignore unknown event types so this
+ * fires one every ~30s while the cloud adapter acquires a runner, and during
+ * LLM calls, tool dispatch, and outputs upload. Existing SSE consumers MUST
+ * ignore unknown event types, and tolerate unknown `stage` values, so this
  * is backward-compatible.
  *
  * Known `stage` values:
+ *  - `"acquiring_runner"` — cloud adapter waking or creating the run's
+ *    machine, up to its `/init` (then `runner_spawned`)
  *  - `"waiting_llm"` — awaiting an LLM provider response
  *  - `"waiting_tool"` — awaiting a tool's `callTool` result (script or MCP)
  *  - `"uploading_outputs"` — cloud adapter sync-uploading outputs to R2
  */
 export interface RunHeartbeatEvent extends BaseRunEvent {
   type: "run_heartbeat";
-  stage: "waiting_llm" | "waiting_tool" | "uploading_outputs";
+  stage: "acquiring_runner" | "waiting_llm" | "waiting_tool" | "uploading_outputs";
 }
 
 /**
@@ -220,6 +258,10 @@ export interface RunHeartbeatEvent extends BaseRunEvent {
  *    declared `outputs` schema, and the auto-repair retry also failed.
  *  - `COST_EXCEEDED` — the run's aggregate estimated cost exceeded the agent's
  *    declared `environment.max_cost`; the run is aborted before completing.
+ *  - `TOO_MANY_TOOL_CALLS` — one answer of the model asked for more than 128 tool calls; none ran.
+ *  - `MODEL_RESPONSE_TOO_LARGE` — a response of the agent's `model.base_url` was over 4 MiB.
+ *  - `MODEL_OUTPUT_BUDGET_EXCEEDED` — the model's answers in the run weighed over 4 MiB in all.
+ *  - `OUTPUT_TOO_LARGE` — the JSON object of the final answer was over 1 MiB; it was not parsed.
  *  - any provider/runtime-specific code (LLM error, timeout, etc.) — the field
  *    is intentionally typed as `string` to accommodate future codes without a
  *    coordinated SDK release.
@@ -230,7 +272,10 @@ export interface RunErrorEvent extends BaseRunEvent {
 }
 
 /**
- * Per-phase cold-start timing for a cloud (Fly) runner spawn, in milliseconds.
+ * Per-phase cold-start timing for a cloud (Fly) runner spawn — durations in
+ * milliseconds — and the pool's indicators: whether a pooled machine served
+ * the run, whether it resumed from its snapshot, and how many pooled machines
+ * the run lost after its handoff began (a count).
  * Only `create_api_ms` is always present (harness-measured); the derived and
  * in-VM fields are OPTIONAL because the runner image and the harness deploy
  * independently — an older runner may not report them, and the harness must
@@ -244,11 +289,24 @@ export interface SpawnPhases {
    */
   create_api_ms: number;
   /**
-   * Whether this run was served by a pre-created machine rather than one created
-   * for it. Present only when a pool is configured, so its absence means "no pool"
-   * rather than "pool missed".
+   * `true` when a pre-created machine served this run rather than one created
+   * for it. Never `false`: every other run omits it — no pool configured, a pool
+   * that missed, or a run not entitled to one (`RunRequest.poolEligible`).
    */
   pool_hit?: boolean;
+  /**
+   * How many pooled machines were taken for this run and then discarded on a
+   * failed handoff, before it had its machine — the run's handoff being its
+   * URLs signed for it, then its credential and allowed hosts handed over
+   * (the assignment), then its `/init`. A machine that would not wake or
+   * answer its health check is not counted, nor one discarded as stale before
+   * any claim: the run's handoff had not begun. `1` or absent: a run hands
+   * its agent to one pooled machine at most, and one whose handoff failed
+   * takes the cold path — so it never comes with `pool_hit`. Never `0`:
+   * absent when there is none — no pool, nothing ready, a run not entitled to
+   * one.
+   */
+  pool_handoffs_failed?: number;
   /** Time to wake a pre-created machine and see it answer (pool-served runs only). */
   pool_resume_ms?: number;
   /** Time to hand a woken machine its run credential and egress rules. */
@@ -286,6 +344,11 @@ export interface SpawnPhases {
   init_bundle_ms?: number;
   /** In-VM /init: bundle extract. */
   init_extract_ms?: number;
+  /**
+   * In-VM /init: installing the dependencies the agent's scripts declare (near
+   * zero when it declares none). Absent from a runner that predates the install.
+   */
+  init_deps_ms?: number;
   /** In-VM /init: MCP server connect (0 when the agent declares no MCP servers). */
   init_mcp_ms?: number;
 }
@@ -296,10 +359,12 @@ export interface SpawnPhases {
  * otherwise-silent gap between `run_start` and the first agent-loop event so
  * consumers can see where a slow first run spends its time.
  *
- * Carries DURATIONS ONLY. The machine id and private IP are operator-internal
- * and travel via the adapter's `onRunnerSpawned` callback, never over the event
- * stream. LocalAdapter runs (no VM) do not emit this event. Existing SSE
- * consumers ignore unknown event types, so this is backward-compatible.
+ * Carries the phases only: durations, and the pool's indicators — a count among
+ * them, which a cold-started run may carry too (`pool_handoffs_failed`). The
+ * machine id and private IP are operator-internal and travel via the adapter's
+ * `onRunnerSpawned` callback, never over the event stream. LocalAdapter runs (no
+ * VM) do not emit this event. Existing SSE consumers ignore unknown event types,
+ * so this is backward-compatible.
  */
 export interface RunnerSpawnedEvent extends BaseRunEvent {
   type: "runner_spawned";
@@ -319,26 +384,11 @@ export type RunEvent =
   | RunErrorEvent;
 
 /**
- * The runner's `POST /init` response contract, shared by the runner
- * (infra/runtime-image) and the FlyioAdapter. `phases`/`boot` are OPTIONAL: the
- * runner image and the harness deploy independently, so a newer harness may
- * receive an older runner's `{ ok, tools }` response and MUST degrade rather
- * than throw.
+ * The runner's `POST /init` answer — declared, with the rest of what the harness
+ * and the runner say to each other, in `runner-contract.ts`, derived from its
+ * schema there, and named here too for the readers of this module.
  */
-export interface InitResult {
-  ok: true;
-  tools: ToolDefinition[];
-  phases?: {
-    bundle_ms: number;
-    extract_ms: number;
-    mcp_ms: number;
-  };
-  boot?: {
-    vm_boot_ms?: number;
-    entrypoint_egress_ms?: number;
-    module_load_ms?: number;
-  };
-}
+export type { InitResult } from "./runner-contract.js";
 
 /**
  * Operator-only spawn telemetry delivered to the api layer via the FlyioAdapter
@@ -354,3 +404,13 @@ export interface RunnerSpawnedInfo {
 
 /** Callback signature for `FlyioAdapterOptions.onRunnerSpawned`. */
 export type OnRunnerSpawned = (info: RunnerSpawnedInfo) => void;
+
+/**
+ * Callback signature for `FlyioAdapterOptions.onSpawnFailed`: a run's machine
+ * never got ready, and `phase` says where its acquisition stopped —
+ * `undefined` for a failure that was not a failed start (`MachineSpawnError`).
+ * Called before the run's `run_error` is handed out, so that whoever ends the
+ * run on that event already knows the phase. Internal, like
+ * `onRunnerSpawned`: nothing of it travels on the event stream.
+ */
+export type OnSpawnFailed = (info: { phase: MachineSpawnPhase | undefined }) => void;

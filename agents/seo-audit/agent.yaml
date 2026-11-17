@@ -1,13 +1,28 @@
 name: seo-audit
-version: 1.0.0
+version: 1.3.1
 
 model:
   provider: google
-  name: gemini-2.5-flash
-  temperature: 0.3
+  name: gemini-3.8-flash
+  # No temperature: Google recommends keeping Gemini 3 models at their default.
   fallback:
     provider: google
-    name: gemini-2.5-flash
+    name: gemini-3.5-flash-lite
+
+# Read the page before judging it: the first model turn must call fetch_page.
+tool_choice: fetch_page
+
+tools:
+  - name: fetch_page
+    description: Fetch the web page at a URL (public http/https only, at most 1 MB, 15 s) and return what an SEO audit reads from it — HTTP status, final URL after redirects, content type, title, meta description, h1 and h2 texts, and the number of links. It also saves what it read — the page's first 50 000 characters, with its status and title — as fetched-page.json among the run's files. Returns { "error" } when the page cannot be fetched, and saves nothing then.
+    input_schema:
+      type: object
+      properties:
+        url:
+          type: string
+          description: The absolute http(s) URL of the page to fetch — the website_url to audit.
+      required: [url]
+      additionalProperties: false
 
 inputs:
   - name: website_url
@@ -33,14 +48,12 @@ environment:
   networking:
     allowed_hosts:
       - "*"
-  filesystem: read-only
-  secrets: []
   timeout: 300s
   max_cost: 0.50
-  sandbox: strict
 
 state:
   type: kv
+  scope: per_caller
   ttl: 30d
 
 tests:

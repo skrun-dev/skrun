@@ -2,12 +2,35 @@ import {
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
   type S3ClientConfig,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import type { StorageAdapter } from "./adapter.js";
+import {
+  assertListPrefix,
+  type PresignedDownloadOptions,
+  type StorageAdapter,
+  type StoragePutOptions,
+} from "./adapter.js";
+
+/** How long a call may take to open its connection to the store, in milliseconds. */
+export const R2_CONNECTION_TIMEOUT_MS = 5_000;
+
+/**
+ * How long an open connection may stay silent, in milliseconds — no byte sent
+ * or received. Not how long a call may last: a large bundle pushed at any speed
+ * keeps its bytes moving and never trips it. A store that took the connection
+ * and never answers fails the call instead of holding it, and whatever awaits
+ * it, forever. The client retries a call that timed out, so one call can wait
+ * about three times this long before it fails.
+ *
+ * Not a request timeout: that one counts until the response headers, which
+ * includes sending the whole body, so a value short enough to catch a silent
+ * store would also fail a slow push.
+ */
+export const R2_SOCKET_TIMEOUT_MS = 60_000;
 
 /**
  * R2Storage — S3-compatible storage backend.
@@ -38,6 +61,11 @@ export interface R2StorageConfig {
   endpoint?: string;
   /** Region — defaults to "auto" for R2, "us-east-1" for MinIO. */
   region?: string;
+  /**
+   * The two timeouts, in milliseconds. Defaults: `R2_CONNECTION_TIMEOUT_MS` and
+   * `R2_SOCKET_TIMEOUT_MS`. Tests shorten them; nothing else sets them.
+   */
+  timeouts?: { connectionMs: number; socketMs: number };
 }
 
 export class R2Storage implements StorageAdapter {
@@ -48,11 +76,21 @@ export class R2Storage implements StorageAdapter {
     this.bucket = config.bucket;
 
     const isMinIO = config.endpoint !== undefined;
+    const timeouts = config.timeouts ?? {
+      connectionMs: R2_CONNECTION_TIMEOUT_MS,
+      socketMs: R2_SOCKET_TIMEOUT_MS,
+    };
     const clientConfig: S3ClientConfig = {
       region: config.region ?? (isMinIO ? "us-east-1" : "auto"),
       credentials: {
         accessKeyId: config.accessKeyId,
         secretAccessKey: config.secretAccessKey,
+      },
+      // Without these the client waits on a silent store forever: its defaults
+      // set no connection, socket or request timeout.
+      requestHandler: {
+        connectionTimeout: timeouts.connectionMs,
+        socketTimeout: timeouts.socketMs,
       },
     };
 
@@ -69,13 +107,15 @@ export class R2Storage implements StorageAdapter {
     this.client = new S3Client(clientConfig);
   }
 
-  async put(key: string, data: Buffer): Promise<void> {
+  /** The signal reaches the client as the request's abort signal: aborting it ends the request. */
+  async put(key: string, data: Buffer, opts?: StoragePutOptions): Promise<void> {
     await this.client.send(
       new PutObjectCommand({
         Bucket: this.bucket,
         Key: key,
         Body: data,
       }),
+      { abortSignal: opts?.signal },
     );
   }
 
@@ -121,10 +161,44 @@ export class R2Storage implements StorageAdapter {
     }
   }
 
-  async getPresignedDownloadUrl(key: string, expiresIn: number): Promise<string> {
-    return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.bucket, Key: key }), {
-      expiresIn,
+  /**
+   * One `ListObjectsV2` call per page of at most 1000 keys, following the
+   * continuation token until the store says the listing is complete.
+   */
+  async list(prefix: string): Promise<string[]> {
+    assertListPrefix(prefix);
+    const keys: string[] = [];
+    let token: string | undefined;
+    do {
+      const page = await this.client.send(
+        new ListObjectsV2Command({ Bucket: this.bucket, Prefix: prefix, ContinuationToken: token }),
+      );
+      for (const object of page.Contents ?? []) {
+        if (object.Key !== undefined) keys.push(object.Key);
+      }
+      token = page.IsTruncated ? page.NextContinuationToken : undefined;
+    } while (token !== undefined);
+    return keys;
+  }
+
+  /**
+   * A disposition rides in the query as `response-content-disposition`, which
+   * the signature covers: the store answers with it, and a changed value fails
+   * the signature check. Computed locally — no call to the store.
+   */
+  async getPresignedDownloadUrl(
+    key: string,
+    expiresIn: number,
+    opts?: PresignedDownloadOptions,
+  ): Promise<string> {
+    const command = new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+      ...(opts?.contentDisposition !== undefined && {
+        ResponseContentDisposition: opts.contentDisposition,
+      }),
     });
+    return getSignedUrl(this.client, command, { expiresIn });
   }
 
   async getPresignedUploadUrl(key: string, expiresIn: number): Promise<string> {

@@ -1,42 +1,14 @@
 import { createLogger } from "@skrun-dev/runtime";
 import type { Context } from "hono";
+import { parsePublicUrl } from "../operator-site.js";
+import { errorFields } from "./error-fields.js";
 
 const logger = createLogger("external-url");
 
-/**
- * Parse and validate the canonical public origin an operator configured.
- *
- * Throws, with a message naming the value received and what was expected. This is
- * the loud half of the pair below: it runs once, at startup, from `createApp`.
- *
- * Accepted: an absolute `http` or `https` URL, a port if you need one, and nothing
- * else — no path (a bare `/` is tolerated because `new URL` adds it), no query, no
- * fragment. Those are refused rather than ignored: a path in a value whose whole
- * job is to be an *origin* means the operator expected something we would silently
- * drop.
- */
-export function parsePublicUrl(raw: string): URL {
-  const expected =
-    "an absolute http(s) origin with no path, query or fragment " +
-    "(e.g. https://api.example.com or https://api.example.com:8443)";
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new Error(`SKRUN_PUBLIC_URL must be ${expected} — received "${raw}"`);
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error(
-      `SKRUN_PUBLIC_URL must be ${expected} — received "${raw}" (scheme "${url.protocol.replace(":", "")}")`,
-    );
-  }
-  if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
-    throw new Error(
-      `SKRUN_PUBLIC_URL must be ${expected} — received "${raw}" (it carries a path, query or fragment)`,
-    );
-  }
-  return url;
-}
+// The loud half of the pair below: the check createApp runs once, at startup,
+// on the canonical public origin. It lives in operator-site.ts, a module that
+// imports nothing, so that a tool with no build step applies this very rule.
+export { parsePublicUrl };
 
 /**
  * The canonical public origin, or `undefined` when none is configured.
@@ -64,7 +36,7 @@ export function publicOrigin(): string | undefined {
     // same value), so if it ever fires the pinning has silently fallen back to
     // the proxy headers — the one thing the variable exists to prevent. Say so.
     logger.error(
-      { event: "public_url_unreadable", error: err instanceof Error ? err.message : String(err) },
+      { event: "public_url_unreadable", ...errorFields(err) },
       "SKRUN_PUBLIC_URL is unreadable at request time; falling back to the proxy headers",
     );
     return undefined;

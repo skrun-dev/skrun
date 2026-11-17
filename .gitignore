@@ -185,3 +185,9 @@ specs/_meta/JOURNAL-worktree.md
 # private directory is named in a file that syncs to the public mirror.
 # Excluded from biome the same way (biome.json does not read this file).
 **/.obsidian/
+
+# Python bytecode. Running an agent's Python script locally (a demo's tool, a
+# probe) writes __pycache__/ next to it; one was committed by accident with a
+# demo agent's script on 2026-10-01.
+__pycache__/
+*.pyc

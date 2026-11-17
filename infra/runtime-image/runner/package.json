@@ -3,22 +3,44 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "In-machine RPC server bundled inside the skrun-runtime Docker image. Standalone (NOT a pnpm workspace member) — see infra/runtime-image/runner/README.md for rationale. The @skrun-dev/runtime dependency is injected as a tarball at Docker build time via the RUNTIME_TGZ build arg (produced by the GHCR workflow via `pnpm --filter @skrun-dev/runtime pack`).",
+  "description": "In-machine RPC server of the skrun-runtime image. Not a pnpm workspace member: the image installs it with npm ci from package-lock.json, which pins every package to the version pnpm-lock.yaml resolved. The dependencies listed here are the runner's own plus the production dependencies of @skrun-dev/schema and @skrun-dev/runtime, whose tarballs the image extracts into node_modules at build time. Regenerate the lock with infra/runtime-image/update-locks.sh.",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@hono/node-server": "^2.0.1",
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "hono": "^4.12.18",
-    "zod": "^4.4.1"
+    "@anthropic-ai/sdk": "0.92.0",
+    "@google/generative-ai": "0.24.1",
+    "@hono/node-server": "2.1.6",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "ajv": "8.20.0",
+    "hono": "4.13.16",
+    "openai": "6.35.0",
+    "pino": "10.3.1",
+    "tar-stream": "3.2.0",
+    "undici": "8.12.3",
+    "yaml": "2.8.3",
+    "zod": "4.6.7"
   },
   "devDependencies": {
-    "@types/node": "^25.6.0",
-    "typescript": "^6.0.3"
+    "@types/node": "25.6.0",
+    "typescript": "6.0.3"
+  },
+  "overrides": {
+    "@hono/node-server@<2.1.6": "^2.1.6",
+    "body-parser@<2.4.0": "^2.4.0",
+    "fast-uri": "^3.1.9",
+    "fast-xml-parser": "^5.12.0",
+    "hono@<4.13.16": "^4.13.16",
+    "ip-address": "^10.7.4",
+    "nanoid@>=5.0.0 <6.0.0": "^5.1.16",
+    "proxy-addr": "^2.0.8",
+    "qs": "^6.16.1",
+    "source-map-js": "^1.2.2",
+    "undici@<7.30.1": "^7.30.1",
+    "ws": "^8.20.1"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.19.0"
   }
 }

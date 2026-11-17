@@ -1,24 +1,29 @@
 /**
- * Live assertions for two surfaces that are new on the public API and would
+ * Live assertions for surfaces that are new on the public API and would
  * otherwise only ever be exercised by unit tests: the rate-limit headers on the
- * real push and run routes, and the expiry a key can now carry.
+ * real push and run routes, the expiry a key can now carry, and the run route's
+ * request-body cap.
  *
  * Every request here stops before any model call — the push carries a body
  * that is never extracted (the registry stores it as-is), the run pins a
- * version that does not exist — so the phase costs nothing. What it proves is that the limiter sits on the real
+ * version that does not exist, the oversized run is refused on its declared
+ * length — so the phase costs nothing. What it proves is that the limiter sits on the real
  * two-segment routes (where it used to be silently absent: the mount pattern
- * never matched them) and that the key endpoint round-trips an expiry.
+ * never matched them), that the key endpoint round-trips an expiry, and that a
+ * run body over the cap is refused 413 REQUEST_TOO_LARGE by the live server.
  *
  * Each PASS line prints the value it saw, so a green run is a measurement.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REGISTRY, results, skrun, TOKEN } from "./_ctx.js";
+import { pushFixture, REGISTRY, results, skrun, TOKEN } from "./_ctx.js";
 
 const NS = "dev";
 const AGENT = "run-boundary-live";
 const V1 = "9.27.1";
+/** 7 MiB of input: over the run route's body cap, whatever the JSON around it. */
+const OVERSIZED_RUN_BYTES = 7 * 1024 * 1024;
 
 function record(feature: string, passed: boolean, detail: string): void {
   results.push({ agent: "run-boundary", feature, passed, duration: 0, cost: 0, detail });
@@ -31,7 +36,7 @@ async function deleteAgent(): Promise<void> {
   });
 }
 
-function buildAndPush(): string {
+async function buildAndPush(): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), `skrun-live-27-${AGENT}-`));
   writeFileSync(
     join(dir, "SKILL.md"),
@@ -51,7 +56,7 @@ Reply with the literal string "ok".
 version: ${V1}
 model:
   provider: anthropic
-  name: claude-sonnet-4-5
+  name: claude-sonnet-5-5
 inputs:
   - name: task
     type: string
@@ -62,11 +67,7 @@ outputs:
 `,
   );
   skrun(["build"], dir);
-  try {
-    skrun(["push"], dir);
-  } catch {
-    // 409 if the version was already pushed in a prior run — proceed.
-  }
+  await pushFixture(dir);
   return dir;
 }
 
@@ -94,12 +95,11 @@ interface KeyBody {
 
 export async function run(): Promise<void> {
   await deleteAgent();
-  const dir = buildAndPush();
+  const dir = await buildAndPush();
   try {
-    // 1. The push route. The registry stores whatever bytes it is given (it
-    //    does not open the archive at push time, so this even answers 200);
-    //    what is asserted is the limiter's stamp on the response, not the
-    //    handler's verdict.
+    // 1. The push route. These bytes are no bundle, so the handler refuses
+    //    them (400 BUNDLE_CORRUPT); what is asserted is the limiter's stamp on
+    //    the response, not the handler's verdict.
     const push = await fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}/push?version=9.27.2`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/octet-stream" },
@@ -149,6 +149,25 @@ export async function run(): Promise<void> {
         headers: { Authorization: `Bearer ${TOKEN}` },
       });
     }
+
+    // 4. The run route's body cap. A 7 MB body — over the cap of about 6.33 MB
+    //    that bounds a request's inline files — is refused on its declared
+    //    length, before the handler reads it, so before any model.
+    const oversized = JSON.stringify({ input: { task: "x".repeat(OVERSIZED_RUN_BYTES) } });
+    const tooLarge = await fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}/run`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+      body: oversized,
+    });
+    const refusal = (await tooLarge.json().catch(() => ({}))) as {
+      error?: { code?: string };
+    };
+    const refusedCode = refusal.error?.code ?? "none";
+    record(
+      "a run body over the cap is refused 413 REQUEST_TOO_LARGE",
+      tooLarge.status === 413 && refusedCode === "REQUEST_TOO_LARGE",
+      `status=${tooLarge.status} code=${refusedCode} sent=${Buffer.byteLength(oversized)} bytes`,
+    );
   } finally {
     await deleteAgent();
     rmSync(dir, { recursive: true, force: true });

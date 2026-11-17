@@ -28,7 +28,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REGISTRY, results, skrun, TOKEN } from "./_ctx.js";
+import { pushFixture, REGISTRY, results, skrun, TOKEN } from "./_ctx.js";
 
 const NS = "dev";
 const AGENT = "multi-tenant-reads-live";
@@ -41,7 +41,7 @@ async function deleteAgent(): Promise<void> {
   });
 }
 
-function buildAndPush(): string {
+async function buildAndPush(): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), `skrun-live-17-${V1}-`));
   writeFileSync(
     join(dir, "SKILL.md"),
@@ -61,7 +61,7 @@ Reply with the literal string "ok".
 version: ${V1}
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
 inputs:
   - name: task
     type: string
@@ -72,11 +72,7 @@ outputs:
 `,
   );
   skrun(["build"], dir);
-  try {
-    skrun(["push"], dir);
-  } catch {
-    // 409 if the version was already pushed in a prior run — proceed.
-  }
+  await pushFixture(dir);
   return dir;
 }
 
@@ -93,7 +89,7 @@ export async function run(): Promise<void> {
     const beforeBody = (await beforeRes.json()) as { total?: number; agents?: unknown[] };
     const totalBefore = beforeBody.total ?? 0;
 
-    dir = buildAndPush();
+    dir = await buildAndPush();
 
     const afterRes = await fetch(`${REGISTRY}/api/agents`, {
       headers: { Authorization: `Bearer ${TOKEN}` },

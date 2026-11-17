@@ -1,6 +1,7 @@
 import { createLogger } from "@skrun-dev/runtime";
 import { Ratelimit } from "@upstash/ratelimit";
 import type { Redis } from "@upstash/redis";
+import { errorFields } from "../utils/error-fields.js";
 import type { RateLimiterAdapter, RateLimitResult } from "./adapter.js";
 import { MemoryRateLimiter } from "./memory.js";
 
@@ -52,7 +53,7 @@ export class RedisRateLimiter implements RateLimiterAdapter {
       };
     } catch (err) {
       logger.error(
-        { event: "ratelimit_redis_error", error: err instanceof Error ? err.message : String(err) },
+        { event: "ratelimit_redis_error", ...errorFields(err) },
         "Redis rate-limiter unreachable — falling back to in-memory (per-instance) for this request",
       );
       return this.fallback.check(key);

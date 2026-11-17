@@ -19,7 +19,7 @@ This agent gives you a real PDF. Title page, opening narrative with the headline
 - One LLM API key (Google Gemini works on the free tier)
 - **Python 3.11+** locally
 
-That's it. The agent's `requirements.txt` (pandas + matplotlib + reportlab) is resolved automatically by the Skrun runtime on first call and cached at `~/.skrun/deps/<hash>/` for subsequent runs. Cold-install takes ~30s; warm cache is instant.
+That's it. The agent's `requirements.txt` (pandas + matplotlib + reportlab) is resolved automatically by the local registry on its first call and cached on this machine, at `~/.skrun/deps/<hash>/`, for subsequent runs. Cold-install takes ~30s; warm cache is instant.
 
 > Bumped to **v0.2.0** (was v0.1.0 with a manual `pip install -r requirements.txt`).
 
@@ -31,7 +31,7 @@ From the repo root:
 # 1. Push the agent to your local registry
 cd agents/csv-to-executive-report
 skrun build && skrun push
-skrun verify dev/csv-to-executive-report@0.2.0   # admin step; dev-token = auto-admin
+skrun verify dev/csv-to-executive-report@0.3.1   # admin step; dev-token = auto-admin
 
 # 2. Call it (quick-try with the bundled 50-row revenue CSV)
 curl -X POST http://localhost:4000/api/agents/dev/csv-to-executive-report/run \

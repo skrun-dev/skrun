@@ -1,6 +1,6 @@
 {
   "name": "@skrun-dev/schema",
-  "version": "1.2.1",
+  "version": "2.0.0",
   "type": "module",
   "exports": {
     ".": {
@@ -14,7 +14,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "tsc --watch"
@@ -22,13 +22,13 @@
   "dependencies": {
     "tar-stream": "3.2.0",
     "yaml": "^2.8.3",
-    "zod": "^4.4.1"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
     "@types/tar-stream": "3.1.4",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   },
   "publishConfig": {
     "access": "public"

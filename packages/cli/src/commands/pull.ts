@@ -1,26 +1,55 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
-import { isUnsafeName, unpackAgentTar } from "@skrun-dev/schema";
+import {
+  BundleDecompressedTooLargeError,
+  decompressedCapText,
+  isUnsafeName,
+  maxDecompressedBytes,
+  type UnpackedAgentEntry,
+  unpackAgentTar,
+} from "@skrun-dev/schema";
 import type { Command } from "commander";
-import { getRegistryUrl, getToken } from "../utils/auth.js";
+import { exitWith } from "../utils/exit.js";
 import * as format from "../utils/format.js";
-import { RegistryClient } from "../utils/registry-client.js";
-
-// Cap decompressed bundle size (gzip-bomb defense), matching the server default.
-const MAX_DECOMPRESSED_BYTES = 50 * 1024 * 1024;
+import { connect } from "../utils/registry-client.js";
 
 /**
- * Extract a .agent bundle (tar.gz) into `outputDir`, writing raw bytes so binary
- * assets survive. Unlike the API reader (which SKIPS bad entries for hot-path
- * resilience), the CLI THROWS on any unsafe entry — a pulled bundle containing
- * path-traversal names or symlinks is a hard error the user should see. Returns
- * the number of files written.
+ * The most `skrun pull` unpacks a bundle to (gzip-bomb defense), in bytes:
+ * `BUNDLE_MAX_DECOMPRESSED_MB` from the user's environment, read as the server
+ * reads its own (`maxDecompressedBytes`, `@skrun-dev/schema`) — unset, the
+ * server's default; malformed, it throws, naming the variable.
  */
-export async function extractBundle(gzBuffer: Buffer, outputDir: string): Promise<number> {
-  const entries = await unpackAgentTar(gzBuffer, { maxBytes: MAX_DECOMPRESSED_BYTES });
-  const root = resolve(outputDir);
-  let fileCount = 0;
+export function pullMaxDecompressedBytes(): number {
+  return maxDecompressedBytes(process.env.BUNDLE_MAX_DECOMPRESSED_MB);
+}
 
+/**
+ * Read a pulled .agent bundle (tar.gz) and check every entry, writing nothing.
+ * Unlike the API reader (which SKIPS bad entries for hot-path resilience), the
+ * CLI THROWS on any unsafe entry — a pulled bundle containing path-traversal
+ * names or symlinks is a hard error the user should see. A bundle past the
+ * decompression cap — `maxBytes`, by default the user's
+ * `BUNDLE_MAX_DECOMPRESSED_MB` — is refused, the variable that raises it named;
+ * so is one an entry of which cannot be written out — two entries that
+ * contradict each other, a name too long —, by the codec, its message naming
+ * the entry (`BundleEntryError`), as the push refuses it.
+ */
+export async function readPulledBundle(
+  gzBuffer: Buffer,
+  maxBytes: number = pullMaxDecompressedBytes(),
+): Promise<UnpackedAgentEntry[]> {
+  let entries: UnpackedAgentEntry[];
+  try {
+    entries = await unpackAgentTar(gzBuffer, { maxBytes });
+  } catch (err) {
+    if (err instanceof BundleDecompressedTooLargeError) {
+      // Rounded down, as the server says it: what is said stays true.
+      throw new Error(
+        `The bundle decompresses to more than ${decompressedCapText(maxBytes)}, the most skrun pull unpacks. Set BUNDLE_MAX_DECOMPRESSED_MB to a larger number of MB to pull it.`,
+      );
+    }
+    throw err;
+  }
   for (const entry of entries) {
     if (entry.type === "symlink" || entry.type === "link") {
       throw new Error(`Refusing to extract link entry from bundle: ${entry.name}`);
@@ -28,19 +57,54 @@ export async function extractBundle(gzBuffer: Buffer, outputDir: string): Promis
     if (isUnsafeName(entry.name, entry.linkname)) {
       throw new Error(`Path traversal detected in bundle: ${entry.name}`);
     }
-    const filePath = resolve(outputDir, entry.name);
-    if (!filePath.startsWith(root + sep) && filePath !== root) {
-      throw new Error(`Path traversal detected in bundle: ${entry.name}`);
+  }
+  return entries;
+}
+
+/**
+ * Write a pulled bundle's entries into `outputDir`, raw bytes so binary assets
+ * survive: each path is checked to stay inside it before the first write, and
+ * the directory is made only then. A directory entry — the standard `tar`
+ * writes one for each directory it packs — makes its directory. Returns the
+ * number of files written.
+ */
+export function writePulledBundle(entries: UnpackedAgentEntry[], outputDir: string): number {
+  const root = resolve(outputDir);
+  const placed = entries.map((entry) => {
+    const path = resolve(outputDir, entry.name);
+    const inside = path.startsWith(root + sep) || (entry.type === "directory" && path === root);
+    if (!inside) throw new Error(`Path traversal detected in bundle: ${entry.name}`);
+    return { entry, path };
+  });
+
+  mkdirSync(root, { recursive: true });
+  let fileCount = 0;
+  for (const { entry, path } of placed) {
+    if (entry.type === "directory") {
+      mkdirSync(path, { recursive: true });
+      continue;
     }
-    const fileDir = dirname(filePath);
+    const fileDir = dirname(path);
     if (!existsSync(fileDir)) {
       mkdirSync(fileDir, { recursive: true });
     }
-    writeFileSync(filePath, entry.content);
+    writeFileSync(path, entry.content);
     fileCount++;
   }
-
   return fileCount;
+}
+
+/**
+ * Extract a pulled .agent bundle into `outputDir`: read and checked whole
+ * (`readPulledBundle`), then written (`writePulledBundle`) — a refused bundle
+ * writes nothing, not even the directory. Returns the number of files written.
+ */
+export async function extractBundle(
+  gzBuffer: Buffer,
+  outputDir: string,
+  maxBytes: number = pullMaxDecompressedBytes(),
+): Promise<number> {
+  return writePulledBundle(await readPulledBundle(gzBuffer, maxBytes), outputDir);
 }
 
 /**
@@ -74,30 +138,47 @@ export function registerPullCommand(program: Command): void {
     .command("pull <agent>")
     .description("Pull agent from the Skrun registry")
     .action(async (agentRef: string) => {
-      // Check auth
-      const token = getToken();
-      if (!token) {
-        format.error("Not logged in. Run `skrun login` first.");
-        process.exit(1);
-      }
+      // The server this pull comes from, and its session
+      const client = connect();
 
       // Parse agent ref: namespace/name or namespace/name@version
       const [fullName, version] = agentRef.split("@");
       const parts = fullName.split("/");
       if (parts.length !== 2) {
         format.error('Invalid agent name. Use format: namespace/name (e.g., "acme/seo-audit")');
-        process.exit(1);
+        exitWith(1);
       }
       const [namespace, name] = parts;
 
+      // The cap this pull unpacks under, read before anything is downloaded:
+      // a malformed value stops it, the variable named.
+      let maxBytes: number;
+      try {
+        maxBytes = pullMaxDecompressedBytes();
+      } catch (err) {
+        format.error(err instanceof Error ? err.message : String(err));
+        exitWith(1);
+      }
+
       // Pull
-      const client = new RegistryClient(getRegistryUrl(), token);
       let bundle: Buffer;
       try {
         bundle = await client.pull(namespace, name, version);
       } catch (err) {
         format.error(formatPullErrorMessage(err, `${namespace}/${name}`));
-        process.exit(1);
+        exitWith(1);
+      }
+
+      // Read and check the archive before anything is written: a refused pull
+      // leaves no directory behind.
+      let entries: UnpackedAgentEntry[];
+      try {
+        entries = await readPulledBundle(bundle, maxBytes);
+      } catch (err) {
+        format.error(
+          `Failed to extract bundle: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        exitWith(1);
       }
 
       // Extract
@@ -105,10 +186,9 @@ export function registerPullCommand(program: Command): void {
       if (existsSync(outputDir)) {
         format.warn(`Directory ${name}/ already exists. Overwriting.`);
       }
-      mkdirSync(outputDir, { recursive: true });
 
       try {
-        const fileCount = await extractBundle(bundle, outputDir);
+        const fileCount = writePulledBundle(entries, outputDir);
         format.success(
           `Pulled ${namespace}/${name}${version ? `@${version}` : ""} → ./${name}/ (${fileCount} files)`,
         );
@@ -116,7 +196,7 @@ export function registerPullCommand(program: Command): void {
         format.error(
           `Failed to extract bundle: ${err instanceof Error ? err.message : String(err)}`,
         );
-        process.exit(1);
+        exitWith(1);
       }
     });
 }

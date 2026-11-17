@@ -138,4 +138,118 @@ describe("TTLCache", () => {
     expect(cache.get("young")).toBe(2);
     expect(cache.sweep()).toBe(0);
   });
+
+  // ── Opt-in: a byte budget, besides the count ──
+  describe("a budget in bytes", () => {
+    /** A cache whose values weigh their own number, under `maxBytes`. */
+    function budgeted(maxBytes: number, maxEntries = 10, onEvict = vi.fn()) {
+      const sizeOf = vi.fn((value: number) => value);
+      const cache = new TTLCache<string, number>({
+        ttlMs: 100,
+        maxEntries,
+        onEvict,
+        budget: { maxBytes, sizeOf },
+      });
+      return { cache, onEvict, sizeOf };
+    }
+
+    it("without one, nothing is weighed, and every value is kept", () => {
+      const cache = new TTLCache<string, number>({ ttlMs: 60_000, maxEntries: 10 });
+      expect(cache.set("a", 1_000_000)).toBe(true);
+      expect(cache.bytes).toBe(0);
+    });
+
+    it("weighs each value once, when it is set, and counts what they weigh together", () => {
+      const { cache, sizeOf } = budgeted(100);
+      cache.set("a", 30);
+      cache.set("b", 40);
+      cache.get("a");
+      expect(cache.bytes).toBe(70);
+      expect(sizeOf).toHaveBeenCalledTimes(2);
+    });
+
+    it("a value that would go past it pushes the least recently used out first, until it fits, each through onEvict", () => {
+      const { cache, onEvict } = budgeted(100);
+      cache.set("a", 30);
+      cache.set("b", 30);
+      cache.set("c", 30);
+      cache.get("a"); // "b" is now the least recently used, then "c"
+
+      expect(cache.set("d", 60)).toBe(true);
+      expect(onEvict.mock.calls).toEqual([
+        ["b", 30],
+        ["c", 30],
+      ]);
+      expect(cache.get("a")).toBe(30);
+      expect(cache.get("d")).toBe(60);
+      expect(cache.size).toBe(2);
+      expect(cache.bytes).toBe(90);
+    });
+
+    it("a value exactly at what is left is kept, nothing evicted", () => {
+      const { cache, onEvict } = budgeted(100);
+      cache.set("a", 40);
+      expect(cache.set("b", 60)).toBe(true);
+      expect(onEvict).not.toHaveBeenCalled();
+      expect(cache.bytes).toBe(100);
+    });
+
+    it("a value heavier than the whole budget is not kept, and evicts nothing", () => {
+      const { cache, onEvict } = budgeted(100);
+      cache.set("a", 50);
+      expect(cache.set("huge", 101)).toBe(false);
+      expect(cache.get("huge")).toBeUndefined();
+      expect(cache.get("a")).toBe(50);
+      expect(onEvict).not.toHaveBeenCalled();
+      expect(cache.bytes).toBe(50);
+    });
+
+    it("a value of the whole budget is kept, alone", () => {
+      const { cache } = budgeted(100);
+      cache.set("a", 50);
+      expect(cache.set("all", 100)).toBe(true);
+      expect(cache.size).toBe(1);
+      expect(cache.bytes).toBe(100);
+    });
+
+    it("the count still bounds it", () => {
+      const { cache, onEvict } = budgeted(1_000, 2);
+      cache.set("a", 1);
+      cache.set("b", 1);
+      cache.set("c", 1);
+      expect(onEvict).toHaveBeenCalledWith("a", 1);
+      expect(cache.size).toBe(2);
+      expect(cache.bytes).toBe(2);
+    });
+
+    it("every way out gives the weight back: a delete, an expiry found by a read or a sweep, a key set again, a clear", () => {
+      const { cache } = budgeted(1_000);
+      cache.set("deleted", 1);
+      cache.set("read", 10);
+      cache.set("swept", 100);
+      cache.delete("deleted");
+      expect(cache.bytes).toBe(110);
+
+      vi.advanceTimersByTime(150);
+      expect(cache.get("read")).toBeUndefined();
+      expect(cache.bytes).toBe(100);
+      expect(cache.sweep()).toBe(1);
+      expect(cache.bytes).toBe(0);
+
+      cache.set("k", 200);
+      cache.set("k", 300);
+      expect(cache.bytes).toBe(300);
+      cache.clear();
+      expect(cache.bytes).toBe(0);
+    });
+
+    it("a key set again with a value too heavy loses its old value too", () => {
+      const { cache, onEvict } = budgeted(100);
+      cache.set("k", 50);
+      expect(cache.set("k", 101)).toBe(false);
+      expect(onEvict).toHaveBeenCalledWith("k", 50);
+      expect(cache.get("k")).toBeUndefined();
+      expect(cache.bytes).toBe(0);
+    });
+  });
 });

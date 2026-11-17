@@ -1,9 +1,24 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { serve } from "@hono/node-server";
-import { authorizeRunnerRequest, type InitResult } from "@skrun-dev/runtime/runner";
+import {
+  authorizeRunnerRequest,
+  ClaimRequestSchema,
+  type ClaimResult,
+  CollectRequestSchema,
+  errorFields,
+  type HealthzResult,
+  INFRA_HOSTS_CHECKS,
+  type InfraHostsCheck,
+  InitRequestSchema,
+  type InitResult,
+  initErrorBody,
+  ToolRequestSchema,
+  truncateToolResult,
+} from "@skrun-dev/runtime/runner";
 import { Hono } from "hono";
-import { z } from "zod";
 import {
   collectOutputs,
   dispatchTool,
@@ -27,11 +42,20 @@ const MODULE_LOAD_MS = Math.round(performance.now());
 // Boot probes — always to STDERR: stdout is line-buffered and gets dropped when
 // the process dies within milliseconds in Fly's log-forwarder context. Same
 // pattern as runner-start.sh + entrypoint.sh (surfaced 2026-05-25).
-process.stderr.write(`[skrun-runner] boot: node ${process.version} uid=${process.getuid?.()}\n`);
+//
+// `image=` names the build this process runs from, so a machine's log says which
+// image it booted — not only which one it was created with. The value is set when
+// the image is built (Dockerfile, last lines of each target); a build that did not
+// set it prints `unknown`, never an empty field.
+const IMAGE_VERSION = process.env.SKRUN_IMAGE_VERSION?.trim() || "unknown";
+process.stderr.write(
+  `[skrun-runner] boot: node ${process.version} uid=${process.getuid?.()} image=${IMAGE_VERSION}\n`,
+);
 process.stderr.write(`[skrun-runner] boot: modules loaded in ${MODULE_LOAD_MS}ms\n`);
 
 // By design the sandbox has zero LLM/DB/Skrun-API credentials in env. The
-// only envs read here are infrastructure (port + graceful shutdown timing).
+// only envs read here are infrastructure (port + graceful shutdown timing) and
+// the image's build name above.
 const PORT = Number.parseInt(process.env.RUNNER_PORT ?? "9000", 10);
 
 /**
@@ -56,11 +80,7 @@ const CLAIM_EGRESS_TIMEOUT_MS = 15_000;
  * All best-effort — a read/parse failure leaves the field undefined and the
  * harness degrades (never throws).
  */
-const bootInfo: {
-  vm_boot_ms?: number;
-  entrypoint_egress_ms?: number;
-  module_load_ms?: number;
-} = { module_load_ms: MODULE_LOAD_MS };
+const bootInfo: NonNullable<InitResult["boot"]> = { module_load_ms: MODULE_LOAD_MS };
 
 /** Seconds since this machine booted, in ms; undefined where /proc is unavailable. */
 function readUptimeMs(): number | undefined {
@@ -93,32 +113,63 @@ function captureBootInfo(): void {
   }
 }
 
-const ToolConfigSchema = z.looseObject({ name: z.string() });
-const McpServerSchema = z.looseObject({ name: z.string() });
+/**
+ * Where the privileged loop writes, once a pre-created machine's assignment is
+ * answered, what it measured of the infrastructure hosts the boot opened: one of
+ * the contract's words (dns-reresolve.sh). In /run, a directory only root writes
+ * in: this process reads the word, never writes it.
+ */
+const INFRA_CHECK_FILE = "/run/skrun-infra-check";
 
-const InitBodySchema = z.object({
-  bundleUrl: z.string().url(),
-  outputsPutUrl: z.string().url().optional(),
-  tools: z.array(ToolConfigSchema).default([]),
-  mcpServers: z.array(McpServerSchema).default([]),
-  allowedHosts: z.array(z.string()).default([]),
-  // Hex sha256 the downloaded bundle must match before anything is extracted.
-  // Optional on purpose: a bundle published before checksums were recorded has
-  // none, and this image is versioned separately from the harness, so a newer
-  // harness will be talking to an older image during a rollout. This schema
-  // ignores fields it does not know, which is what makes that direction safe —
-  // requiring the field would make the reverse direction fatal instead.
-  bundleSha256: z
-    .string()
-    .regex(/^[0-9a-f]{64}$/)
-    .optional(),
-});
+/**
+ * How long a failed /init waits for that word, read again every
+ * INFRA_CHECK_POLL_MS. A failure can come within milliseconds of the assignment
+ * — a refused connection, a refusing store —, while the measurement, which
+ * resolves every infrastructure host on both families, may still be waiting on a
+ * slow nameserver: without the wait, that failure would be reported unmeasured.
+ * A download from an address the boot opened no rule for is not one of them:
+ * the default-DROP egress does not refuse its connection, it leaves it
+ * unanswered until the download's own connect timeout, by when the word is
+ * written. A successful /init never waits.
+ */
+const INFRA_CHECK_ERROR_WAIT_MS = 2_000;
+const INFRA_CHECK_POLL_MS = 100;
 
-const ToolBodySchema = z.object({
-  kind: z.enum(["script", "mcp"]),
-  name: z.string(),
-  args: z.record(z.string(), z.unknown()).default({}),
-});
+/** The word written, or nothing while it is not — or is not one of the contract's. */
+async function readInfraCheck(): Promise<InfraHostsCheck | undefined> {
+  try {
+    const word = (await readFile(INFRA_CHECK_FILE, "utf8")).trim();
+    return INFRA_HOSTS_CHECKS.find((known) => known === word);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What /init reports of the infrastructure check: on a pre-created machine, the
+ * word — waited for up to `waitMs`, `unmeasured` while it is not written —;
+ * nothing on a machine created for its run, which opens its hosts at its run and
+ * measures nothing, so has nothing to wait for either.
+ */
+async function infraHostsCheck(waitMs: number): Promise<InfraHostsCheck | undefined> {
+  if (!isPoolMode()) return undefined;
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const word = await readInfraCheck();
+    if (word !== undefined) return word;
+    const left = deadline - Date.now();
+    if (left <= 0) return "unmeasured";
+    await sleep(Math.min(INFRA_CHECK_POLL_MS, left));
+  }
+}
+
+// The bodies of /claim, /init and /tool, and the answers to the first two and
+// to /healthz, are the contract this image shares with the harness
+// (`@skrun-dev/runtime/runner`), never declared here: the two deploy separately,
+// and a copy would drift in silence. That contract ignores a field it does not
+// know — a newer harness talks to an older image during a rollout — and keeps a
+// field added later optional, the checksum of the bundle among them: requiring
+// one would make the reverse direction fatal instead.
 
 // Boot interlock: a machine that waits to be assigned must hold the credential
 // that gates being assigned. Without it this process would hold NEITHER
@@ -158,9 +209,10 @@ app.use("*", async (c, next) => {
     runToken: process.env.RUNNER_RPC_TOKEN,
   });
   if (!decision.allowed) {
-    // A machine that is already assigned answers 409, not 401: the caller has to
-    // tell "your credential is wrong" from "someone else got here first", because
-    // only the second means discard this machine and take another. The decision is
+    // A machine that is already assigned answers 409, not 401: "someone else got
+    // here first" is told apart from "your credential is wrong". Either way the
+    // harness discards this machine, never retries it, and the run takes no
+    // other pooled machine: it starts on a machine of its own. The decision is
     // made in the authorisation step because it runs before any handler could.
     if (decision.denial === "already-claimed") {
       return c.json({ error: "already claimed" }, 409);
@@ -190,16 +242,13 @@ app.use("*", async (c, next) => {
  */
 const PROCESS_ID = randomBytes(8).toString("hex");
 
-app.get("/healthz", (c) => c.json({ ok: true, process_id: PROCESS_ID }));
-
-const ClaimBodySchema = z.object({
-  rpcToken: z.string().min(32),
-  allowedHosts: z.array(z.string()).default([]),
-});
+app.get("/healthz", (c) => c.json({ ok: true, process_id: PROCESS_ID } satisfies HealthzResult));
 
 /**
  * Assign this pre-created machine to a run: install its egress rules, then its
- * per-run credential.
+ * per-run credential. The machine's lifetime, when the assignment carries one,
+ * travels with the egress rules to the privileged helper, which arms it: from
+ * there, the machine ends at its lifetime whatever becomes of this process.
  *
  * The order below is the security property, not a style choice:
  *
@@ -222,16 +271,20 @@ app.post("/claim", async (c) => {
   assigned = true;
 
   const raw = await c.req.json().catch(() => null);
-  const parsed = ClaimBodySchema.safeParse(raw);
+  const parsed = ClaimRequestSchema.safeParse(raw);
   if (!parsed.success) {
     return c.json({ error: "invalid /claim body", details: parsed.error.issues }, 400);
   }
 
   try {
-    await applyEgress(parsed.data.allowedHosts, CLAIM_EGRESS_TIMEOUT_MS);
+    await applyEgress(parsed.data.allowedHosts, parsed.data.lifetimeS, CLAIM_EGRESS_TIMEOUT_MS);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`[skrun-runner] claim failed — egress not confirmed: ${message}\n`);
+    // The log line says a fixed text and the error's class and code, never its
+    // message; the harness still gets the message in the response body.
+    process.stderr.write(
+      `[skrun-runner] claim failed — egress not confirmed: ${JSON.stringify(errorFields(err))}\n`,
+    );
     // No run credential is installed. The machine stays latched and unusable.
     return c.json({ error: "egress setup failed", message }, 500);
   }
@@ -257,60 +310,79 @@ app.post("/claim", async (c) => {
   // `process_id` is what tells a genuine wake from a silent cold boot: unchanged
   // since readiness means this is the same process the machine was paused with.
   // `uptime_ms` stays for the operator record — it is a running time, not an age.
-  return c.json({ ok: true, uptime_ms: uptimeMs, process_id: PROCESS_ID });
+  return c.json({ ok: true, uptime_ms: uptimeMs, process_id: PROCESS_ID } satisfies ClaimResult);
 });
 
 app.post("/init", async (c) => {
   const raw = await c.req.json().catch(() => null);
-  const parsed = InitBodySchema.safeParse(raw);
+  const parsed = InitRequestSchema.safeParse(raw);
   if (!parsed.success) {
     return c.json({ error: "invalid /init body", details: parsed.error.issues }, 400);
   }
   try {
-    const result = await initRunner({
-      bundleUrl: parsed.data.bundleUrl,
-      outputsPutUrl: parsed.data.outputsPutUrl,
-      // biome-ignore lint/suspicious/noExplicitAny: zod-validated loose objects relayed to runtime providers
-      tools: parsed.data.tools as any,
-      // biome-ignore lint/suspicious/noExplicitAny: zod-validated loose objects relayed to runtime providers
-      mcpServers: parsed.data.mcpServers as any,
-      allowedHosts: parsed.data.allowedHosts,
-      bundleSha256: parsed.data.bundleSha256,
-    });
+    const result = await initRunner(parsed.data);
     // Typed against the shared runtime contract so the runner and the harness
     // cannot drift on the /init response shape. `boot` carries the cold-start
-    // clock captured at listen-time; `phases` the in-VM /init timings.
+    // clock captured at listen-time; `phases` the in-VM /init timings;
+    // `infra_hosts` the infrastructure check, read once, never waited for.
     const response: InitResult = {
       ok: true,
       tools: result.tools,
       phases: result.phases,
       boot: bootInfo,
+      infra_hosts: await infraHostsCheck(0),
     };
     return c.json(response);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return c.json({ error: "init failed", message }, 500);
+    // The body the contract shared with the harness writes: the step that
+    // failed, read from the error's class — and, for an MCP server, what that
+    // server answered —, and the message cut to its bound, so that a long one
+    // leaves the rest within what the harness reads of an error. The message
+    // never reaches the run's caller: the harness tells a failed start in fixed
+    // words of its own. The infrastructure check is waited for, within its
+    // bound: a failure can come before the measurement is written.
+    return c.json(initErrorBody(err, await infraHostsCheck(INFRA_CHECK_ERROR_WAIT_MS)), 500);
   }
 });
 
 app.post("/tool", async (c) => {
   const raw = await c.req.json().catch(() => null);
-  const parsed = ToolBodySchema.safeParse(raw);
+  const parsed = ToolRequestSchema.safeParse(raw);
   if (!parsed.success) {
     return c.json({ error: "invalid /tool body", details: parsed.error.issues }, 400);
   }
+  // Both answers — a result, and an error turned into one — are cut to fit the
+  // bound on a tool's answer, with a marker the model reads: a script or a
+  // server can return far more than the harness takes.
   try {
     const result = await dispatchTool(parsed.data.kind, parsed.data.name, parsed.data.args);
-    return c.json(result);
+    return c.json(truncateToolResult(result));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return c.json({ content: message, isError: true });
+    return c.json(truncateToolResult({ content: message, isError: true }));
   }
 });
 
+/**
+ * List the run's output files, within the limits the harness sends — the
+ * defaults when it sends none (an empty body), and a refusal when they are not
+ * whole numbers within their bounds, or not JSON. The refusal does not repeat
+ * what was sent. The answer counts what was left out, by reason.
+ */
 app.post("/outputs/collect", async (c) => {
+  let raw: unknown;
   try {
-    const result = await collectOutputs();
+    const text = await c.req.text();
+    raw = text.trim() === "" ? undefined : JSON.parse(text);
+  } catch {
+    return c.json({ error: "invalid /outputs/collect body" }, 400);
+  }
+  const parsed = CollectRequestSchema.safeParse(raw);
+  if (!parsed.success) {
+    return c.json({ error: "invalid /outputs/collect body" }, 400);
+  }
+  try {
+    const result = await collectOutputs(parsed.data);
     return c.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -321,8 +393,12 @@ app.post("/outputs/collect", async (c) => {
 // GET /outputs/file?path=<relative-path>
 // Streams a single output file back to the harness so it can sync-upload
 // to R2. Path is resolved under /mnt/session/outputs and rejected if it
-// escapes (defense-in-depth — the manifest path is already filesystem-walked,
-// but we re-validate because it round-trips through HTTP).
+// escapes, or if a link stands anywhere on it — the outputs directory, a
+// directory on the way, the file itself —, as the walk follows none
+// (defense-in-depth — the manifest path is already filesystem-walked, but we
+// re-validate because it round-trips through HTTP). A file past the
+// size limit of the last list is refused with 413, an empty one is served as
+// nothing, and Content-Length is the length served.
 app.get("/outputs/file", async (c) => {
   const path = c.req.query("path");
   if (!path) {
@@ -330,10 +406,18 @@ app.get("/outputs/file", async (c) => {
   }
   try {
     const opened = await openOutputFile(path);
-    // biome-ignore lint/suspicious/noExplicitAny: Hono body() accepts a Node Readable but the TS type is the web ReadableStream
-    return c.body(opened.stream as any, 200, {
+    if (opened.kind === "too_large") {
+      return c.json(
+        { error: "file larger than the size limit", max_size_bytes: opened.maxBytes },
+        413,
+      );
+    }
+    if (opened.kind === "empty") {
+      return c.body(null, 200, { "Content-Type": opened.mimeType, "Content-Length": "0" });
+    }
+    return c.body(opened.body, 200, {
       "Content-Type": opened.mimeType,
-      "Content-Length": String(opened.size),
+      "Content-Length": String(opened.length),
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -350,7 +434,7 @@ const server = serve({ fetch: app.fetch, port: PORT }, (info) => {
 async function gracefulShutdown(signal: string): Promise<void> {
   console.log(`[skrun-runner] received ${signal} — shutting down`);
   await shutdownRunner().catch((err) => {
-    console.error("[skrun-runner] shutdown error:", err);
+    console.error(`[skrun-runner] shutdown error: ${JSON.stringify(errorFields(err))}`);
   });
   server.close(() => process.exit(0));
   // Hard kill after 10s if close() hangs (MCP subprocess didn't exit cleanly).

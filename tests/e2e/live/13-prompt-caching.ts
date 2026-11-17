@@ -3,9 +3,10 @@
  *
  * Two cross-provider scenarios, each independently gated on its API key:
  *
- *   - Anthropic (Sonnet 4.6, threshold 2048 tokens) — exercises explicit
+ *   - Anthropic (Sonnet 4.6, threshold 1024 tokens) — exercises explicit
  *     `cache_control` injection AND extraction. Skipped without ANTHROPIC_API_KEY.
- *   - Gemini Flash (2.5, threshold 1024 tokens) — exercises implicit caching
+ *   - Gemini Flash (3.8; Google sets the implicit-caching minimum per model,
+ *     the filler stays well past a few thousand tokens) — exercises implicit caching
  *     extraction (`usageMetadata.cachedContentTokenCount`) end-to-end. The
  *     adapter doesn't inject anything for Gemini (caching is automatic on
  *     stable prefixes), so this verifies the runtime extraction + gross→net
@@ -23,12 +24,12 @@
  *
  * Cost per provider scenario:
  *   - Anthropic: ~$0.02 (3 calls × ~3000 tokens × $3/M Sonnet)
- *   - Gemini Flash: ~$0.005 (3 calls × ~2000 tokens × $0.15/M Flash)
+ *   - Gemini Flash: ~$0.03 (5 calls × ~7500 tokens × $0.75/M 3.8 Flash)
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { REGISTRY, ROOT, results, skrun, TOKEN, verifyLatestVersion } from "./_ctx.js";
+import { pushFixture, REGISTRY, ROOT, results, skrun, TOKEN, verifyLatestVersion } from "./_ctx.js";
 
 /**
  * Make a stable filler block of approximately N paragraphs of `seed`-tagged
@@ -144,11 +145,7 @@ async function runScenario(cfg: ScenarioConfig): Promise<void> {
 
   try {
     skrun(["build"], dir);
-    try {
-      skrun(["push"], dir);
-    } catch {
-      // already pushed at this version
-    }
+    await pushFixture(dir);
     await verifyLatestVersion("dev", "email-drafter");
 
     const input = {
@@ -235,11 +232,7 @@ async function runScenario(cfg: ScenarioConfig): Promise<void> {
     writeFileSync(skillPath, reSkill, "utf-8");
 
     skrun(["build"], dir);
-    try {
-      skrun(["push"], dir);
-    } catch {
-      // already pushed
-    }
+    await pushFixture(dir);
     await verifyLatestVersion("dev", "email-drafter");
 
     const r3 = await callAgent(input);
@@ -287,7 +280,7 @@ export async function run(): Promise<void> {
     await runScenario({
       provider: "Anthropic Sonnet 4.6",
       modelYaml: "model:\n  provider: anthropic\n  name: claude-sonnet-4-6\n",
-      fillerParagraphs: 12, // ~12_000 chars → ~3000 token estimate > 2048 threshold
+      fillerParagraphs: 12, // ~12_000 chars → ~3000 token estimate > its 1024 threshold
       expectsWriteTokens: true,
       costEstimate: "~$0.02",
       // Anthropic explicit cache_control is deterministic — 1 attempt suffices.
@@ -300,13 +293,13 @@ export async function run(): Promise<void> {
 
   if (process.env.GOOGLE_API_KEY) {
     await runScenario({
-      provider: "Gemini 2.5 Flash",
-      modelYaml: "model:\n  provider: google\n  name: gemini-2.5-flash\n",
-      // 30 paragraphs → ~30_000 chars → ~7500-token estimate. Well above the
-      // documented 1024-token implicit threshold.
+      provider: "Gemini 3.8 Flash",
+      modelYaml: "model:\n  provider: google\n  name: gemini-3.8-flash\n",
+      // 30 paragraphs → ~30_000 chars → ~7500-token estimate: a long prefix,
+      // the kind Gemini's implicit cache keeps.
       fillerParagraphs: 30,
       expectsWriteTokens: false, // Gemini implicit caching has no separate write surcharge
-      costEstimate: "~$0.015",
+      costEstimate: "~$0.03",
       // Gemini implicit caching is best-effort — empirically ~67% hit rate per
       // call. 3 attempts give ~96% confidence the wire-up works when at least
       // one hits. PASS = at least one attempt shows cache_read_tokens > 0.

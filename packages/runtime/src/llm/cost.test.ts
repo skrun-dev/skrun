@@ -1,6 +1,6 @@
 import { MODEL_CAPABILITIES } from "@skrun-dev/schema";
 import { describe, expect, it } from "vitest";
-import { estimateCacheSavings, estimateCost } from "./cost.js";
+import { estimateCacheSavings, estimateCost, PRICING, pricingFor } from "./cost.js";
 
 describe("estimateCost", () => {
   it("uses default pricing for an unknown model", () => {
@@ -13,71 +13,24 @@ describe("estimateCost", () => {
     expect(estimateCost("claude-opus-4-7", 0, 0)).toBe(0);
   });
 
-  // VT-2 — every live model returns a positive number for non-zero tokens.
-  // This catches a regression where a row is added but with malformed values
-  // (e.g. NaN, missing input/output keys).
-  it("every priced model returns a positive number for non-zero tokens", () => {
-    // We can't enumerate PRICING directly (it's not exported), so we test
-    // each row indirectly via a representative call. The list mirrors the
-    // current cost.ts contents.
-    const pricedModels = [
-      "claude-opus-4-7",
-      "claude-opus-4-6",
-      "claude-sonnet-4-6",
-      "claude-haiku-4-5",
-      "claude-opus-4-20250514",
-      "claude-sonnet-4-20250514",
-      "claude-haiku-4-5-20251001",
-      "gpt-5.5-pro",
-      "gpt-5.5",
-      "gpt-5.4-pro",
-      "gpt-5.4-mini",
-      "gpt-5.4-nano",
-      "gpt-5.4",
-      "gpt-audio",
-      "gpt-audio-1.5",
-      "gpt-4o-audio-preview",
-      "gpt-4o",
-      "gpt-4o-mini",
-      "o3-mini",
-      "gemini-3.1-pro-preview",
-      "gemini-3.1-flash-preview",
-      "gemini-3.1-flash-lite-preview",
-      "gemini-3-flash-preview",
-      "gemini-2.5-pro",
-      "gemini-2.5-flash",
-      "mistral-large-3",
-      "mistral-medium-3.5",
-      "mistral-medium-3",
-      "mistral-small-4",
-      "mistral-small-3.1",
-      "ministral-8b",
-      "magistral-medium-1.2",
-      "mistral-large-latest",
-      "mistral-small-latest",
-      "openai/gpt-oss-120b",
-      "openai/gpt-oss-20b",
-      "openai/gpt-oss-safeguard-20b",
-      "gpt-oss-120b",
-      "gpt-oss-20b",
-      "llama-3.3-70b-versatile",
-      "llama-3.1-8b-instant",
-      "grok-4.3",
-      "grok-4.1-fast",
-      "grok-4.20-multi-agent",
-    ];
-    for (const model of pricedModels) {
+  // Every row prices a small call above zero and below a dollar: a row added
+  // with a malformed value (NaN, a missing key, a price per token instead of
+  // per million) fails here.
+  it("every row of the table prices a small call above zero and below a dollar", () => {
+    const models = Object.keys(PRICING);
+    expect(models.length).toBeGreaterThan(0);
+    for (const model of models) {
       const cost = estimateCost(model, 1_000, 500);
       expect(cost, model).toBeGreaterThan(0);
-      expect(cost, model).toBeLessThan(1); // sanity: no row should bill > $1 for tiny test usage
+      expect(cost, model).toBeLessThan(1);
     }
   });
 
-  // Spot-check the bug fix in 2.1 — gpt-5.5-pro was previously $5/$30
-  // (copy-paste of gpt-5.5). Now $30/$180 per audited OpenAI docs.
-  it("gpt-5.5-pro pricing matches OpenAI docs ($30/$180 per 1M)", () => {
-    const cost = estimateCost("gpt-5.5-pro", 1_000_000, 1_000_000);
-    expect(cost).toBeCloseTo(30 + 180, 5);
+  it("every cache read rate of the table is below its row's input rate", () => {
+    for (const [model, pricing] of Object.entries(PRICING)) {
+      if (pricing.inputCachedRead === undefined) continue;
+      expect(pricing.inputCachedRead, model).toBeLessThan(pricing.input);
+    }
   });
 
   // Spot-check the renames against capability.ts: the gemini-3.x preview
@@ -88,20 +41,13 @@ describe("estimateCost", () => {
     expect(cost).toBeCloseTo(2 + 12, 5);
   });
 
-  // Spot-check Groq prefix vs unprefixed parity (back-compat alias).
-  it("openai/gpt-oss-120b and gpt-oss-120b have identical pricing (alias)", () => {
-    const a = estimateCost("openai/gpt-oss-120b", 1_000_000, 1_000_000);
-    const b = estimateCost("gpt-oss-120b", 1_000_000, 1_000_000);
-    expect(a).toBe(b);
-  });
-
-  // RT-1 — legacy snapshot models still estimate (no breakage from the
-  // refresh). Confirms back-compat for agents that hardcoded snapshot IDs.
+  // A dated id of a current model takes its row; a retired dated id that no
+  // row covers takes the default flat rate.
   it.each([
     ["claude-haiku-4-5-20251001", 1, 5],
-    ["claude-opus-4-20250514", 15, 75],
+    ["claude-opus-4-20250514", 3, 15],
     ["claude-sonnet-4-20250514", 3, 15],
-  ] as const)("legacy snapshot %s estimates at $%d/$%d per 1M", (model, expectedIn, expectedOut) => {
+  ] as const)("the dated id %s estimates at $%d/$%d per 1M", (model, expectedIn, expectedOut) => {
     const cost = estimateCost(model, 1_000_000, 1_000_000);
     expect(cost).toBeCloseTo(expectedIn + expectedOut, 5);
   });
@@ -152,27 +98,31 @@ describe("estimateCost", () => {
     expect(cost).toBeCloseTo(0.0006, 6);
   });
 
-  // RT-2 (#68 regression) — when no cacheReadTokens / cacheWriteTokens are
-  // provided, cost computation falls back to the pre-#68 behavior:
-  // promptTokens × input + completionTokens × output. No NaN, no error.
-  it("RT-2: no cache fields → falls back to pre-#68 formula (Mistral)", () => {
-    // Mistral has no caching fields in PRICING (no native API).
-    // Without cache args, behaves identically to before #68.
-    const cost = estimateCost("mistral-large-3", 1_000, 500);
-    // mistral-large-3: input=$2, output=$6
-    // (1000×$2 + 500×$6) / 1M = (2000 + 3000) / 1M = $0.005
-    expect(cost).toBeCloseTo(0.005, 6);
+  // With no cacheReadTokens / cacheWriteTokens, the cost is promptTokens ×
+  // input + completionTokens × output. No NaN, no error.
+  it("no cache fields: the prompt at the input rate, the completion at the output rate", () => {
+    const cost = estimateCost("mistral-large-2512", 1_000, 500);
+    // mistral-large-2512: input=$0.5, output=$1.5
+    // (1000×$0.5 + 500×$1.5) / 1M = (500 + 750) / 1M = $0.00125
+    expect(cost).toBeCloseTo(0.00125, 8);
     expect(Number.isFinite(cost)).toBe(true);
   });
 
-  // RT-2 — cacheReadTokens passed but model has no inputCachedRead rate
-  // (Mistral) → conservatively bills cached portion at FULL input rate.
-  // Never under-bills on missing data.
-  it("RT-2: cacheReadTokens on uncached model bills at full input rate (conservative)", () => {
-    const cost = estimateCost("mistral-large-3", 1_000, 500, 5_000);
-    // (1000×$2 + 5000×$2 (fall-through to input) + 500×$6) / 1M
-    // = (2000 + 10000 + 3000) / 1M = $0.015
-    expect(cost).toBeCloseTo(0.015, 6);
+  // cacheReadTokens passed but the model has no inputCachedRead rate →
+  // the cached portion bills at the FULL input rate. Never under-bills on
+  // missing data.
+  it("cacheReadTokens on a model with no cache rate bill at the full input rate (conservative)", () => {
+    const cost = estimateCost("gpt-audio-1.5", 1_000, 500, 5_000);
+    // (1000×$2.5 + 5000×$2.5 (fall-through to input) + 500×$10) / 1M
+    // = (2500 + 12500 + 5000) / 1M = $0.02
+    expect(cost).toBeCloseTo(0.02, 8);
+  });
+
+  // Mistral bills a cached prefix at a tenth of its input rate.
+  it("Mistral: the cached portion bills at a tenth of the input rate", () => {
+    const cost = estimateCost("mistral-large-2512", 1_000, 500, 5_000);
+    // (1000×$0.5 + 5000×$0.05 + 500×$1.5) / 1M = (500 + 250 + 750) / 1M = $0.0015
+    expect(cost).toBeCloseTo(0.0015, 8);
   });
 
   // RT-2 — undefined cache args + zero cache args yield identical cost.
@@ -198,9 +148,14 @@ describe("estimateCacheSavings", () => {
     expect(estimateCacheSavings("gpt-5.5", 10_000)).toBe(0.045);
   });
 
-  // VT-4 — Mistral has no inputCachedRead → cachedRate = pricing.input → diff = 0.
-  it("VT-4: Mistral large-3 — no inputCachedRead → savings = 0", () => {
-    expect(estimateCacheSavings("mistral-large-3", 10_000)).toBe(0);
+  // A model with no inputCachedRead → cachedRate = pricing.input → diff = 0.
+  it("a model with no cache read rate (gpt-audio-1.5) saves nothing", () => {
+    expect(estimateCacheSavings("gpt-audio-1.5", 10_000)).toBe(0);
+  });
+
+  it("Mistral Large 3 — reads at a tenth of the input rate: 90% saved", () => {
+    // 10k × ($0.5 - $0.05) / 1M = $0.0045
+    expect(estimateCacheSavings("mistral-large-2512", 10_000)).toBe(0.0045);
   });
 
   // VT-4 — unknown model uses DEFAULT_PRICING which has no inputCachedRead.
@@ -220,11 +175,170 @@ describe("estimateCacheSavings", () => {
     expect(estimateCacheSavings("claude-sonnet-4-6", 0)).toBe(0);
   });
 
-  // Edge — Gemini 2.5 Flash (input=$0.15, cachedRead=$0.015 per 1M).
+  // Edge — Gemini 2.5 Flash (input=$0.30, cachedRead=$0.03 per 1M).
   // Spot-check a small saving rounds to 6 decimals correctly.
-  // 7143 × ($0.15 - $0.015) / 1_000_000 = 7143 × 0.135 / 1_000_000 = 0.000964305 USD.
-  // Rounded to 6 decimals = 0.000964.
-  it("Gemini 2.5 Flash — 7143 cache_read_tokens saves $0.000964 (rounded)", () => {
-    expect(estimateCacheSavings("gemini-2.5-flash", 7143)).toBe(0.000964);
+  // 7143 × ($0.30 - $0.03) / 1_000_000 = 7143 × 0.27 / 1_000_000 = 0.00192861 USD.
+  // Rounded to 6 decimals = 0.001929.
+  it("Gemini 2.5 Flash — 7143 cache_read_tokens saves $0.001929 (rounded)", () => {
+    expect(estimateCacheSavings("gemini-2.5-flash", 7143)).toBe(0.001929);
+  });
+});
+
+describe("pricingFor", () => {
+  it("returns a model's own row, with its key", () => {
+    expect(pricingFor("claude-haiku-4-5")).toEqual({
+      key: "claude-haiku-4-5",
+      pricing: PRICING["claude-haiku-4-5"],
+    });
+  });
+
+  it("prices Claude Haiku 5.5 at its rates for a prompt up to 100,000 tokens", () => {
+    expect(pricingFor("claude-haiku-5-5")).toEqual({
+      key: "claude-haiku-5-5",
+      pricing: {
+        input: 0.1,
+        output: 0.5,
+        inputCachedRead: 0.01,
+        inputCachedWrite5m: 0.125,
+        inputCachedWrite1h: 0.2,
+      },
+    });
+  });
+
+  it("prices Mistral Large 4 by its own row, not Mistral Large 3's", () => {
+    expect(pricingFor("mistral-large-4")).toEqual({
+      key: "mistral-large-4",
+      pricing: { input: 0.7, output: 2.1, inputCachedRead: 0.07 },
+    });
+  });
+
+  it("prices Mistral Large 4's versioned ids at its row", () => {
+    for (const model of ["mistral-large-4-0", "mistral-large-4-0-8"]) {
+      expect(pricingFor(model).key, model).toBe("mistral-large-4");
+    }
+  });
+
+  // Claude Fable 5.2 and Mythos 5.2 extend claude-fable-5 and claude-mythos-5
+  // ($10 / $50, cache read $1) and are sold for less: a row each, or they are
+  // billed at the price of the model they extend.
+  it.each([
+    "claude-fable-5-2",
+    "claude-mythos-5-2",
+  ])("prices %s by its own row, not the 5 model's", (model) => {
+    expect(pricingFor(model)).toEqual({
+      key: model,
+      pricing: {
+        input: 8,
+        output: 40,
+        inputCachedRead: 0.2,
+        inputCachedWrite5m: 10,
+        inputCachedWrite1h: 16,
+      },
+    });
+  });
+
+  it("reads Groq's gpt-oss-safeguard-20b cache at half its input rate", () => {
+    const { pricing } = pricingFor("openai/gpt-oss-safeguard-20b");
+    expect(pricing.inputCachedRead).toBe(pricing.input / 2);
+  });
+
+  it("prices Gemini 4 Argon at its introductory price, by its own row", () => {
+    expect(pricingFor("gemini-4-argon")).toEqual({
+      key: "gemini-4-argon",
+      pricing: { input: 2, output: 10, inputCachedRead: 0.1 },
+    });
+  });
+
+  it("prices GPT-6.1 Terra by its own row, not at the default rate", () => {
+    expect(pricingFor("gpt-6.1-terra")).toEqual({
+      key: "gpt-6.1-terra",
+      pricing: { input: 1, output: 5, inputCachedRead: 0.05 },
+    });
+  });
+
+  it("returns the default flat rate, with no key, for a model no key covers", () => {
+    expect(pricingFor("self-hosted-llama-99-quantum")).toEqual({
+      pricing: { input: 3, output: 15 },
+    });
+  });
+
+  it("is the lookup estimateCost prices through", () => {
+    const { pricing } = pricingFor("gpt-4o-mini");
+    expect(estimateCost("gpt-4o-mini", 1_000_000, 1_000_000)).toBeCloseTo(
+      pricing.input + pricing.output,
+      10,
+    );
+  });
+});
+
+describe("the pricing lookup — the longest key a model id extends", () => {
+  it("prices a dated id as its base model", () => {
+    expect(pricingFor("gpt-5.5-2026-04-23")).toEqual({
+      key: "gpt-5.5",
+      pricing: PRICING["gpt-5.5"],
+    });
+    expect(estimateCost("gpt-5.5-2026-04-23", 1_000_000, 1_000_000)).toBeCloseTo(5 + 30, 6);
+    expect(estimateCacheSavings("gpt-5.5-2026-04-23", 10_000)).toBe(0.045);
+  });
+
+  it("lets a row of its own win over the key the id extends", () => {
+    // gpt-5.5-cyber extends gpt-5.5 ($5/$30) and has a price of its own.
+    expect(pricingFor("gpt-5.5-cyber").key).toBe("gpt-5.5-cyber");
+    expect(estimateCost("gpt-5.5-cyber", 1_000_000, 1_000_000)).toBeCloseTo(12.5 + 75, 6);
+  });
+
+  it("prices a retired dated id with no row of its own as the key it extends", () => {
+    // gpt-4o-2024-05-13 ($5/$15) lost its row when OpenAI shut it down on
+    // 2026-10-23: a call to it fails at OpenAI's API, before any token.
+    expect(pricingFor("gpt-4o-2024-05-13")).toEqual({ key: "gpt-4o", pricing: PRICING["gpt-4o"] });
+  });
+
+  it("takes the longest key the id extends", () => {
+    // Extends both claude-sonnet-5 and claude-sonnet-5-5.
+    expect(pricingFor("claude-sonnet-5-5-20260929").key).toBe("claude-sonnet-5-5");
+  });
+
+  it("extends a key only after a dash", () => {
+    expect(pricingFor("gpt-5.50")).toEqual({ pricing: { input: 3, output: 15 } });
+  });
+
+  it("prices an unknown id at the default flat rate", () => {
+    expect(estimateCost("self-hosted-llama-99-quantum", 1_000_000, 1_000_000)).toBeCloseTo(
+      3 + 15,
+      6,
+    );
+  });
+});
+
+describe("cache read rates, model by model", () => {
+  it("reads Claude Opus 5.5 at 0.05× its input rate", () => {
+    const { pricing } = pricingFor("claude-opus-5-5");
+    expect(pricing.inputCachedRead).toBeCloseTo(pricing.input * 0.05, 10);
+    // 10k × ($4 - $0.20) / 1M
+    expect(estimateCacheSavings("claude-opus-5-5", 10_000)).toBe(0.038);
+  });
+
+  it("reads Claude Sonnet 5.5 at 0.05× its input rate", () => {
+    const { pricing } = pricingFor("claude-sonnet-5-5");
+    expect(pricing.inputCachedRead).toBeCloseTo(pricing.input * 0.05, 10);
+    // 10k × ($2 - $0.10) / 1M
+    expect(estimateCacheSavings("claude-sonnet-5-5", 10_000)).toBe(0.019);
+  });
+
+  it.each([
+    "claude-fable-5-2",
+    "claude-mythos-5-2",
+  ])("reads %s at 0.025× its input rate", (model) => {
+    const { pricing } = pricingFor(model);
+    expect(pricing.inputCachedRead).toBeCloseTo(pricing.input * 0.025, 10);
+    // 10k × ($8 - $0.20) / 1M
+    expect(estimateCacheSavings(model, 10_000)).toBe(0.078);
+  });
+
+  it("reads Claude Fable 5.1 at 0.025× its input rate", () => {
+    const { pricing } = pricingFor("claude-fable-5-1");
+    expect(pricing.inputCachedRead).toBeCloseTo(pricing.input * 0.025, 10);
+    // 10k × ($10 - $0.25) / 1M
+    expect(estimateCacheSavings("claude-fable-5-1", 10_000)).toBe(0.0975);
   });
 });

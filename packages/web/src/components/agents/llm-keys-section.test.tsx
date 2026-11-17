@@ -78,3 +78,21 @@ describe("LlmKeysSection — VT-25", () => {
     await waitFor(() => expect(capturedPolicy).toBe("creator_only"));
   });
 });
+
+describe("LlmKeysSection — the providers it offers", () => {
+  it("offers a key for every provider agent.yaml knows, meta included", async () => {
+    renderWithProviders(<LlmKeysSection namespace="alice" name="bot" />);
+    await screen.findByText("••••7890");
+
+    const select = screen.getByLabelText("Provider") as HTMLSelectElement;
+    expect([...select.options].map((option) => option.value)).toEqual([
+      "anthropic",
+      "openai",
+      "google",
+      "mistral",
+      "groq",
+      "xai",
+      "meta",
+    ]);
+  });
+});

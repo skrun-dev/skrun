@@ -9,7 +9,7 @@ version: 1.0.0
 
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
 
 tool_choice: always_fails
 
@@ -36,10 +36,8 @@ outputs:
 environment:
   networking:
     allowed_hosts: []
-  filesystem: read-only
   secrets: []
   timeout: 60s
-  sandbox: strict
 
 state:
   type: none

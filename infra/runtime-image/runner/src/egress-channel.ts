@@ -72,8 +72,14 @@ export class EgressChannelError extends Error {
 let used = false;
 
 /**
- * Hand the agent's allowed hosts to the privileged helper and wait for it to confirm
- * the rules are in place.
+ * Hand the agent's allowed hosts, and the machine's lifetime, to the privileged
+ * helper and wait for it to confirm the rules are in place.
+ *
+ * The message is one line, `<lifetime>;<hosts>`: the lifetime in whole seconds —
+ * empty when the assignment gave none —, then the hosts, comma-separated. The
+ * helper arms the lifetime and starts the machine's guardian, which ends the
+ * machine once it is reached, out of reach of the user this process and the
+ * agent's code share.
  *
  * Fails closed by design: a timeout, a refusal, or a closed channel throws, and the
  * caller must NOT proceed to install the run credential. A run that started with its
@@ -84,7 +90,11 @@ let used = false;
  * Single-use: the channel carries one message for the machine's whole life. A second
  * call is a programming error, not a retry.
  */
-export async function applyEgress(hosts: string[], timeoutMs: number): Promise<void> {
+export async function applyEgress(
+  hosts: string[],
+  lifetimeS: number | undefined,
+  timeoutMs: number,
+): Promise<void> {
   if (!CHANNEL_PRESENT) {
     throw new EgressChannelError("no egress channel on this machine (not a pre-created runner)");
   }
@@ -94,17 +104,22 @@ export async function applyEgress(hosts: string[], timeoutMs: number): Promise<v
   used = true;
 
   // Reject anything that would corrupt the line-oriented framing before it reaches a
-  // process running as root. The helper re-validates, but a malformed message should
-  // never leave here in the first place.
+  // process running as root: a line ends the message, a comma ends a host, a
+  // semicolon ends the lifetime, which is digits or nothing. The helper re-validates,
+  // but a malformed message should never leave here in the first place.
   for (const host of hosts) {
-    if (/[\n\r,]/.test(host)) {
+    if (/[\n\r,;]/.test(host)) {
       throw new EgressChannelError(`invalid host in egress request: ${JSON.stringify(host)}`);
     }
+  }
+  const lifetime = lifetimeS === undefined ? "" : String(lifetimeS);
+  if (!/^[0-9]*$/.test(lifetime)) {
+    throw new EgressChannelError(`invalid lifetime in egress request: ${JSON.stringify(lifetime)}`);
   }
 
   const ack = new Socket({ fd: ACK_FD, readable: true, writable: false });
   try {
-    writeSync(REQUEST_FD, `${hosts.join(",")}\n`);
+    writeSync(REQUEST_FD, `${lifetime};${hosts.join(",")}\n`);
     const reply = await readOneLine(ack, timeoutMs);
     if (reply !== ACK_OK) {
       throw new EgressChannelError(

@@ -49,7 +49,6 @@ describeCold("SC-2 / VT-2: cold-start P95 < 10s over 20 spawns", () => {
         image: FLY_TEST_IMAGE as string,
         iterations: ITERATIONS,
       });
-      // biome-ignore lint/suspicious/noConsole: D-1 PASS line
       console.log(
         `PASS cold-start: p95=${result.p95}ms p50=${result.p50}ms min=${result.min}ms max=${result.max}ms over ${result.iterations} spawns`,
       );

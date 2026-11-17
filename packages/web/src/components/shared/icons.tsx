@@ -84,6 +84,23 @@ export function IconBook(p: IconProps) {
   );
 }
 
+export function IconDocument(p: IconProps) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      {...p}
+    >
+      <path d="M9.5 1.5h-5a1 1 0 00-1 1v11a1 1 0 001 1h7a1 1 0 001-1v-9l-3-3z" />
+      <path d="M9.5 1.5v3h3M6 8h4M6 10.5h4" />
+    </svg>
+  );
+}
+
 export function IconExternal(p: IconProps) {
   return (
     <svg

@@ -1,14 +1,14 @@
 /**
- * E2E: bundle delivery + outputs sync upload (#15 VT-11 + VT-12).
+ * E2E: bundle delivery + outputs sync upload.
  *
- * VT-11 (bundle delivery): the harness side of the boot flow — generate a
+ * Bundle delivery: the harness side of the boot flow — generate a
  * presigned R2 GET URL from the bundle key, hand it to the runner via /init,
  * trust the runner to download + extract before its tools fire. Tested here
  * via the harness `getPresignedDownloadUrl` boundary + the FlyioAdapter
- * spawn flow. The actual < 3s P95 metric requires real R2 + a real machine
- * and is asserted by the env-gated cold-start benchmark in 9.5.
+ * spawn flow. How long it takes needs real R2 and a real machine, and is
+ * not measured here.
  *
- * VT-12 (outputs upload): the harness pulls each output from the runner via
+ * Outputs upload: the harness pulls each output from the runner via
  * `/outputs/collect` + `/outputs/file` and sync-uploads to R2 / MinIO via
  * storage.put. The run_complete event then carries one presigned GET URL per
  * file so the caller can download directly from object storage. This test
@@ -16,7 +16,10 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import type { PresignedStorageAdapter } from "../../packages/runtime/src/adapter/flyio/index.js";
-import { uploadOutputs } from "../../packages/runtime/src/adapter/flyio/outputs-upload.js";
+import {
+  OutputsUploadError,
+  uploadOutputs,
+} from "../../packages/runtime/src/adapter/flyio/outputs-upload.js";
 import type { FileInfo } from "../../packages/runtime/src/index.js";
 
 const RUNNER_URL = "http://machine-private:9000";
@@ -91,8 +94,8 @@ function makeStorageMock(): {
   return { storage, putSpy, presignDownloadSpy, uploadedKeys };
 }
 
-describe("VT-12: harness sync-uploads outputs to R2 and embeds presigned GET URLs", () => {
-  it("uploads each manifest file to runs/{runId}/outputs/{path} and returns FileInfo[] with urls", async () => {
+describe("harness sync-uploads outputs to R2 and embeds presigned GET URLs", () => {
+  it("uploads each manifest file to _runs/{runId}/outputs/{path} and returns FileInfo[] with urls", async () => {
     const files = [
       {
         path: "report.pdf",
@@ -105,35 +108,35 @@ describe("VT-12: harness sync-uploads outputs to R2 and embeds presigned GET URL
     const runner = makeRunnerMock(files);
     const s = makeStorageMock();
 
-    const result: FileInfo[] = await uploadOutputs({
+    const { files: result }: { files: FileInfo[] } = await uploadOutputs({
       runId: "run-vt12",
       runnerBaseUrl: RUNNER_URL,
       storage: s.storage,
       fetchImpl: runner.fetchImpl,
     });
 
-    // 3 files in, 3 files out — preserved order.
+    // 3 files in, 3 files out — in path order, the order the output rules keep them in.
     expect(result).toHaveLength(3);
-    expect(result.map((f) => f.name)).toEqual(["report.pdf", "summary.md", "nested/data.csv"]);
+    expect(result.map((f) => f.name)).toEqual(["nested/data.csv", "report.pdf", "summary.md"]);
 
     // Sizes match what the runner reported in the manifest.
-    expect(result[0]?.size).toBe(files[0]?.bytes.length);
-    expect(result[1]?.size).toBe(files[1]?.bytes.length);
-    expect(result[2]?.size).toBe(files[2]?.bytes.length);
+    for (const f of files) {
+      expect(result.find((r) => r.name === f.path)?.size).toBe(f.bytes.length);
+    }
 
     // Each file was pulled exactly once + uploaded exactly once under the
     // run-scoped key prefix.
-    expect(runner.pulledPaths).toEqual(["report.pdf", "summary.md", "nested/data.csv"]);
+    expect(runner.pulledPaths).toEqual(["nested/data.csv", "report.pdf", "summary.md"]);
     expect(s.uploadedKeys.map((k) => k.key)).toEqual([
-      "runs/run-vt12/outputs/report.pdf",
-      "runs/run-vt12/outputs/summary.md",
-      "runs/run-vt12/outputs/nested/data.csv",
+      "_runs/run-vt12/outputs/nested/data.csv",
+      "_runs/run-vt12/outputs/report.pdf",
+      "_runs/run-vt12/outputs/summary.md",
     ]);
 
     // Every FileInfo carries a presigned GET URL (substring check on the
     // mock signature).
     for (const f of result) {
-      expect(f.url).toMatch(/^https:\/\/r2\.example\.com\/runs%2Frun-vt12%2Foutputs%2F.+\?sig=/);
+      expect(f.url).toMatch(/^https:\/\/r2\.example\.com\/_runs%2Frun-vt12%2Foutputs%2F.+\?sig=/);
     }
 
     // Storage.put was called with the exact bytes from the runner.
@@ -143,7 +146,7 @@ describe("VT-12: harness sync-uploads outputs to R2 and embeds presigned GET URL
   it("returns empty FileInfo[] when the runner has no outputs", async () => {
     const runner = makeRunnerMock([]);
     const s = makeStorageMock();
-    const result = await uploadOutputs({
+    const { files: result } = await uploadOutputs({
       runId: "run-empty",
       runnerBaseUrl: RUNNER_URL,
       storage: s.storage,
@@ -154,21 +157,23 @@ describe("VT-12: harness sync-uploads outputs to R2 and embeds presigned GET URL
     expect(s.presignDownloadSpy).not.toHaveBeenCalled();
   });
 
-  it("throws when /outputs/collect returns a non-200 (harness surfaces as run_error upstream)", async () => {
+  it("throws an OutputsUploadError with a constant message when /outputs/collect returns a non-200 (harness surfaces as run_error upstream)", async () => {
     const fetchImpl = vi.fn(async () => new Response("upstream timeout", { status: 503 }));
     const s = makeStorageMock();
-    await expect(
-      uploadOutputs({
-        runId: "run-fail",
-        runnerBaseUrl: RUNNER_URL,
-        storage: s.storage,
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-      }),
-    ).rejects.toThrow(/outputs\/collect/);
+    const failure = uploadOutputs({
+      runId: "run-fail",
+      runnerBaseUrl: RUNNER_URL,
+      storage: s.storage,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await expect(failure).rejects.toBeInstanceOf(OutputsUploadError);
+    // No status, no path, no text of the runner: the cause, kept, says what failed.
+    await expect(failure).rejects.toThrow("The run's output files could not be stored.");
+    expect(s.putSpy).not.toHaveBeenCalled();
   });
 
-  it("throws when a single /outputs/file pull fails (partial upload is unsafe)", async () => {
-    // Manifest claims 2 files; runner serves file 1 + returns 404 for file 2.
+  it("a file that cannot be pulled is left out, the others are stored", async () => {
+    // Manifest claims 2 files; the runner returns 404 for the first one pulled, serves the other.
     const fetchImpl = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.endsWith("/outputs/collect")) {
@@ -190,21 +195,19 @@ describe("VT-12: harness sync-uploads outputs to R2 and embeds presigned GET URL
     }) as unknown as typeof fetch;
 
     const s = makeStorageMock();
-    await expect(
-      uploadOutputs({
-        runId: "run-partial",
-        runnerBaseUrl: RUNNER_URL,
-        storage: s.storage,
-        fetchImpl,
-      }),
-    ).rejects.toThrow(/broken\.txt/);
-    // The first file WAS uploaded before the failure — partial uploads are
-    // NOT rolled back because the machine is destroyed after the harness
-    // run_error anyway, so the partial keys are orphaned safely.
-    expect(s.uploadedKeys.map((k) => k.key)).toEqual(["runs/run-partial/outputs/ok.txt"]);
+    const { files, excluded } = await uploadOutputs({
+      runId: "run-partial",
+      runnerBaseUrl: RUNNER_URL,
+      storage: s.storage,
+      fetchImpl,
+    });
+    // broken.txt is pulled first (path order) and left out; the run keeps the other file.
+    expect(files.map((f) => f.name)).toEqual(["ok.txt"]);
+    expect(excluded.pull_failed).toBe(1);
+    expect(s.uploadedKeys.map((k) => k.key)).toEqual(["_runs/run-partial/outputs/ok.txt"]);
   });
 
-  it("SEC-2026-002: sends Authorization: Bearer <token> on /outputs/collect + /outputs/file when set", async () => {
+  it("sends Authorization: Bearer <token> on /outputs/collect + /outputs/file when set", async () => {
     const authHeaders: Array<string | null> = [];
     const fetchImpl = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -231,7 +234,7 @@ describe("VT-12: harness sync-uploads outputs to R2 and embeds presigned GET URL
     expect(authHeaders).toEqual(["Bearer run-token-xyz", "Bearer run-token-xyz"]);
   });
 
-  it("SEC-2026-002 back-compat: omits Authorization when no token is set", async () => {
+  it("omits Authorization when no token is set (a runner that does not check one)", async () => {
     const authHeaders: Array<string | null> = [];
     const fetchImpl = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -256,33 +259,33 @@ describe("VT-12: harness sync-uploads outputs to R2 and embeds presigned GET URL
   });
 });
 
-describe("VT-11: bundle delivery — harness signs presigned GET URL for the runner", () => {
+describe("bundle delivery — harness signs presigned GET URL for the runner", () => {
   /**
    * The harness side of bundle delivery is: given a bundle storage key,
    * call `storage.getPresignedDownloadUrl(key, ttl)` and pass the URL
-   * to the runner's /init. The TTL must cover the worst-case machine
-   * boot time + a safety margin so the URL doesn't expire mid-download.
+   * to the runner's /init. The URL is signed once the machine answers its
+   * boot probe, and lives long enough to cover /init itself.
    *
-   * VT-11's < 3s P95 download metric requires a live MinIO / R2 plus a
-   * spawned machine — that's the env-gated benchmark in 9.5.
-   * Here we assert the structural plumbing: harness asks storage, gets
-   * back a URL, hands it to the runner verbatim.
+   * A download time can only be measured against a live store and a spawned
+   * machine. Here, the structural plumbing only: the harness asks storage,
+   * gets back a URL, hands it to the runner verbatim.
    */
   it("FlyioAdapter.spawnRunner calls storage.getPresignedDownloadUrl with the bundle key + TTL", async () => {
-    // Implementation detail covered by the FlyioAdapter unit tests in
-    // packages/runtime/src/adapter/flyio/adapter.test.ts (3 abort + spawn
-    // tests). Cross-reference + structural assertion only here — the
-    // full integration with a real download lives in 9.5 / 10.1.
+    // Covered by the FlyioAdapter unit tests in
+    // packages/runtime/src/adapter/flyio/adapter.test.ts, where a cold run's
+    // /init URLs are signed — the bundle key and the outputs archive key, and
+    // nothing else. A cross-reference only here; a real download needs a live
+    // store and a machine.
     expect(true).toBe(true); // structural cross-reference.
   });
 
   it("presigned URL TTL covers MAX_MACHINE_BOOT_TIME + 30s margin (cross-ref FlyioAdapter spawnRunner)", () => {
-    // FlyioAdapter computes `ttlSeconds = ceil(maxBootTimeMs / 1000) + 30`.
-    // With defaults (30_000ms boot + 30s margin) → 60s TTL. This is the
-    // structural invariant that keeps slow-boot machines from racing
-    // expired URLs. Verified by reading the adapter source — no further
-    // test runtime assertion possible without mocking the entire spawn
-    // path again (already done in 9.1 adapter-parity).
-    expect(true).toBe(true); // structural cross-reference, see flyio/adapter.ts:165.
+    // FlyioAdapter signs a cold run's /init URLs once the machine answers its
+    // boot probe — never before it is created — for
+    // `ceil(maxBootTimeMs / 1000) + 30` seconds counted from there: with the
+    // default boot budget (90_000 ms), 120 s. Signed that late, the lifetime
+    // only has to cover /init itself. The adapter's unit tests assert both, on
+    // a simulated clock (the URLs signed after the last probe, for 120 s).
+    expect(true).toBe(true); // structural cross-reference.
   });
 });

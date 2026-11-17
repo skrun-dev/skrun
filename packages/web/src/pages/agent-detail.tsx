@@ -25,6 +25,7 @@ import {
 } from "../lib/api-client";
 import { useAuth } from "../lib/auth";
 import { computeDeltaPercent as deltaPct, formatUsd } from "../lib/format";
+import { verificationPolicyOf } from "../lib/verification";
 
 /**
  * Truncate a string at N graphemes (not UTF-16 code units), so emoji and CJK
@@ -67,7 +68,7 @@ export function AgentDetailPage() {
   // → hidden (verification is off). Missing policy = legacy `'admin'`. The
   // server enforces the same rule; the UI just hides a control the caller
   // can't use.
-  const verificationPolicy = user?.verification_policy ?? "admin";
+  const verificationPolicy = verificationPolicyOf(user);
   const canVerify =
     verificationPolicy === "disabled"
       ? false
@@ -323,6 +324,7 @@ export function AgentDetailPage() {
                     <div className="rounded-md border border-gray-200 dark:border-gray-900 bg-gray-50/60 dark:bg-gray-950/70 p-3 font-mono text-[11.5px] text-gray-600 dark:text-gray-400 leading-relaxed whitespace-pre">{`curl -X POST ${window.location.origin}/api/agents/${namespace}/${name}/run \\
   -H "Authorization: Bearer $KEY" \\
   -H "Content-Type: application/json" \\
+  -H "Accept: text/event-stream" \\
   -d '{ "input": ${inputJson} }'`}</div>
                     <div className="flex items-center gap-2">
                       <Btn
@@ -330,7 +332,7 @@ export function AgentDetailPage() {
                         size="sm"
                         icon={<IconCopy />}
                         onClick={() => {
-                          const cmd = `curl -X POST ${window.location.origin}/api/agents/${namespace}/${name}/run -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d '${JSON.stringify({ input: exampleInput })}'`;
+                          const cmd = `curl -X POST ${window.location.origin}/api/agents/${namespace}/${name}/run -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -H "Accept: text/event-stream" -d '${JSON.stringify({ input: exampleInput })}'`;
                           navigator.clipboard.writeText(cmd).catch(() => {});
                         }}
                       >

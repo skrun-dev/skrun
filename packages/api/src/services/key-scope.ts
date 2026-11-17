@@ -1,5 +1,5 @@
 /**
- * API-key scope enforcement — the three capability rules of an `sk_live` key.
+ * API-key scope enforcement — the three capability rules of an API key.
  *
  *   R1 operation + resource  — run / push / verify: the key must carry the
  *                              `agent:*` operation AND be allowed to act on the
@@ -9,7 +9,10 @@
  *                              or an account-wide + full-operation key.
  *   R3 read least-privilege  — a delegated (`scope_kind='agents'`) key may read
  *                              only the metadata of its in-scope agents; it gets
- *                              no source (pull), versions, runs, or stats.
+ *                              no source (pull), versions, runs, or stats. Run
+ *                              history, stats and source take a master
+ *                              credential; any other key reads only the files
+ *                              of its own runs and uploads.
  *
  * Every rule keys off `user.key` — NEVER `user.role`. A restricted or limited
  * key restricts even an admin owner, because the key (not the person) is the
@@ -68,13 +71,13 @@ export function isDelegatedKey(user: UserContext): boolean {
 }
 
 /**
- * A "master credential" = a session, a dev-token, or an `sk_live` key that is
+ * A "master credential" = a session, a dev-token, or an API key that is
  * BOTH account-wide AND carries the full operation set. Required for
  * account-management. Operation comparison is **set-equality** (order-independent)
  * so a reordered default mint still counts as master. Keyed on the key, never
  * `role` — an admin presenting a restricted/limited key is NOT a master credential.
  */
-export function isMasterCredential(user: UserContext): boolean {
+export function isMasterCredential(user: Pick<UserContext, "key">): boolean {
   const key = user.key;
   if (key == null) return true; // session / dev-token
   if (key.scope_kind !== "account") return false; // delegated
@@ -84,6 +87,53 @@ export function isMasterCredential(user: UserContext): boolean {
   // permission. De-duplicate first, then compare size and membership.
   const ops = new Set(key.operations);
   return ops.size === FULL_OPERATION_SET.size && [...ops].every((op) => FULL_OPERATION_SET.has(op));
+}
+
+/**
+ * Whether the caller acts as the instance administrator: the `admin` role AND a
+ * master credential. The reads and the run that widen past the caller's own
+ * account for an administrator — the pool view, the agent list, another
+ * account's agents, a run of one, an environment override on it, an
+ * attestation — ask this, never the role alone. The role belongs to the person;
+ * a key that person reduced to fewer operations, or delegated to a client, was
+ * handed out for one job and answers as the same key of an ordinary account
+ * would (the rule at the top of this module: the key, never the role).
+ *
+ * Not every widening asks it. The administration routes that act on another
+ * account — an agent's visibility, deleting a version or an agent, an agent's
+ * model keys (their list as well as their writes), deleting an account —
+ * require a master credential (`requireMasterCredential`) and read the role
+ * beside it: the same pair, checked in two steps, which a change to this
+ * predicate does not reach.
+ */
+export function isInstanceAdmin(user: Pick<UserContext, "role" | "key">): boolean {
+  return user.role === "admin" && isMasterCredential(user);
+}
+
+/**
+ * Who the caller of a run is. A master credential is the account it belongs to;
+ * any other key — reduced, or delegated to a client — is that key. Derived from
+ * the authenticated credential alone: nothing in the request (header, body) and
+ * nothing the model sees can name or change it.
+ */
+export type RunCaller = { kind: "account"; userId: string } | { kind: "key"; keyId: string };
+
+export function runCaller(user: UserContext): RunCaller {
+  const key = user.key;
+  // A null key (session / dev-token) is master: the account.
+  if (key == null || isMasterCredential(user)) return { kind: "account", userId: user.id };
+  return { kind: "key", keyId: key.id };
+}
+
+/**
+ * The caller an agent's per-caller state is kept under: `runCaller`, or `null`
+ * when the account has no row to attach state to (the dev-token fallback that
+ * could not record its account). With `null` the run reads and writes no
+ * per-caller state; it still runs.
+ */
+export function stateCaller(user: UserContext): RunCaller | null {
+  if (user.syntheticAccount) return null;
+  return runCaller(user);
 }
 
 /** R1 — the key must permit `op` AND be allowed to act on `agent`. */
@@ -144,4 +194,51 @@ export function assertNotDelegatedOrThrow(user: UserContext): void {
   if (isDelegatedKey(user)) {
     throwKeyScope("This endpoint is not available to a resource-scoped API key.");
   }
+}
+
+/**
+ * R3 (master read) — run history, usage stats and an agent's source are for a
+ * master credential only. A delegated key keeps its own refusal, word for word;
+ * any other credential that is not master (an account-wide key with fewer than
+ * every operation, or with none) is refused with a message that names what the
+ * read takes. A reduced key is the key a creator hands out to run an agent: it
+ * must not open what every other caller of the account produced.
+ */
+export function assertMasterReadOrThrow(user: UserContext): void {
+  assertNotDelegatedOrThrow(user);
+  if (!isMasterCredential(user)) {
+    throwKeyScope(
+      "Reading this requires full access: a session, the dev token, or an account-wide API key that carries every operation.",
+    );
+  }
+}
+
+/** The fields of a run that decide who may read its output files. */
+export type RunFileOwnership = { user_id: string | null; api_key_id: string | null };
+
+/**
+ * Whether the caller may read the output files of `run`. A master credential
+ * reads the files of every run of its account; any other key reads only the
+ * files of the runs it launched itself. A run whose account was removed
+ * (`user_id` null), or whose key was revoked (`api_key_id` null), is read by
+ * no key that is not master.
+ */
+export function mayReadRunFiles(user: UserContext, run: RunFileOwnership): boolean {
+  if (run.user_id === null || run.user_id !== user.id) return false;
+  const caller = runCaller(user);
+  return caller.kind === "account" || run.api_key_id === caller.keyId;
+}
+
+/** The fields of an upload that decide who may use it. */
+export type UploadOwnership = { owner_id: string; uploaded_by_key_id: string | null };
+
+/**
+ * Whether the caller may read, delete, or pass as a run input the file it
+ * uploaded through `POST /api/files`. A master credential uses every upload of
+ * its account; any other key only the uploads it made itself.
+ */
+export function mayUseUpload(user: UserContext, upload: UploadOwnership): boolean {
+  if (upload.owner_id !== user.id) return false;
+  const caller = runCaller(user);
+  return caller.kind === "account" || upload.uploaded_by_key_id === caller.keyId;
 }

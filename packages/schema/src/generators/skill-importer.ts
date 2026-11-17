@@ -1,3 +1,4 @@
+import { MODEL_CHOICES } from "../model-choices.js";
 import type { ParsedSkill } from "../parsers/skill-md.js";
 import type { AgentConfig } from "../schemas/agent-config.js";
 import type { ToolConfig } from "../schemas/tool-config.js";
@@ -48,32 +49,26 @@ export function generateAgentYaml(skill: ParsedSkill): GeneratedAgentYaml {
     mcp_servers: [],
     environment: {
       networking: { allowed_hosts: [] },
-      filesystem: "read-only",
-      secrets: [],
       timeout: "300s",
-      sandbox: "strict",
     },
     context_mode: "skill",
     state: {
-      type: "kv",
+      type: "none",
+      scope: "per_caller",
       ttl: "30d",
     },
     tests: [],
   };
 
+  // The same choices `skrun init` offers, as "provider / name".
+  const modelOptions = MODEL_CHOICES.map((c) => `${c.provider} / ${c.name}`);
   const prompts: AgentYamlPrompt[] = [
     {
       field: "model",
       question: "Which model provider and name?",
       type: "select",
-      options: [
-        "anthropic / claude-sonnet-4-20250514",
-        "openai / gpt-4o",
-        "mistral / mistral-large-latest",
-        "groq / llama-3.3-70b-versatile",
-        "xai / grok-4.3",
-      ],
-      default: "anthropic / claude-sonnet-4-20250514",
+      options: modelOptions,
+      default: modelOptions[0],
     },
     {
       field: "inputs",

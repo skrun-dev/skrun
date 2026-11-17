@@ -1,8 +1,8 @@
 // Generates `legacy-handrolled.agent` — a `.agent` bundle produced by the
 // PRE-migration hand-rolled ustar writer (a faithful replica of the logic that
 // lived in `packages/cli/src/commands/build.ts` before the tar-stream migration,
-// post-6.9 so entry names are already POSIX). This is the ground truth for the
-// new reader's registry read-back test (RT-1 / SC-8): bundles already stored in
+// once its entry names were POSIX). This is the ground truth for the
+// new reader's registry read-back test: bundles already stored in
 // the registry are hand-rolled ustar, and the tar-stream reader must parse them.
 //
 // Run once to (re)generate the committed fixture:

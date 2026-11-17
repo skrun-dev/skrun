@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ToolConfig } from "@skrun-dev/schema";
+import type { ManifestInfo, ToolConfig } from "@skrun-dev/schema";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DepsCache, type InstallFn } from "../cache/deps-cache.js";
 import { ScriptDepsInstallError } from "../errors.js";
 import type { ResolvedDeps } from "./script-deps-resolver.js";
 import { buildInterpreterArgs, ScriptToolProvider } from "./script-provider.js";
@@ -496,5 +497,159 @@ describe("ScriptToolProvider", () => {
       // CI environments.
       expect(result.content.length).toBeGreaterThan(0);
     });
+  });
+});
+
+/**
+ * A deps cache whose install step writes one small CommonJS package instead of
+ * running a package manager. The manifest detection, the resolver, the cache
+ * layout and the provider are the real ones: only the network step is
+ * simulated. `installs` counts how many times that step ran.
+ */
+class SimulatedInstallDepsCache extends DepsCache {
+  installs = 0;
+
+  constructor(
+    rootDir: string,
+    private readonly failure?: Error,
+  ) {
+    super({ rootDir });
+  }
+
+  override ensure(manifest: ManifestInfo, _installFn: InstallFn): Promise<string> {
+    return super.ensure(manifest, async (tmpPath) => {
+      this.installs++;
+      if (this.failure) throw this.failure;
+      const pkg = join(tmpPath, "node_modules", "skrun-dep-witness");
+      mkdirSync(pkg, { recursive: true });
+      writeFileSync(
+        join(pkg, "package.json"),
+        '{"name":"skrun-dep-witness","version":"1.0.0","main":"index.js"}',
+      );
+      writeFileSync(join(pkg, "index.js"), "module.exports = { value: 'FROM-DEPENDENCY' };");
+    });
+  }
+}
+
+describe("ScriptToolProvider — declared Node dependencies, end to end", () => {
+  let bundleRoot: string;
+  let cacheRoot: string;
+
+  const anyArgs = { type: "object", properties: {}, additionalProperties: true };
+  const esmTool: ToolConfig = { name: "esm-import", description: "ESM", input_schema: anyArgs };
+  const cjsTool: ToolConfig = { name: "cjs-require", description: "CJS", input_schema: anyArgs };
+
+  beforeEach(() => {
+    bundleRoot = mkdtempSync(join(tmpdir(), "skrun-deps-bundle-"));
+    cacheRoot = mkdtempSync(join(tmpdir(), "skrun-deps-cache-"));
+    writeFileSync(
+      join(bundleRoot, "package.json"),
+      '{"name":"agent","private":true,"dependencies":{"skrun-dep-witness":"1.0.0"}}',
+    );
+    mkdirSync(join(bundleRoot, "scripts"));
+    // The shape of a real agent script: a `.ts` file with an ES `import` of a
+    // declared dependency.
+    writeFileSync(
+      join(bundleRoot, "scripts", "esm-import.ts"),
+      [
+        'import witness from "skrun-dep-witness";',
+        "const value: string = witness.value;",
+        "process.stdout.write(value);",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(bundleRoot, "scripts", "cjs-require.js"),
+      'process.stdout.write(require("skrun-dep-witness").value);\n',
+    );
+  });
+
+  afterEach(() => {
+    rmSync(bundleRoot, { recursive: true, force: true });
+    rmSync(cacheRoot, { recursive: true, force: true });
+  });
+
+  function makeProvider(cache: DepsCache): ScriptToolProvider {
+    return new ScriptToolProvider(join(bundleRoot, "scripts"), [esmTool, cjsTool], [], "", {
+      bundleRoot,
+      depsCache: cache,
+    });
+  }
+
+  it("an ES-module script imports a declared dependency", async () => {
+    const result = await makeProvider(new SimulatedInstallDepsCache(cacheRoot)).callTool(
+      "esm-import",
+      {},
+    );
+    expect(result.content).not.toContain("ERR_MODULE_NOT_FOUND");
+    expect(result).toEqual({ content: "FROM-DEPENDENCY", isError: false });
+  });
+
+  it("a CommonJS script requires the same dependency", async () => {
+    const result = await makeProvider(new SimulatedInstallDepsCache(cacheRoot)).callTool(
+      "cjs-require",
+      {},
+    );
+    expect(result).toEqual({ content: "FROM-DEPENDENCY", isError: false });
+  });
+
+  it("prepareDependencies installs before any tool call, and the call does not install again", async () => {
+    const cache = new SimulatedInstallDepsCache(cacheRoot);
+    const provider = makeProvider(cache);
+
+    const prepared = await provider.prepareDependencies();
+
+    expect(prepared.failed).toBe(false);
+    expect(prepared.error).toBeUndefined();
+    expect(prepared.ms).toBeGreaterThanOrEqual(0);
+    expect(cache.installs).toBe(1);
+    // The link is in place before the first script runs.
+    expect(lstatSync(join(bundleRoot, "node_modules")).isSymbolicLink()).toBe(true);
+
+    const result = await provider.callTool("esm-import", {});
+    expect(result).toEqual({ content: "FROM-DEPENDENCY", isError: false });
+    expect(cache.installs).toBe(1);
+  });
+
+  it("prepareDependencies never rejects: a failed install is returned, then given, typed, to the first call", async () => {
+    const failure = new ScriptDepsInstallError({
+      ecosystem: "node",
+      command: "npm install --prefix=/somewhere",
+      exitCode: 1,
+      stderr: "npm error 404 Not Found",
+    });
+    const cache = new SimulatedInstallDepsCache(cacheRoot, failure);
+    const provider = makeProvider(cache);
+
+    const prepared = await provider.prepareDependencies();
+
+    expect(prepared.failed).toBe(true);
+    expect(prepared.error).toBe(failure);
+    expect(existsSync(join(bundleRoot, "node_modules"))).toBe(false);
+
+    const result = await provider.callTool("esm-import", {});
+    expect(result.isError).toBe(true);
+    expect(result.content).toBe(`[SCRIPT_DEPS_INSTALL_FAILED] ${failure.message}`);
+    // Memoized: the failure is not retried by the call.
+    expect(cache.installs).toBe(1);
+  });
+
+  it("installs nothing for a bundle without a scripts directory, as the local route makes no provider for one", async () => {
+    rmSync(join(bundleRoot, "scripts"), { recursive: true, force: true });
+    const cache = new SimulatedInstallDepsCache(cacheRoot);
+
+    const prepared = await makeProvider(cache).prepareDependencies();
+
+    expect(prepared).toEqual({ ms: expect.any(Number), failed: false });
+    expect(cache.installs).toBe(0);
+    expect(existsSync(join(bundleRoot, "node_modules"))).toBe(false);
+  });
+
+  it("prepareDependencies has nothing to do without a cache", async () => {
+    const provider = new ScriptToolProvider(join(bundleRoot, "scripts"), [esmTool], [], "", {
+      bundleRoot,
+    });
+    expect(await provider.prepareDependencies()).toEqual({ ms: expect.any(Number), failed: false });
+    expect(existsSync(join(bundleRoot, "node_modules"))).toBe(false);
   });
 });

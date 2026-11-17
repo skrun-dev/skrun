@@ -6,6 +6,7 @@ import {
   parseSkillMd,
   serializeAgentYaml,
 } from "@skrun-dev/schema";
+import { exitWith } from "../utils/exit.js";
 import * as format from "../utils/format.js";
 import { askModel, askText } from "../utils/prompts.js";
 
@@ -23,13 +24,13 @@ export async function initFromSkill(skillPath: string, opts: FromSkillOptions): 
   // Check SKILL.md exists
   if (!existsSync(skillMdPath)) {
     format.error(`No SKILL.md found in ${dir}. Is this an Agent Skills directory?`);
-    process.exit(1);
+    exitWith(1);
   }
 
   // Check existing agent.yaml
   if (existsSync(agentYamlPath) && !opts.force) {
     format.error("agent.yaml already exists. Use --force to overwrite.");
-    process.exit(1);
+    exitWith(1);
   }
 
   // Parse SKILL.md
@@ -39,7 +40,7 @@ export async function initFromSkill(skillPath: string, opts: FromSkillOptions): 
     skill = parseSkillMd(content);
   } catch (err) {
     format.error(`SKILL.md validation failed: ${err instanceof Error ? err.message : String(err)}`);
-    process.exit(1);
+    exitWith(1);
   }
 
   format.success(`SKILL.md detected: ${skill.frontmatter.name}`);

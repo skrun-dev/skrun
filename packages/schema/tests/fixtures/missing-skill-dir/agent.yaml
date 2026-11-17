@@ -3,7 +3,7 @@ version: 1.0.0
 
 model:
   provider: anthropic
-  name: claude-sonnet-4-20250514
+  name: claude-sonnet-4-6
   temperature: 0.3
   fallback:
     provider: openai
@@ -32,7 +32,6 @@ tools:
 mcp_servers:
   - name: google-search-console
     url: https://mcp.gsc.io/sse
-    auth: oauth2
 
 inputs:
   - name: website_url
@@ -50,12 +49,8 @@ environment:
     allowed_hosts:
       - googleapis.com
       - "*.target-site"
-  filesystem: read-only
-  secrets:
-    - GSC_API_KEY
   timeout: 300s
   max_cost: 0.50
-  sandbox: strict
 
 context_mode: skill
 

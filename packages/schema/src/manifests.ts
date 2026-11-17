@@ -2,8 +2,9 @@
 //
 // Detects standard language manifests at the bundle root and returns their
 // CONTENT (no absolute paths — paths break cross-host hash determinism).
-// The runtime hashes the content to drive a content-addressable cache at
-// `~/.skrun/deps/<hash>/`.
+// The runtime hashes the content to drive a content-addressable cache —
+// `~/.skrun/deps/<hash>/` on a server that runs scripts itself; a cloud
+// sandbox runner keeps its own, for one run.
 //
 // Precedence:
 //   - Node manifest:   package.json
@@ -165,159 +166,55 @@ export function detectManifest(bundleRoot: string): ManifestInfo {
 // later"; the cost of a false positive is "noisy build output". Tilt toward
 // silence.
 
-// Python standard library top-level module names (Python 3.11+, common subset).
+// Python standard library top-level module names: `sys.stdlib_module_names`
+// of CPython 3.12 (3.12.10), whole and verbatim — private modules included, as
+// an import of one is no third-party dependency either. Regenerate with:
+//   python3.12 -c "import sys; print(' '.join(sorted(sys.stdlib_module_names)))"
+// A hand-picked subset missed common modules (`__future__`, `codecs`,
+// `optparse`, `graphlib`) and warned on scripts that needed no manifest.
+const PYTHON_3_12_STDLIB = `
+  __future__ _abc _aix_support _ast _asyncio _bisect _blake2 _bz2 _codecs _codecs_cn _codecs_hk
+  _codecs_iso2022 _codecs_jp _codecs_kr _codecs_tw _collections _collections_abc _compat_pickle
+  _compression _contextvars _crypt _csv _ctypes _curses _curses_panel _datetime _dbm _decimal
+  _elementtree _frozen_importlib _frozen_importlib_external _functools _gdbm _hashlib _heapq
+  _imp _io _json _locale _lsprof _lzma _markupbase _md5 _msi _multibytecodec _multiprocessing
+  _opcode _operator _osx_support _overlapped _pickle _posixshmem _posixsubprocess _py_abc
+  _pydatetime _pydecimal _pyio _pylong _queue _random _scproxy _sha1 _sha2 _sha3 _signal
+  _sitebuiltins _socket _sqlite3 _sre _ssl _stat _statistics _string _strptime _struct _symtable
+  _thread _threading_local _tkinter _tokenize _tracemalloc _typing _uuid _warnings _weakref
+  _weakrefset _winapi _wmi _zoneinfo abc aifc antigravity argparse array ast asyncio atexit
+  audioop base64 bdb binascii bisect builtins bz2 cProfile calendar cgi cgitb chunk cmath cmd
+  code codecs codeop collections colorsys compileall concurrent configparser contextlib
+  contextvars copy copyreg crypt csv ctypes curses dataclasses datetime dbm decimal difflib dis
+  doctest email encodings ensurepip enum errno faulthandler fcntl filecmp fileinput fnmatch
+  fractions ftplib functools gc genericpath getopt getpass gettext glob graphlib grp gzip
+  hashlib heapq hmac html http idlelib imaplib imghdr importlib inspect io ipaddress itertools
+  json keyword lib2to3 linecache locale logging lzma mailbox mailcap marshal math mimetypes mmap
+  modulefinder msilib msvcrt multiprocessing netrc nis nntplib nt ntpath nturl2path numbers
+  opcode operator optparse os ossaudiodev pathlib pdb pickle pickletools pipes pkgutil platform
+  plistlib poplib posix posixpath pprint profile pstats pty pwd py_compile pyclbr pydoc
+  pydoc_data pyexpat queue quopri random re readline reprlib resource rlcompleter runpy sched
+  secrets select selectors shelve shlex shutil signal site smtplib sndhdr socket socketserver
+  spwd sqlite3 sre_compile sre_constants sre_parse ssl stat statistics string stringprep struct
+  subprocess sunau symtable sys sysconfig syslog tabnanny tarfile telnetlib tempfile termios
+  textwrap this threading time timeit tkinter token tokenize tomllib trace traceback tracemalloc
+  tty turtle turtledemo types typing unicodedata unittest urllib uu uuid venv warnings wave
+  weakref webbrowser winreg winsound wsgiref xdrlib xml xmlrpc zipapp zipfile zipimport zlib
+  zoneinfo
+`;
+
+// Two names that list lacks and the runtime image's Python 3.12 still imports
+// without a package from the index: `distutils`, removed from the standard
+// library in 3.12 but provided there by setuptools, a system package pip
+// depends on; and `test`, the regression-test package, which the standard
+// library ships and `sys.stdlib_module_names` leaves out. The other modules
+// 3.12 removed (`asynchat`, `asyncore`, `imp`, `smtpd`) import nowhere without
+// a package, so a script importing one draws the warning.
+const PYTHON_STDLIB_BEYOND_3_12 = ["distutils", "test"];
+
 const PYTHON_STDLIB = new Set<string>([
-  "abc",
-  "argparse",
-  "array",
-  "ast",
-  "asynchat",
-  "asyncio",
-  "asyncore",
-  "base64",
-  "binascii",
-  "bisect",
-  "builtins",
-  "calendar",
-  "collections",
-  "colorsys",
-  "concurrent",
-  "configparser",
-  "contextlib",
-  "contextvars",
-  "copy",
-  "copyreg",
-  "csv",
-  "ctypes",
-  "curses",
-  "dataclasses",
-  "datetime",
-  "decimal",
-  "difflib",
-  "dis",
-  "doctest",
-  "email",
-  "enum",
-  "errno",
-  "faulthandler",
-  "fcntl",
-  "filecmp",
-  "fileinput",
-  "fnmatch",
-  "fractions",
-  "ftplib",
-  "functools",
-  "gc",
-  "getopt",
-  "getpass",
-  "gettext",
-  "glob",
-  "gzip",
-  "hashlib",
-  "heapq",
-  "hmac",
-  "html",
-  "http",
-  "imaplib",
-  "imp",
-  "importlib",
-  "inspect",
-  "io",
-  "ipaddress",
-  "itertools",
-  "json",
-  "keyword",
-  "linecache",
-  "locale",
-  "logging",
-  "lzma",
-  "mailbox",
-  "math",
-  "mimetypes",
-  "multiprocessing",
-  "netrc",
-  "numbers",
-  "operator",
-  "os",
-  "pathlib",
-  "pickle",
-  "pickletools",
-  "pkgutil",
-  "platform",
-  "plistlib",
-  "poplib",
-  "pprint",
-  "queue",
-  "quopri",
-  "random",
-  "re",
-  "readline",
-  "reprlib",
-  "resource",
-  "secrets",
-  "select",
-  "selectors",
-  "shelve",
-  "shlex",
-  "shutil",
-  "signal",
-  "site",
-  "smtpd",
-  "smtplib",
-  "sndhdr",
-  "socket",
-  "socketserver",
-  "sqlite3",
-  "ssl",
-  "stat",
-  "statistics",
-  "string",
-  "stringprep",
-  "struct",
-  "subprocess",
-  "symtable",
-  "sys",
-  "sysconfig",
-  "tabnanny",
-  "tarfile",
-  "telnetlib",
-  "tempfile",
-  "termios",
-  "test",
-  "textwrap",
-  "threading",
-  "time",
-  "timeit",
-  "tkinter",
-  "token",
-  "tokenize",
-  "tomllib",
-  "trace",
-  "traceback",
-  "tracemalloc",
-  "tty",
-  "turtle",
-  "types",
-  "typing",
-  "unicodedata",
-  "unittest",
-  "urllib",
-  "uu",
-  "uuid",
-  "venv",
-  "warnings",
-  "wave",
-  "weakref",
-  "webbrowser",
-  "wsgiref",
-  "xdrlib",
-  "xml",
-  "xmlrpc",
-  "zipapp",
-  "zipfile",
-  "zipimport",
-  "zlib",
-  "zoneinfo",
+  ...PYTHON_3_12_STDLIB.split(/\s+/).filter(Boolean),
+  ...PYTHON_STDLIB_BEYOND_3_12,
 ]);
 
 // Node.js built-in module names (Node 20+). Both bare (`fs`) and prefixed

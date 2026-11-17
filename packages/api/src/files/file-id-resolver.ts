@@ -1,33 +1,17 @@
 import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { extname, join, sep } from "node:path";
+import { join, sep } from "node:path";
 import { getInputFile } from "../cache/input-cache.js";
 import { getOutputFileById } from "../cache/output-cache.js";
-
-const CONTENT_TYPES: Record<string, string> = {
-  ".pdf": "application/pdf",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".webp": "image/webp",
-  ".csv": "text/csv",
-  ".json": "application/json",
-  ".html": "text/html",
-  ".txt": "text/plain",
-  ".md": "text/markdown",
-  ".xml": "application/xml",
-  ".zip": "application/zip",
-  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-};
-
-function inferMediaType(filename: string): string {
-  return CONTENT_TYPES[extname(filename).toLowerCase()] ?? "application/octet-stream";
-}
+import { contentTypeFor } from "./content-types.js";
 
 export interface ResolvedFile {
   source: "input" | "output";
   path: string;
+  /**
+   * The name a download of the file carries: an output's file name; for an
+   * input, its `file_id` (an upload keeps no name of its own).
+   */
+  name: string;
   metadata: {
     size: number;
     media_type: string;
@@ -47,6 +31,7 @@ export function resolveFileId(fileId: string): ResolvedFile | null {
     return {
       source: "input",
       path: inputMeta.path,
+      name: fileId,
       metadata: {
         size: inputMeta.size,
         media_type: inputMeta.media_type,
@@ -71,9 +56,10 @@ export function resolveFileId(fileId: string): ResolvedFile | null {
     return {
       source: "output",
       path,
+      name: outputEntry.filename,
       metadata: {
         size: lstat.size,
-        media_type: inferMediaType(outputEntry.filename),
+        media_type: contentTypeFor(outputEntry.filename),
         purpose: "output",
       },
     };

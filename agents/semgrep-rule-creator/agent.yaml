@@ -1,12 +1,12 @@
 name: semgrep-rule-creator
-version: 0.1.0
+version: 0.2.1
 
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
   fallback:
     provider: google
-    name: gemini-2.5-flash-lite
+    name: gemini-3.5-flash-lite
 
 tools:
   - name: write_artifact
@@ -62,10 +62,7 @@ outputs:
 environment:
   networking:
     allowed_hosts: []
-  filesystem: read-write
-  secrets: []
   timeout: 120s
-  sandbox: strict
 
 state:
   type: none
@@ -84,7 +81,7 @@ tests:
         const res = await fetch(url);
         return res.text();
       language: typescript
-    assert: output.severity == "ERROR" || output.severity == "WARNING"
+    assert: output.cwe == "CWE-918"
   - name: sql-injection-python
     input:
       cve_description: |

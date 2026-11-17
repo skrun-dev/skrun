@@ -34,6 +34,8 @@
 # Or a single target directly:
 #   docker build --target runner     -t skrun-runtime:runner     infra/runtime-image/
 #   docker build --target api-server -t skrun-runtime:api-server infra/runtime-image/
+# Add `--build-arg SKRUN_IMAGE_VERSION=<version>` to name the image on the
+# runner's boot line (`image=<version>`); without it, the line says `unknown`.
 
 # ============================ shared base ============================
 # Digest-pinned: a tag is mutable, so `ubuntu:24.04` can
@@ -52,10 +54,13 @@ FROM ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a
 # NOTE: `build-essential` is intentionally NOT installed here — it is only needed
 # by the `api-server` target (self-host compiles native deps for some agent Python
 # packages — pandas/numpy/etc. — at RUNTIME via the LocalAdapter + depsCache). The
-# runner never installs agent deps (ScriptToolProvider runs with no depsCache in
-# runner mode), and its own npm install below is pure-JS (Hono + MCP SDK) → no C
-# compiler needed. Keeping build-essential out of the base is the bulk of the
-# runner slim-down.
+# runner installs an agent's declared script dependencies too, at run time, inside
+# its sandbox (pip and venv from this layer, npm from mise) — but WITHOUT a
+# compiler: a package with no prebuilt wheel for the machine's platform cannot
+# install there, and the agent's first tool call returns that failure. The
+# runner's own npm install below is pure-JS (Hono + MCP SDK) → no C compiler
+# needed. Keeping build-essential out of the base is the bulk of the runner
+# slim-down.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get -o Acquire::Retries=3 update \
@@ -144,41 +149,91 @@ WORKDIR /mnt/agent
 
 # ---------- Runner (standalone Node app) ----------
 #
-# The runner is a STANDALONE Node package (not a pnpm workspace member) to avoid
-# leaking its lockfile into the public OSS repo via `pnpm-lock.yaml`. Its sole
-# dependency on `@skrun-dev/runtime` is injected at build time as RUNTIME_TGZ.
+# The runner is a STANDALONE Node package, not a pnpm workspace member: npm
+# installs it here, from its own lock. It runs on `@skrun-dev/runtime` and
+# `@skrun-dev/schema`, packed from this repository at build time (RUNTIME_TGZ,
+# SCHEMA_TGZ).
 #
-# `pnpm pack` REWRITES `@skrun-dev/schema: workspace:*` to a CONCRETE version, so
-# the runtime tarball asks for `@skrun-dev/schema@<this release>`. That version is
-# only on the public registry AFTER npm publish — so resolving it from there made
-# the image build depend on the publish having already happened. It held for every
-# `-dev` build (the packages stayed at the last published version) and broke the
-# first time a release bumped them: v1.0.0 died on
-# `notarget No matching version found for @skrun-dev/schema@1.0.0`.
+# Every version it installs is the one pnpm-lock.yaml resolved, i.e. the one the
+# repository's tests ran against, transitive dependencies included — as long as
+# the lock is the one update-locks.sh writes: runner/package.json pins the
+# runner's own dependencies AND the production dependencies of the two tarballs,
+# update-locks.sh seeds runner/package-lock.json from the tree pnpm deploys from
+# pnpm-lock.yaml, and `npm ci` installs exactly that lock or fails. Regenerate the lock with
+# `bash infra/runtime-image/update-locks.sh` (its header says when).
+# tests/e2e/image-locks.test.ts fails when the pins differ from pnpm-lock.yaml's,
+# when the lock was not written from this manifest, or when it locks a
+# name@version that pnpm-lock.yaml does not hold with the same integrity. It does
+# not prove that pnpm resolved that version for that path: a lock edited by hand
+# to another version pnpm-lock.yaml holds elsewhere would pass it.
+# check-installed-versions.mjs compares a built image with the lock.
 #
-# The schema tarball is installed alongside the runtime one instead, exactly as the
-# api-server target below already does. Same package, same size, no registry lookup.
-# The runner's deps (Hono + MCP SDK) are pure-JS → no build-essential needed here.
+# The tarballs are EXTRACTED into node_modules/@skrun-dev/, never `npm install`ed.
+# Installing a tarball resolves its `^` ranges against the registry at build
+# time, so two builds of one commit could install different versions: v1.2.0
+# shipped an undici release published hours before its build, which no test had
+# run against. Installing them also once made the build depend on the npm
+# publish of the same release (v1.0.0 died on `notarget No matching version found
+# for @skrun-dev/schema@1.0.0`). Extraction resolves nothing, and what the
+# tarballs depend on is already in the lock.
 #
-# Build uses `npm` (not pnpm): the runner has no workspace links. `npm run build`
+# The runner's deps are pure-JS → no build-essential needed here. `npm run build`
 # runs tsc (devDeps must be present — hence NODE_ENV is set per-target LATER, not
-# here, so this install keeps devDependencies).
+# here, so `npm ci` keeps devDependencies).
+#
+# Three steps, in this order, because a COPY invalidates every layer after it:
+#   1. the manifest and its lock, then `npm ci` — the only networked step;
+#   2. the two tarballs, then their extraction, then the blocked-ranges file
+#      written from the runtime (re-run when a tarball's bytes change; no
+#      registry involved);
+#   3. the sources, then the compile.
+# An edit under runner/src/ therefore rebuilds step 3 only: both installs stay
+# cached, and the build needs no registry. Only what the image needs is copied:
+# the smoke scripts next to these files drive Docker from the host, never from
+# inside the image.
 ARG SCHEMA_TGZ=skrun-dev-schema.tgz
 ARG RUNTIME_TGZ=skrun-dev-runtime.tgz
 
-COPY runner/ /opt/skrun-runner/
+COPY runner/package.json runner/package-lock.json /opt/skrun-runner/
+RUN cd /opt/skrun-runner \
+    && npm ci --no-audit --no-fund
+
 COPY ${SCHEMA_TGZ} /opt/skrun-runner/${SCHEMA_TGZ}
 COPY ${RUNTIME_TGZ} /opt/skrun-runner/${RUNTIME_TGZ}
+RUN set -eu; \
+    cd /opt/skrun-runner; \
+    extract() { \
+      mkdir -p "node_modules/@skrun-dev/$1"; \
+      tar -xzf "$2" --strip-components=1 --no-same-owner -C "node_modules/@skrun-dev/$1"; \
+    }; \
+    extract schema "${SCHEMA_TGZ}"; \
+    extract runtime "${RUNTIME_TGZ}"; \
+    rm -f /opt/skrun-runner/*.tgz
 
+# The address ranges an agent may never reach, written from the runtime just
+# extracted — the same list the harness classifies addresses with — one CIDR per
+# line. net-lib.sh reads this file: its private-address check, and the egress
+# rules that drop every range before an agent's host is accepted. Nobody edits it:
+# a build that cannot produce it fails here. No registry involved, and placed
+# after both installs, so it re-runs only when the runtime tarball changes.
+RUN set -eu; \
+    mkdir -p /usr/local/share/skrun; \
+    node --input-type=module -e ' \
+      const { BLOCKED_RANGES } = await import("/opt/skrun-runner/node_modules/@skrun-dev/runtime/dist/security/blocked-ranges.js"); \
+      if (!Array.isArray(BLOCKED_RANGES) || BLOCKED_RANGES.length === 0) throw new Error("BLOCKED_RANGES is empty"); \
+      for (const range of BLOCKED_RANGES) console.log(range); \
+    ' > /usr/local/share/skrun/blocked-ranges; \
+    chmod 0644 /usr/local/share/skrun/blocked-ranges; \
+    test -s /usr/local/share/skrun/blocked-ranges
+
+COPY runner/tsconfig.json /opt/skrun-runner/tsconfig.json
+COPY runner/src/ /opt/skrun-runner/src/
 RUN cd /opt/skrun-runner \
-    && npm install --no-audit --no-fund \
-    && npm install --no-audit --no-fund \
-        /opt/skrun-runner/${SCHEMA_TGZ} /opt/skrun-runner/${RUNTIME_TGZ} \
-    && npm run build \
-    && rm -f /opt/skrun-runner/*.tgz
+    && npm run build
 # NOTE — `npm prune --omit=dev` removed 2026-05-25 (Unit 2/3 H1 fix). Suspected of
 # stripping a transitive prod dep of @skrun-dev/runtime whose absence crashed the
-# runner at module-load. The ~50MB saving wasn't worth the foot-gun.
+# runner at module-load. The ~50MB saving wasn't worth the foot-gun — and a prune
+# would now delete the extracted @skrun-dev packages, which the lock never lists.
 
 # ---------- Entrypoint (shared by both targets) ----------
 # Dispatcher between `runner` (cloud sandbox) and `api-server` (self-host) modes,
@@ -208,6 +263,14 @@ ENV SKRUN_CONTAINER_MODE=runner
 # Set AFTER the base's runner npm install so devDependencies were installed for tsc.
 ENV NODE_ENV=production
 
+# The image's name, printed on the runner's boot line (`image=<value>`) so a
+# machine's log says which build it runs. The release workflow passes the release
+# version through docker-bake.hcl; a build that passes nothing prints `unknown`.
+# Declared LAST, and never in `base`: declared before the install steps, a new
+# value — one per release — would re-run every one of them.
+ARG SKRUN_IMAGE_VERSION=unknown
+ENV SKRUN_IMAGE_VERSION=${SKRUN_IMAGE_VERSION}
+
 # ======================= api-server target (self-host default) =======================
 # Full: the base PLUS build-essential + the Hono API bundle + the operator
 # dashboard. A strict SUPERSET of `runner` (still contains /opt/skrun-runner).
@@ -215,7 +278,8 @@ FROM base AS api-server
 
 # build-essential — native deps for some agent Python packages (pandas/numpy/etc.)
 # installed at RUNTIME by the api-server / LocalAdapter path (ScriptToolProvider +
-# depsCache). The cloud runner never hits this path, so it stays out of that image.
+# depsCache). The cloud runner installs agent deps too, but deliberately without a
+# compiler (see the note in the base stage), so it stays out of that image.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get -o Acquire::Retries=3 update \
@@ -225,24 +289,36 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # ---------- API server bundle (api-server mode) ----------
 #
-# Three tarballs installed as siblings under /opt/skrun-api/node_modules/, in
-# dependency order (schema → runtime → api) so npm resolves each `workspace:*` ref
-# to the corresponding tarball at install time. The api package ships its prod
-# deps (Hono, pg, AWS SDK, etc.) via the standard npm registry.
+# Same scheme as the runner block above. api-server/package.json pins the
+# production dependencies of the three tarballs (schema, runtime, api) to the
+# versions pnpm-lock.yaml resolved, api-server/package-lock.json is derived from
+# pnpm-lock.yaml (update-locks.sh), and `npm ci --omit=dev` installs exactly that
+# lock — better-sqlite3 included, whose install script builds it here, for this
+# image's architecture, with the build-essential above. The three tarballs are
+# then EXTRACTED into node_modules/@skrun-dev/, never `npm install`ed: that
+# install re-resolved their `^` ranges at build time, and v1.2.0's failure came
+# in through this block.
 ARG SCHEMA_TGZ=skrun-dev-schema.tgz
 ARG RUNTIME_TGZ=skrun-dev-runtime.tgz
 ARG API_TGZ=skrun-dev-api.tgz
 
-RUN mkdir -p /opt/skrun-api
+COPY api-server/package.json api-server/package-lock.json /opt/skrun-api/
+RUN cd /opt/skrun-api \
+    && npm ci --omit=dev --no-audit --no-fund
+
 COPY ${SCHEMA_TGZ} /opt/skrun-api/${SCHEMA_TGZ}
 COPY ${RUNTIME_TGZ} /opt/skrun-api/${RUNTIME_TGZ}
 COPY ${API_TGZ} /opt/skrun-api/${API_TGZ}
-
-RUN cd /opt/skrun-api \
-    && npm init -y >/dev/null \
-    && npm install --no-audit --no-fund \
-        ./${SCHEMA_TGZ} ./${RUNTIME_TGZ} ./${API_TGZ} \
-    && rm -f /opt/skrun-api/*.tgz
+RUN set -eu; \
+    cd /opt/skrun-api; \
+    extract() { \
+      mkdir -p "node_modules/@skrun-dev/$1"; \
+      tar -xzf "$2" --strip-components=1 --no-same-owner -C "node_modules/@skrun-dev/$1"; \
+    }; \
+    extract schema "${SCHEMA_TGZ}"; \
+    extract runtime "${RUNTIME_TGZ}"; \
+    extract api "${API_TGZ}"; \
+    rm -f /opt/skrun-api/*.tgz
 
 # ---------- Dashboard (operator web SPA — api-server mode) ----------
 # The operator dashboard (packages/web, a Vite SPA) is served by api-server mode
@@ -256,6 +332,12 @@ ENV SKRUN_DASHBOARD_DIR=/opt/skrun-web/dist
 ENV SKRUN_CONTAINER_MODE=api-server
 
 # Production by default so the dev-auth fail-secure interlock holds even on a bare
-# `docker run` (no compose / Fly env). See packages/api/src/index.ts. Set AFTER the
-# npm installs above so they kept devDependencies (parity with the pre-split image).
+# `docker run` (no compose / Fly env). See packages/api/src/index.ts. Set last: the
+# API's install above omits devDependencies itself (`--omit=dev`), and the runner's,
+# in the base stage, needs them for tsc.
 ENV NODE_ENV=production
+
+# Same as the runner target, and for the same reason last: this image also boots
+# in runner mode (it is a superset), and then names itself the same way.
+ARG SKRUN_IMAGE_VERSION=unknown
+ENV SKRUN_IMAGE_VERSION=${SKRUN_IMAGE_VERSION}

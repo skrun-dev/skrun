@@ -1,17 +1,9 @@
 import { stdin } from "node:process";
+import { ModelProviderSchema } from "@skrun-dev/schema";
 import type { Command } from "commander";
-import { getRegistryUrl, getToken } from "../utils/auth.js";
+import { CliExit, exitWith } from "../utils/exit.js";
 import * as format from "../utils/format.js";
-import { RegistryClient } from "../utils/registry-client.js";
-
-function client(): RegistryClient {
-  const token = getToken();
-  if (!token) {
-    format.error("Not logged in. Run `skrun login` first.");
-    process.exit(1);
-  }
-  return new RegistryClient(getRegistryUrl(), token);
-}
+import { connect } from "../utils/registry-client.js";
 
 /** Split `<namespace>/<name>` into its parts. Pure (tested). */
 export function splitAgent(agent: string): { ns: string; name: string } {
@@ -22,17 +14,56 @@ export function splitAgent(agent: string): { ns: string; name: string } {
   return { ns, name };
 }
 
-/** Normalise the CLI policy arg (`open` | `creator-only`/`creator_only`). Pure (tested). */
+/**
+ * An environment variable's name written the conventional way — the only kind
+ * of value an error message repeats. Every known provider's key carries
+ * lower-case letters, so a key typed where a name is expected never matches,
+ * and is never echoed back to a terminal or a CI log.
+ */
+export const CONVENTIONAL_VARIABLE_NAME = /^[A-Z_][A-Z0-9_]*$/;
+
+const PROVIDERS: readonly string[] = ModelProviderSchema.options;
+
+/**
+ * A provider argument, read against the providers `agent.yaml` knows in any
+ * letter case, and returned lower-cased — the form the registry stores and the
+ * run route compares to the letter; undefined when unknown. The one rule for
+ * `skrun llm-key` and `skrun run`. Pure (tested).
+ */
+export function knownProvider(provider: string): string | undefined {
+  const lowerCased = provider.toLowerCase();
+  return PROVIDERS.includes(lowerCased) ? lowerCased : undefined;
+}
+
+/** The providers `agent.yaml` knows, as an error message lists them. */
+export const KNOWN_PROVIDERS = PROVIDERS.join(", ");
+
+/**
+ * Check a provider argument before anything is sent, and return it lower-cased.
+ * An unknown value is not repeated: it may be a key typed in the wrong place.
+ * Pure (tested).
+ */
+export function checkProviderArg(provider: string): string {
+  const known = knownProvider(provider);
+  if (!known) throw new Error(`Unknown provider. Known providers: ${KNOWN_PROVIDERS}.`);
+  return known;
+}
+
+/**
+ * Normalise the CLI policy arg (`open` | `creator-only`/`creator_only`). A
+ * refused value is not repeated. Pure (tested).
+ */
 export function parsePolicy(arg: string): "open" | "creator_only" {
   const normalized = arg.toLowerCase().replace("-", "_");
   if (normalized === "open") return "open";
   if (normalized === "creator_only") return "creator_only";
-  throw new Error(`Invalid policy '${arg}'. Use 'open' or 'creator-only'.`);
+  throw new Error("Invalid policy. Use 'open' or 'creator-only'.");
 }
 
 /**
  * Resolve the LLM key from `--key-env <VAR>` or stdin — NEVER a positional
- * argument, so the secret doesn't land in the shell history. Pure (tested).
+ * argument, so the secret doesn't land in the shell history. The variable is
+ * named in an error only when its name is conventional. Pure (tested).
  */
 export async function resolveKeyInput(
   opts: { keyEnv?: string },
@@ -42,7 +73,12 @@ export async function resolveKeyInput(
   if (opts.keyEnv) {
     const value = env[opts.keyEnv];
     if (!value?.trim()) {
-      throw new Error(`Environment variable ${opts.keyEnv} is empty or unset.`);
+      throw new Error(
+        CONVENTIONAL_VARIABLE_NAME.test(opts.keyEnv)
+          ? `Environment variable ${opts.keyEnv} is empty or unset.`
+          : // An unusual name may be a key typed in the wrong place: not repeated.
+            "The environment variable given to --key-env is empty or unset.",
+      );
     }
     return value.trim();
   }
@@ -64,7 +100,8 @@ async function readStdin(): Promise<string> {
  * a key lets your callers run the agent without supplying their own key (you cover
  * the inference). The key is read from stdin or `--key-env`, never an argument, so
  * it never reaches the shell history; the server stores it encrypted and never
- * returns it.
+ * returns it. No error message repeats a value that may be a key typed in the
+ * wrong place (a variable name, a provider, a policy).
  */
 export function registerLlmKeyCommand(program: Command): void {
   const cmd = program.command("llm-key").description("Manage your agent's creator LLM keys");
@@ -77,12 +114,14 @@ export function registerLlmKeyCommand(program: Command): void {
     .action(async (provider: string, opts: { agent: string; keyEnv?: string }) => {
       try {
         const { ns, name } = splitAgent(opts.agent);
+        const known = checkProviderArg(provider);
         const key = await resolveKeyInput(opts, process.env, readStdin);
-        await client().setLlmKey(ns, name, provider, key);
-        format.success(`Attached ${provider} key to ${opts.agent}.`);
+        await connect().setLlmKey(ns, name, known, key);
+        format.success(`Attached ${known} key to ${opts.agent}.`);
       } catch (err) {
+        if (err instanceof CliExit) throw err; // connect() already said why
         format.error(err instanceof Error ? err.message : String(err));
-        process.exit(1);
+        exitWith(1);
       }
     });
 
@@ -93,7 +132,7 @@ export function registerLlmKeyCommand(program: Command): void {
     .action(async (opts: { agent: string }) => {
       try {
         const { ns, name } = splitAgent(opts.agent);
-        const { policy, keys } = await client().listLlmKeys(ns, name);
+        const { policy, keys } = await connect().listLlmKeys(ns, name);
         format.info(`policy: ${policy}`);
         if (keys.length === 0) {
           format.info("No LLM key attached.");
@@ -103,8 +142,9 @@ export function registerLlmKeyCommand(program: Command): void {
           format.info(`${String(k.provider)}  ••••${String(k.last4)}`);
         }
       } catch (err) {
+        if (err instanceof CliExit) throw err; // connect() already said why
         format.error(err instanceof Error ? err.message : String(err));
-        process.exit(1);
+        exitWith(1);
       }
     });
 
@@ -115,11 +155,13 @@ export function registerLlmKeyCommand(program: Command): void {
     .action(async (provider: string, opts: { agent: string }) => {
       try {
         const { ns, name } = splitAgent(opts.agent);
-        await client().removeLlmKey(ns, name, provider);
-        format.success(`Removed ${provider} key from ${opts.agent}.`);
+        const known = checkProviderArg(provider);
+        await connect().removeLlmKey(ns, name, known);
+        format.success(`Removed ${known} key from ${opts.agent}.`);
       } catch (err) {
+        if (err instanceof CliExit) throw err; // connect() already said why
         format.error(err instanceof Error ? err.message : String(err));
-        process.exit(1);
+        exitWith(1);
       }
     });
 
@@ -131,11 +173,12 @@ export function registerLlmKeyCommand(program: Command): void {
       try {
         const { ns, name } = splitAgent(opts.agent);
         const policy = parsePolicy(policyArg);
-        await client().setLlmKeyPolicy(ns, name, policy);
+        await connect().setLlmKeyPolicy(ns, name, policy);
         format.success(`Set caller-key policy to ${policy} for ${opts.agent}.`);
       } catch (err) {
+        if (err instanceof CliExit) throw err; // connect() already said why
         format.error(err instanceof Error ? err.message : String(err));
-        process.exit(1);
+        exitWith(1);
       }
     });
 }

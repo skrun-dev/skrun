@@ -1,6 +1,6 @@
 {
   "name": "@skrun-dev/api",
-  "version": "1.2.1",
+  "version": "2.0.0",
   "type": "module",
   "exports": {
     ".": {
@@ -14,7 +14,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc && node -e \"require('fs').cpSync('src/db/migrations','dist/db/migrations',{recursive:true})\"",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc --noEmit -p tsconfig.json && tsc -p tsconfig.build.json && node -e \"require('fs').cpSync('src/db/migrations','dist/db/migrations',{recursive:true});require('fs').cpSync('src/services/agent-yaml-worker.mjs','dist/services/agent-yaml-worker.mjs')\"",
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "node --use-system-ca --env-file=../../.env --import tsx src/dev.ts"
@@ -22,25 +22,26 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1053.0",
     "@aws-sdk/s3-request-presigner": "^3.1053.0",
-    "@hono/node-server": "^2.1.1",
+    "@hono/node-server": "^2.1.6",
     "@skrun-dev/runtime": "workspace:*",
     "@skrun-dev/schema": "workspace:*",
     "@upstash/ratelimit": "^2.0.8",
     "@upstash/redis": "^1.38.0",
     "better-sqlite3": "^12.9.0",
-    "hono": "^4.13.4",
+    "hono": "^4.13.16",
     "pg": "^8.20.0",
-    "tldts": "^7.4.12"
+    "tldts": "^7.4.16"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.6.0",
     "@types/pg": "^8.20.0",
     "@types/tar-stream": "3.1.4",
+    "github-slugger": "2.0.0",
     "tar-stream": "3.2.0",
     "tsx": "^4.23.13",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   },
   "publishConfig": {
     "access": "public"
@@ -59,6 +60,6 @@
     "ai-agents"
   ],
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.19.0"
   }
 }

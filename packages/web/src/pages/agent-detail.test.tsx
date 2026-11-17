@@ -1,8 +1,9 @@
-import { screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import { Route, Routes } from "react-router-dom";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { instanceLinks, useInstance } from "../lib/api-client";
 import { renderWithProviders } from "../test-utils";
 import { AgentDetailPage } from "./agent-detail";
 
@@ -261,6 +262,32 @@ describe("AgentDetailPage", () => {
     });
   });
 
+  it("keeps its API link on this server's API reference when the operator sets its own docs", async () => {
+    server.use(
+      http.get("/api/instance", () =>
+        HttpResponse.json({
+          links: { docs: "https://docs.example.com", terms: null, privacy: null },
+        }),
+      ),
+    );
+    // Reads the instance beside the page: once its answer is shown, the page could read it too.
+    function InstanceDocs() {
+      return <p>instance docs: {instanceLinks(useInstance().data).docs}</p>;
+    }
+    renderWithProviders(
+      <>
+        <InstanceDocs />
+        <Routes>
+          <Route path="/agents/:namespace/:name" element={<AgentDetailPage />} />
+        </Routes>
+      </>,
+      { route: "/agents/dev/test-agent" },
+    );
+
+    await screen.findByText("instance docs: https://docs.example.com");
+    expect((await screen.findByRole("link", { name: "API" })).getAttribute("href")).toBe("/docs");
+  });
+
   it("preserves emoji when truncating (grapheme-safe)", async () => {
     // 79 'a' chars + 2 emoji = 81 graphemes → truncated to 80 without splitting the emoji
     const note = `${"a".repeat(79)}🚀🎉`;
@@ -509,5 +536,37 @@ describe("AgentDetailPage", () => {
       });
       expect(screen.queryByRole("button", { name: /^(un)?verify$/i })).not.toBeInTheDocument();
     });
+  });
+});
+
+describe("AgentDetailPage — the curl of Try it asks for the event stream", () => {
+  // The clipboard, watched: what the page copies is read back, never written anywhere.
+  let writeText: ReturnType<typeof vi.fn>;
+  beforeEach(() => {
+    writeText = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  });
+  afterEach(() => {
+    Reflect.deleteProperty(navigator, "clipboard");
+  });
+
+  it("the curl shown carries the header that asks for the stream", async () => {
+    renderDetailPage();
+
+    const shown = await screen.findByText(/^curl -X POST /);
+
+    expect(shown.textContent).toMatch(/^curl -X POST \S+\/api\/agents\/dev\/test-agent\/run /);
+    expect(shown.textContent).toContain('-H "Accept: text/event-stream"');
+  });
+
+  it("the curl copied carries it too", async () => {
+    renderDetailPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Copy" }));
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    const copied = String(writeText.mock.calls[0]?.[0]);
+    expect(copied).toMatch(/^curl -X POST \S+\/api\/agents\/dev\/test-agent\/run /);
+    expect(copied).toContain('-H "Accept: text/event-stream"');
   });
 });

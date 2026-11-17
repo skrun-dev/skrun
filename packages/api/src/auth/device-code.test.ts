@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   computeExpiresIn,
   generateDeviceCode,
@@ -57,5 +57,26 @@ describe("device-code primitives", () => {
       if (prev === undefined) delete process.env.SKRUN_DEVICE_CODE_TTL_S;
       else process.env.SKRUN_DEVICE_CODE_TTL_S = prev;
     }
+  });
+
+  describe("past a hundred years", () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    // A bound on the date, not a policy: a hundred years keep a code's expiry
+    // far from the years where it would leave the four-digit form (past 9999)
+    // or stop being a date (past about 275760). The value at the cap is taken as
+    // it is, the next one is capped. Written in digits — Number.parseInt reads
+    // "1e13" as 1.
+    it.each([
+      ["3153599999", 3_153_599_999],
+      ["3153600000", 3_153_600_000],
+      ["3153600001", 3_153_600_000],
+      ["10000000000000", 3_153_600_000],
+    ] as const)("SKRUN_DEVICE_CODE_TTL_S=%s is read as %i seconds", (configured, seconds) => {
+      vi.stubEnv("SKRUN_DEVICE_CODE_TTL_S", configured);
+      expect(ttlSeconds()).toBe(seconds);
+    });
   });
 });

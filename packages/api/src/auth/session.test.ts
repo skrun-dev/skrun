@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import ts from "typescript";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryDb } from "../db/memory.js";
 import { SqliteDb } from "../db/sqlite.js";
@@ -29,6 +30,7 @@ describe("Session Management", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it("createSession returns a UUID session ID", async () => {
@@ -76,14 +78,14 @@ describe("Session Management", () => {
   });
 
   // RT-4 (#124): the cookie options themselves did not change — only the value
-  // maxAge derives from. The last assertions were the boundary with this
-  // cross-subdomain handoff: no domain attribute, and a plain cookie name with no
-  // __Host-/__Secure- prefix. That boundary is now crossed, so the guard is
-  // rewritten rather than removed — a frontier whose sentry is deleted along with
-  // it is a frontier everyone still believes in. It now guards BOTH sides: the
-  // unconfigured deployment keeps every value #124 pinned, and the configured one
-  // is the only one that gains a domain and a prefix.
-  it("RT-4 (#124): unconfigured, the cookie options and name are unchanged — configured, they are not", () => {
+  // maxAge derives from. The last assertions were the boundary with the
+  // cross-subdomain handoff: no domain attribute, and a plain cookie name. The
+  // name half of that boundary has moved twice since, so the guard is rewritten
+  // rather than removed — a frontier whose sentry is deleted along with it is a
+  // frontier everyone still believes in. Unconfigured production keeps every
+  // OPTION #124 pinned and no domain, but its name is now host-locked; the
+  // configured one gains a domain and the transport prefix instead.
+  it("RT-4 (#124): unconfigured, the cookie options are unchanged and the name is host-locked — configured, it takes the domain", () => {
     const previousEnv = process.env.NODE_ENV;
     const previousDomain = process.env.SKRUN_SESSION_COOKIE_DOMAIN;
     try {
@@ -101,13 +103,14 @@ describe("Session Management", () => {
       process.env.NODE_ENV = "production";
       expect(getSessionCookieOptions().secure).toBe(true);
 
-      // Still true in production with nothing configured — the self-host promise.
+      // Production with nothing configured: still host-only, and the name is the
+      // host-locking one — the prefix a sibling host of the zone cannot set here.
       expect(getSessionCookieOptions()).not.toHaveProperty("domain");
-      expect(sessionCookieName()).toBe("skrun_session");
-      expect(sessionCookieName().startsWith("__")).toBe(false);
+      expect(sessionCookieName()).toBe("__Host-skrun_session");
 
       // And the crossing itself, so the guard says where the frontier moved to:
-      // the domain is what puts a prefix on the name and a Domain on the cookie.
+      // the domain is what puts a Domain on the cookie, and it swaps the prefix
+      // for the one that allows a Domain.
       process.env.SKRUN_SESSION_COOKIE_DOMAIN = "example.com";
       expect(getSessionCookieOptions()).toHaveProperty("domain", "example.com");
       expect(sessionCookieName()).toBe("__Secure-skrun_session");
@@ -175,12 +178,39 @@ describe("Session Management", () => {
       else process.env.SESSION_TTL_S = previous;
     }
   });
+
+  // The session lifetime is also the cookie's Max-Age, which hono refuses to
+  // write past 400 days, and far enough out the stored expiry is no date at all.
+  // Past 400 days the setting is read as 400 days, by both of its readers: the
+  // value at the cap is taken as it is, the next one is capped. The huge value is
+  // written in digits — Number.parseInt reads "1e13" as 1.
+  it.each([
+    ["34559999", 34_559_999],
+    ["34560000", 34_560_000],
+    ["34560001", 34_560_000],
+    ["63072000", 34_560_000],
+    ["10000000000000", 34_560_000],
+  ] as const)("SESSION_TTL_S=%s is read as %i seconds, by the stored expiry and by the cookie", async (configured, seconds) => {
+    vi.stubEnv("SESSION_TTL_S", configured);
+
+    const before = Date.now();
+    const created = createSession(db, "user-cap");
+    await expect(created).resolves.toEqual(expect.any(String));
+    const after = Date.now();
+
+    expect(getSessionCookieOptions().maxAge).toBe(seconds);
+
+    const row = await db.getSession(hashSessionId(await created));
+    const expiresMs = Date.parse(row?.expires_at ?? "");
+    expect(expiresMs).toBeGreaterThanOrEqual(before + seconds * 1000);
+    expect(expiresMs).toBeLessThanOrEqual(after + seconds * 1000);
+  });
 });
 
 // The name and the Domain attribute are decided by two independent settings —
 // the environment and the configured domain — so the interesting thing is the
-// GRID, not any one cell. Three of its four cells must leave the cookie exactly
-// as it was before this element, and only the fourth may change anything.
+// GRID, not any one cell. Only the domain cells may carry a Domain attribute,
+// and only the production cells may carry a prefix.
 //
 // Note on the fixtures: only SKRUN_SESSION_COOKIE_DOMAIN is read by the two
 // functions under test. SKRUN_PUBLIC_URL is set alongside it because the two
@@ -204,16 +234,33 @@ describe("the session cookie name and domain across the configuration grid (#123
     }
   });
 
-  // VT-1 — nothing configured. The whole "self-host is untouched" promise lives
-  // in this case, and it has to hold in PRODUCTION too: the published image runs
-  // with NODE_ENV=production, so a prefix that followed the Secure flag alone
-  // would rename the cookie of every self-hoster who configured nothing and log
-  // them all out once.
-  it("VT-1: with no domain configured the cookie is unchanged, in development AND in production", () => {
-    for (const env of ["development", "production"]) {
+  // The name over the whole grid, one label per cell. Outside production there
+  // is no Secure flag, so no prefix is possible. In production the name is
+  // always prefixed, and the domain only chooses which prefix: host-locking
+  // without one (a sibling host of the zone can no longer plant the cookie),
+  // the transport prefix with one (host-locking forbids a Domain attribute).
+  it("VT-1 (#125): the name across the four cells of environment × domain", () => {
+    const cells: Array<[string, string | undefined, string]> = [
+      ["development", undefined, "skrun_session"],
+      ["development", "example.com", "skrun_session"],
+      ["production", undefined, "__Host-skrun_session"],
+      ["production", "example.com", "__Secure-skrun_session"],
+    ];
+    for (const [env, domain, expected] of cells) {
       process.env.NODE_ENV = env;
-      expect(sessionCookieName(), env).toBe("skrun_session");
-      expect(getSessionCookieOptions(), env).not.toHaveProperty("domain");
+      if (domain === undefined) {
+        delete process.env.SKRUN_PUBLIC_URL;
+        delete process.env.SKRUN_SESSION_COOKIE_DOMAIN;
+      } else {
+        process.env.SKRUN_PUBLIC_URL =
+          env === "production" ? "https://api.example.com" : "http://api.example.com";
+        process.env.SKRUN_SESSION_COOKIE_DOMAIN = domain;
+      }
+      const label = `${env} × ${domain ?? "no domain"}`;
+      expect(sessionCookieName(), label).toBe(expected);
+      if (domain === undefined) {
+        expect(getSessionCookieOptions(), label).not.toHaveProperty("domain");
+      }
     }
   });
 
@@ -257,38 +304,59 @@ describe("the session cookie name and domain across the configuration grid (#123
     expect(sessionCookieDomain()).toBe("example.com");
   });
 
-  // The erasure factory is what a sign-out loops over, and its SIZE is the whole
-  // point: it is bounded by what is configured, and every prefixed entry carries
-  // the Secure flag that makes the write legal. Getting this wrong throws at
-  // serialisation time, in production only — see the sign-out cases in
-  // routes/auth.test.ts, which exercise it through real setCookie calls.
-  it("the erasure list is one, two or four entries, and every one of them is legal", () => {
-    process.env.NODE_ENV = "production";
-    expect(sessionCookieErasures()).toEqual([
-      { name: "skrun_session", options: { maxAge: 0, path: "/", secure: true } },
-    ]);
-
-    process.env.SKRUN_PUBLIC_URL = "https://api.example.com";
-    process.env.SKRUN_SESSION_COOKIE_DOMAIN = "example.com";
-
-    process.env.NODE_ENV = "development";
-    const unprefixed = sessionCookieErasures();
-    expect(unprefixed).toHaveLength(2);
-    expect(unprefixed.every((e) => e.name === "skrun_session")).toBe(true);
-    expect(unprefixed.map((e) => e.options.domain)).toEqual([undefined, "example.com"]);
-
-    process.env.NODE_ENV = "production";
-    const prefixed = sessionCookieErasures();
-    expect(prefixed).toHaveLength(4);
-    expect(prefixed.map((e) => `${e.name}|${e.options.domain ?? "-"}`)).toEqual([
-      "skrun_session|-",
-      "skrun_session|example.com",
-      "__Secure-skrun_session|-",
-      "__Secure-skrun_session|example.com",
-    ]);
-    // The half that makes every one of these calls legal rather than lucky.
-    expect(prefixed.every((e) => e.options.secure === true)).toBe(true);
-    expect(prefixed.every((e) => e.options.maxAge === 0 && e.options.path === "/")).toBe(true);
+  // The erasure factory is what a sign-out loops over. Its rule is uniform —
+  // every name the cookie can carry × every addressable scope — and its filter is
+  // what makes it legal: hono throws on a prefixed name without Secure and on a
+  // __Host- name with a Domain, in production only. The exact list per cell is
+  // pinned, order included; the sign-out cases in routes/auth.test.ts exercise it
+  // through real setCookie calls.
+  it("VT-3 (#125): the erasure list is one, two, three or five entries, and every one of them is legal", () => {
+    const cells: Array<[string, string | undefined, string[]]> = [
+      ["development", undefined, ["skrun_session|-"]],
+      ["development", "example.com", ["skrun_session|-", "skrun_session|example.com"]],
+      [
+        "production",
+        undefined,
+        ["skrun_session|-", "__Host-skrun_session|-", "__Secure-skrun_session|-"],
+      ],
+      [
+        "production",
+        "example.com",
+        [
+          "skrun_session|-",
+          "skrun_session|example.com",
+          "__Host-skrun_session|-",
+          "__Secure-skrun_session|-",
+          "__Secure-skrun_session|example.com",
+        ],
+      ],
+    ];
+    for (const [env, domain, expected] of cells) {
+      process.env.NODE_ENV = env;
+      if (domain === undefined) {
+        delete process.env.SKRUN_PUBLIC_URL;
+        delete process.env.SKRUN_SESSION_COOKIE_DOMAIN;
+      } else {
+        process.env.SKRUN_PUBLIC_URL =
+          env === "production" ? "https://api.example.com" : "http://api.example.com";
+        process.env.SKRUN_SESSION_COOKIE_DOMAIN = domain;
+      }
+      const label = `${env} × ${domain ?? "no domain"}`;
+      const erasures = sessionCookieErasures();
+      expect(
+        erasures.map((e) => `${e.name}|${e.options.domain ?? "-"}`),
+        label,
+      ).toEqual(expected);
+      // The half that makes every one of these calls legal rather than lucky.
+      for (const e of erasures) {
+        expect(e.options.secure, `${label} ${e.name}`).toBe(env === "production");
+        expect(e.options.maxAge, `${label} ${e.name}`).toBe(0);
+        expect(e.options.path, `${label} ${e.name}`).toBe("/");
+        if (e.name.startsWith("__Host-")) {
+          expect(e.options, `${label} ${e.name}`).not.toHaveProperty("domain");
+        }
+      }
+    }
   });
 });
 
@@ -422,8 +490,27 @@ describe("VT-14 (#124): the recurring sweep of expired sessions", () => {
   it("VT-14b (#124): both server entry points start the sweep", () => {
     const srcDir = join(import.meta.dirname, "..");
     for (const entry of ["server.ts", "dev.ts"]) {
-      const source = readFileSync(join(srcDir, entry), "utf8");
-      expect(source, entry).toContain("startSessionSweep(");
+      // Read as a syntax tree: a call commented out is no call, and a comment
+      // holding `/*` cannot hide the code after it.
+      const file = ts.createSourceFile(
+        entry,
+        readFileSync(join(srcDir, entry), "utf8"),
+        ts.ScriptTarget.Latest,
+        true,
+      );
+      let calls = false;
+      const visit = (node: ts.Node): void => {
+        if (
+          ts.isCallExpression(node) &&
+          ts.isIdentifier(node.expression) &&
+          node.expression.text === "startSessionSweep"
+        ) {
+          calls = true;
+        }
+        if (!calls) ts.forEachChild(node, visit);
+      };
+      visit(file);
+      expect(calls, entry).toBe(true);
     }
   });
 });

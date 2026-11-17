@@ -3,7 +3,7 @@
 > **Persona**: Sophie (freelance / consultant — monthly accounting)
 > **Artifacts**: `expenses.xlsx` (multi-sheet, importable to accounting tools) + `monthly.pdf` (1-page summary for the accountant)
 > **Skrun strengths shown**: multimodal vision · code execution (openpyxl + ReportLab) · multi-step LLM orchestration · Files API
-> **Version**: 0.3.0 (vision-native, runtime-resolved deps — see [CHANGELOG](#version-history))
+> **Version**: 0.5.1 (vision-native, runtime-resolved deps — see [CHANGELOG](#version-history))
 
 ## Purpose
 
@@ -20,10 +20,10 @@ This agent reads each receipt photo directly using vision, extracts the structur
 ## Prerequisites
 
 - Skrun running (`pnpm dev:registry` from the repo root)
-- One LLM API key — **Google Gemini** (the agent's primary model `gemini-2.5-flash` supports image inputs natively)
+- One LLM API key — **Google Gemini** (the agent's primary model `gemini-3.8-flash` supports image inputs natively)
 - **Python 3.11+** locally
 
-That's it. The agent's `requirements.txt` (openpyxl + reportlab + pandas, ~80 MB resolved) is installed automatically by the Skrun runtime on first call and cached at `~/.skrun/deps/<hash>/` for subsequent runs.
+That's it. The agent's `requirements.txt` (openpyxl + reportlab + pandas, ~80 MB resolved) is installed automatically by the local registry on its first call and cached on this machine, at `~/.skrun/deps/<hash>/`, for subsequent runs.
 
 ## How to run
 
@@ -33,7 +33,7 @@ From the repo root:
 # 1. Push the agent to your local registry
 cd agents/receipts-to-expenses
 skrun build && skrun push
-skrun verify dev/receipts-to-expenses@0.4.0   # admin step; dev-token = auto-admin
+skrun verify dev/receipts-to-expenses@0.5.1   # admin step; dev-token = auto-admin
 
 # 2. Upload each receipt image and capture the file_id
 RECEIPT_1=$(curl -s -X POST http://localhost:4000/api/files \
@@ -143,6 +143,8 @@ The LLM assigns one of: `meals`, `transportation`, `lodging`, `software`, `offic
 
 ## Version history
 
+- **0.5.1** — the retired `filesystem` field and the empty `secrets` list removed from `agent.yaml`.
+- **0.5.0** — the model is Gemini 3.8 Flash, with Gemini 3.5 Flash-Lite as fallback: Google opens Gemini 2.5 only to accounts that have used it before.
 - **0.3.0** (2026-05-02) — runtime-resolved deps. The manual `pip install -r requirements.txt` step disappeared; Skrun's runtime installs `requirements.txt` automatically on first call and caches at `~/.skrun/deps/<hash>/`.
 - **0.2.0** (2026-05-01) — vision-native. Receipts are passed directly as image files (JPEG/PNG/WebP/HEIC). The LLM reads each image with its native vision capability. **Breaking**: `receipts_dir: string` input replaced by `receipts: file/image[]`; the upstream OCR step is no longer needed; the `read_receipts` tool was removed.
 - **0.1.0** — text-mode. Receipts had to be pre-OCR'd to .txt files; the agent read text via a `read_receipts` tool. Required upstream OCR (Tesseract / iOS Live Text / pdftotext / etc.) before calling.

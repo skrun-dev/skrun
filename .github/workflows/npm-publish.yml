@@ -1,0 +1,369 @@
+name: Publish to npm
+
+# Stages the five public packages on npm from this repository, by OpenID
+# Connect: no npm token exists anywhere in this workflow, and nothing becomes
+# public here. Each version waits on npm until a maintainer approves it there,
+# with their own two-factor authentication.
+#
+# Started by hand (Actions -> Publish to npm -> Run workflow, or
+# `gh workflow run npm-publish.yml -f version=<version>`), on the head of main,
+# once the public CI is green on that commit.
+#
+#   build   - refuses first, before anything is installed: a malformed
+#             version input alone, without echoing it; otherwise every
+#             cause, all printed: a repository other than skrun-dev/skrun
+#             (a fork receives this file too); a commit that is not the head of main; any of
+#             the five packages' version different from the `version` input;
+#             the check runs `check (22)` and `compose` of this commit not
+#             both completed with success (running or absent is a refusal,
+#             not a wait). Those two names are the `check` job (its Node 22
+#             leg) and the `compose` job of ci.yml: renaming either there
+#             makes every publication refuse here, closed by default.
+#             Then installs, builds, packs each package (`pnpm pack` turns the
+#             workspace ranges into the version), checks the five tarballs,
+#             prints the sha512 of each and uploads them as an artifact.
+#             Dependencies' install scripts run in this job only, which
+#             cannot ask for an OpenID Connect token.
+#   publish - in the npm-publish environment, the only job that can ask for
+#             one: downloads the tarballs and refuses any whose sha512 is not
+#             the one the build job printed, installs no dependency and
+#             builds nothing, installs an exact npm, refuses if a
+#             NODE_AUTH_TOKEN is set, then stages the tarballs one by one in
+#             dependency order (schema, runtime, api, sdk, cli) - the first
+#             failure stops the rest, and the summary names it and the ones
+#             not tried. The summary lists each staged package with its stage
+#             id and integrity, to compare with what npm shows before approval.
+#
+# What must exist, by name - no value is ever written here:
+#   the environment npm-publish of this repository, restricted to the branch
+#   main; on npm, each package's trusted publisher naming this repository,
+#   this file and that environment.
+#
+# Pinned: every action by its commit, the tag in the comment on the same line;
+# npm by its exact version. No package cache in either job.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The version to stage: the version of all five packages on main (e.g. 2.0.0)"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      checks: read
+    # The sha512 of each tarball, checked again by the publish job.
+    outputs:
+      sha512_schema: ${{ steps.digests.outputs.sha512_schema }}
+      sha512_runtime: ${{ steps.digests.outputs.sha512_runtime }}
+      sha512_api: ${{ steps.digests.outputs.sha512_api }}
+      sha512_sdk: ${{ steps.digests.outputs.sha512_sdk }}
+      sha512_cli: ${{ steps.digests.outputs.sha512_cli }}
+    env:
+      PUBLISH_REPO: skrun-dev/skrun
+      PUBLISH_BRANCH: main
+      # One check-run name per line; the names carry a space.
+      REQUIRED_CHECKS: |
+        check (22)
+        compose
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Check out the commit this run was started on
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          # The token stays out of .git/config, where the dependencies'
+          # install scripts below could read it.
+          persist-credentials: false
+
+      - name: Refuse
+        # The only step that holds a token: it reads the head of the branch
+        # and the check runs of this commit. Every cause is printed, then the
+        # job fails if there is one; a malformed version is refused alone, first.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The input's shape first, and alone: the refusals below print the
+          # version, and a value that is not X.Y.Z (a newline in it starts a
+          # workflow command) is never printed. No prerelease, no build suffix.
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version: the version input is not of the form X.Y.Z - nothing was packed, nothing was staged"
+            exit 1
+          fi
+
+          # Every command that can fail below is guarded: no cause is skipped.
+          refusals=0
+          refuse() {
+            echo "::error::$1"
+            refusals=$((refusals + 1))
+          }
+
+          if [ "$GITHUB_REPOSITORY" != "$PUBLISH_REPO" ]; then
+            refuse "repository: this workflow publishes from $PUBLISH_REPO only, not from $GITHUB_REPOSITORY"
+          fi
+
+          for p in schema runtime api sdk cli; do
+            found=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).version' "packages/$p/package.json") || found="unreadable"
+            if [ "$found" != "$VERSION" ]; then
+              refuse "version: packages/$p/package.json is at $found, not at the requested $VERSION"
+            fi
+          done
+
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$PUBLISH_BRANCH" --jq .sha) || head=""
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            refuse "head: this run is on $GITHUB_SHA, but the head of $PUBLISH_BRANCH is ${head:-unreadable}"
+          fi
+
+          runs="$RUNNER_TEMP/check-runs.json"
+          if gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?filter=latest&per_page=100" > "$runs"; then
+            while IFS= read -r name; do
+              if [ -z "$name" ]; then
+                continue
+              fi
+              # The most recent check run of that name on this commit, among
+              # those GitHub Actions created: another app can write a check run
+              # under the same name.
+              state=$(CHECK_NAME="$name" node -e '
+                const all = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).check_runs || [];
+                const mine = all.filter((r) => r.name === process.env.CHECK_NAME && r.app && r.app.slug === "github-actions");
+                mine.sort((a, b) => String(a.started_at).localeCompare(String(b.started_at)) || a.id - b.id);
+                const last = mine[mine.length - 1];
+                console.log(last ? last.status + "/" + (last.conclusion || "none") : "absent");
+              ' "$runs") || state="unreadable"
+              if [ "$state" != "completed/success" ]; then
+                refuse "check: \"$name\" on $GITHUB_SHA is $state, not completed/success - wait for the CI, then start again"
+              fi
+            done <<< "$REQUIRED_CHECKS"
+          else
+            refuse "check: the check runs of $GITHUB_SHA could not be read"
+          fi
+
+          if [ "$refusals" -gt 0 ]; then
+            echo "::error::refused ($refusals cause(s)): nothing was packed, nothing was staged"
+            exit 1
+          fi
+          echo "All refusals passed: $PUBLISH_REPO, head of $PUBLISH_BRANCH, version $VERSION, CI green."
+
+      - name: Set up pnpm (the version of packageManager)
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Pack the five packages
+        # The list is written out: the private dashboard package is built
+        # above and never packed.
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/npm-tarballs"
+          mkdir -p "$out"
+          for p in schema runtime api sdk cli; do
+            (cd "packages/$p" && pnpm pack --pack-destination "$out")
+          done
+
+      - name: Check the tarballs
+        # Exactly five, each named after its package and the version; in each
+        # packed package.json no workspace range is left, and every
+        # dependency on another of the five is at this exact version.
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/npm-tarballs"
+          fail=0
+          count=$(find "$dir" -maxdepth 1 -type f | wc -l)
+          if [ "$count" -ne 5 ]; then
+            echo "::error::tarballs: $count files packed, expected 5"
+            fail=1
+          fi
+          for p in schema runtime api sdk cli; do
+            f="skrun-dev-$p-$VERSION.tgz"
+            if [ ! -f "$dir/$f" ]; then
+              echo "::error::tarballs: $f is missing"
+              fail=1
+              continue
+            fi
+            manifest=$(tar -xOzf "$dir/$f" package/package.json)
+            case "$manifest" in
+              *workspace:*)
+                echo "::error::tarballs: $f still carries a workspace: range"
+                fail=1
+                ;;
+            esac
+            bad=$(MANIFEST="$manifest" node -e '
+              const m = JSON.parse(process.env.MANIFEST);
+              const out = [];
+              if (m.version !== process.env.VERSION) out.push("version " + m.version);
+              for (const field of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+                for (const [name, range] of Object.entries(m[field] || {})) {
+                  if (name.startsWith("@skrun-dev/") && range !== process.env.VERSION) out.push(field + " " + name + "@" + range);
+                }
+              }
+              console.log(out.join(", "));
+            ')
+            if [ -n "$bad" ]; then
+              echo "::error::tarballs: $f is not at $VERSION throughout: $bad"
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+      - name: Print the sha512 of each tarball
+        # The form npm shows as integrity, to compare before approval; also
+        # the job's outputs, which the publish job checks its tarballs
+        # against.
+        id: digests
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/npm-tarballs"
+          {
+            echo "### npm tarballs packed at $GITHUB_SHA"
+            echo
+            echo "| Tarball | sha512 (npm integrity) |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for p in schema runtime api sdk cli; do
+            f="skrun-dev-$p-$VERSION.tgz"
+            digest="sha512-$(openssl dgst -sha512 -binary "$dir/$f" | base64 -w0)"
+            echo "$f $digest"
+            echo "| $f | $digest |" >> "$GITHUB_STEP_SUMMARY"
+            echo "sha512_$p=$digest" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Upload the tarballs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: npm-tarballs
+          path: ${{ runner.temp }}/npm-tarballs/*.tgz
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: npm-publish
+    permissions:
+      id-token: write
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Download the tarballs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: npm-tarballs
+          path: ${{ runner.temp }}/npm-tarballs
+
+      - name: Refuse a tarball the build job did not pack
+        # Each downloaded tarball must have the sha512 the build job printed;
+        # a missing value is a mismatch. Checked before anything is staged.
+        env:
+          EXPECTED_SCHEMA: ${{ needs.build.outputs.sha512_schema }}
+          EXPECTED_RUNTIME: ${{ needs.build.outputs.sha512_runtime }}
+          EXPECTED_API: ${{ needs.build.outputs.sha512_api }}
+          EXPECTED_SDK: ${{ needs.build.outputs.sha512_sdk }}
+          EXPECTED_CLI: ${{ needs.build.outputs.sha512_cli }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/npm-tarballs"
+          for p in schema runtime api sdk cli; do
+            name="EXPECTED_$(echo "$p" | tr '[:lower:]' '[:upper:]')"
+            expected="${!name:-}"
+            f="skrun-dev-$p-$VERSION.tgz"
+            if [ ! -f "$dir/$f" ]; then
+              echo "::error::tarball: $f was not downloaded - nothing was staged"
+              exit 1
+            fi
+            actual="sha512-$(openssl dgst -sha512 -binary "$dir/$f" | base64 -w0)"
+            if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+              echo "::error::tarball: $f is not the one the build job packed (build: ${expected:-nothing}, here: $actual) - nothing was staged"
+              exit 1
+            fi
+            echo "$f $actual"
+          done
+
+      - name: Set up Node.js and the npm registry
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install npm 11.21.2
+        # The npm bundled with Node 22 is too old for trusted publishing.
+        run: |
+          set -euo pipefail
+          npm install -g npm@11.21.2 --ignore-scripts
+          found=$(npm --version)
+          if [ "$found" != "11.21.2" ]; then
+            echo "::error::npm: $found installed, expected 11.21.2"
+            exit 1
+          fi
+
+      - name: Stage the five packages
+        # No token: npm authenticates by OpenID Connect, and adds provenance
+        # by itself for a public package of a public repository. No --tag:
+        # latest is the default.
+        run: |
+          set -Eeuo pipefail
+          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NODE_AUTH_TOKEN is set: this job publishes by OpenID Connect only - nothing was staged"
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/npm-tarballs"
+          packages=(schema runtime api sdk cli)
+          current=""
+          stopped() {
+            local untried="" seen=false q
+            for q in "${packages[@]}"; do
+              if [ "$seen" = true ]; then untried="$untried @skrun-dev/$q"; fi
+              if [ "$q" = "$current" ]; then seen=true; fi
+            done
+            echo "::error::staging stopped at @skrun-dev/$current; not tried:${untried:- none}"
+            {
+              echo
+              echo "**Stopped at @skrun-dev/$current** - not tried:${untried:- none}. Nothing is public."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+          trap stopped ERR
+          {
+            echo "### Staged on npm - nothing is public until approved"
+            echo
+            echo "| Package | Version | Stage id | Integrity |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for p in "${packages[@]}"; do
+            current="$p"
+            npm stage publish "$dir/skrun-dev-$p-$VERSION.tgz" --access public --json > "$RUNNER_TEMP/stage-$p.json"
+            # One object keyed by the package name; a missing field reads n/a
+            # and never fails the step: only npm's own exit code stops it.
+            line=$(node -e '
+              let o = {};
+              try {
+                o = Object.values(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")))[0] || {};
+              } catch {}
+              console.log("| " + (o.name || process.argv[2]) + " | " + (o.version || process.argv[3]) + " | " + (o.stageId || "n/a") + " | " + (o.integrity || "n/a") + " |");
+            ' "$RUNNER_TEMP/stage-$p.json" "@skrun-dev/$p" "$VERSION") || line="| @skrun-dev/$p | $VERSION | n/a | n/a |"
+            echo "$line"
+            echo "$line" >> "$GITHUB_STEP_SUMMARY"
+          done

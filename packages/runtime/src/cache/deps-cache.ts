@@ -3,12 +3,17 @@
 // Each cache entry is a directory at `<rootDir>/<hash>/` whose layout is
 // ecosystem-specific:
 //   - Python:  <hash>/venv/                    (Unix: bin/python, Windows: Scripts/python.exe)
-//   - Node:    <hash>/node_modules/             (consumed via NODE_PATH at spawn)
+//   - Node:    <hash>/node_modules/             (consumed via NODE_PATH at spawn,
+//                                                and through a `node_modules` link
+//                                                at the bundle root for ES modules)
 //
 // The hash is a content-addressable SHA-256 of the manifest's CONTENT (no
 // absolute paths). Two bundles with identical `requirements.txt` text on
-// different hosts produce the same hash — required for cross-host
-// determinism and the future cloud Docker BuildKit cache key.
+// different hosts produce the same hash, so an entry is the same wherever it
+// was installed. Where the cache lives decides what that buys: a server that
+// runs agent scripts itself (the local runtime) keeps one per host, which a
+// shared `SKRUN_DEPS_DIR` mount can extend across hosts; a cloud sandbox runner
+// keeps one for its single run, never shared with another run.
 //
 // In-memory state is intentionally minimal: an in-flight `Map<hash,
 // Promise<string>>` deduplicates concurrent `ensure()` calls within the same
@@ -58,8 +63,8 @@ function defaultRootDir(): string {
  * paths are excluded by design (cross-host determinism).
  *
  * Two bundles with identical manifest+lockfile text on different machines
- * produce the same hash — same key the future cloud Docker BuildKit layer
- * cache will use.
+ * produce the same hash — the key of this cache wherever it lives: per host
+ * for a server running scripts itself, per run in a cloud sandbox runner.
  */
 export function computeDepsHash(manifest: ManifestInfo): string {
   if (manifest.ecosystem === "none") {

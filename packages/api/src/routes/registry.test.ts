@@ -1,16 +1,32 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { packAgentTar } from "@skrun-dev/schema";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateApiKey } from "../auth/api-key.js";
+import { createSession, sessionCookieName } from "../auth/session.js";
 import { MemoryDb } from "../db/memory.js";
 import { createApp } from "../index.js";
+import { parseQuotaEnv } from "../quotas/thresholds.js";
 import type { VerificationPolicy } from "../services/verification-policy.js";
 import { MemoryStorage } from "../storage/memory.js";
+import {
+  agentYamlOfSize,
+  minimalAgentYaml,
+  validBundle,
+  validBundleOfSize,
+} from "./agent-bundle.shared.js";
 
 // Capture logger.info calls so we can assert the structured-log shape emitted
 // by the per-version verify route (AC-9). vi.mock is hoisted to the top of
 // the file; vi.hoisted lets the spy be declared in lock-step so it's defined
 // when the mock factory runs. We replace only `createLogger`; the rest of
 // @skrun-dev/runtime is left intact.
-const { logInfoSpy } = vi.hoisted(() => ({ logInfoSpy: vi.fn() }));
+const { logInfoSpy, logWarnSpy } = vi.hoisted(() => ({
+  logInfoSpy: vi.fn(),
+  logWarnSpy: vi.fn(),
+}));
 vi.mock("@skrun-dev/runtime", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@skrun-dev/runtime")>();
   return {
@@ -23,7 +39,7 @@ vi.mock("@skrun-dev/runtime", async (importOriginal) => {
       trace: vi.fn(),
       fatal: vi.fn(),
       level: "info",
-      child: () => ({ info: logInfoSpy }),
+      child: () => ({ info: logInfoSpy, warn: logWarnSpy }),
     }),
   };
 });
@@ -41,7 +57,10 @@ describe("Registry Routes", () => {
   });
 
   const authHeader = { Authorization: "Bearer dev-token" };
-  const bundle = Buffer.from("fake-agent-bundle-content");
+  let bundle: Buffer;
+  beforeAll(async () => {
+    bundle = await validBundle("test-agent");
+  });
 
   async function pushAgent(ns = "dev", name = "test-agent", version = "1.0.0") {
     return app.request(`/api/agents/${ns}/${name}/push?version=${version}`, {
@@ -73,6 +92,38 @@ describe("Registry Routes", () => {
       body: bundle,
     });
     expect(res.status).toBe(401);
+  });
+
+  // The version names the bundle's object key: a path, a NUL or a keyword in
+  // it is refused before anything is stored — no agent, no object.
+  it.each([
+    ["a path out of the namespace", "..%2F..%2Fvictim%2Fagent%2F1.0.0"],
+    ["a NUL character", "1.0.0%00"],
+    ["a keyword", "latest"],
+    ["two numbers", "1.0"],
+  ])("POST /push refuses a version with %s: 400 INVALID_VERSION_FORMAT, nothing stored", async (_label, version) => {
+    const res = await pushAgent("dev", "test-agent", version);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error: {
+        code: "INVALID_VERSION_FORMAT",
+        message:
+          'version must be strict semver (e.g. "1.0.0"): three whole numbers separated by dots. Nothing was stored.',
+      },
+    });
+    expect(await db.getAgent("dev", "test-agent")).toBeNull();
+    expect(await storage.list("dev/")).toEqual([]);
+    expect(await storage.list("victim/")).toEqual([]);
+  });
+
+  it("POST /push without a version is still 400 MISSING_VERSION", async () => {
+    const res = await app.request("/api/agents/dev/test-agent/push", {
+      method: "POST",
+      headers: { ...authHeader, "Content-Type": "application/octet-stream" },
+      body: bundle,
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("MISSING_VERSION");
   });
 
   it("VT-12: GET /pull returns 500 BUNDLE_INTEGRITY_FAILED on a tampered bundle", async () => {
@@ -125,7 +176,7 @@ describe("Registry Routes", () => {
 
   it("GET /pull/:version returns specific version", async () => {
     await pushAgent("dev", "agent", "1.0.0");
-    const v2 = Buffer.from("v2-content");
+    const v2 = await validBundle("agent-v2");
     await app.request("/api/agents/dev/agent/push?version=2.0.0", {
       method: "POST",
       headers: { ...authHeader, "Content-Type": "application/octet-stream" },
@@ -172,7 +223,7 @@ describe("Registry Routes", () => {
   });
 
   // VT-4 + VT-5 (#80): cross-tenant isolation — each non-admin OAuth user
-  // sees only their own agents. Two sk_live_* users prove the filter
+  // sees only their own agents. Two API-key users prove the filter
   // narrows correctly across owners.
   it("VT-4 + VT-5 (#80): GET /agents — non-admin users see only own agents (cross-tenant isolated)", async () => {
     // Seed user A + 2 agents
@@ -912,7 +963,7 @@ describe("Registry Routes", () => {
     await app.request("/api/agents/dev/agent/push?version=2.0.0", {
       method: "POST",
       headers: { ...authHeader, "Content-Type": "application/octet-stream" },
-      body: Buffer.from("v2"),
+      body: new Uint8Array(await validBundle("agent-v2")),
     });
 
     const res = await app.request("/api/agents/dev/agent/versions", { headers: authHeader });
@@ -1284,11 +1335,12 @@ describe("PATCH visibility + reads (#81)", () => {
   }
 
   async function pushAgent(key: string, ns: string, name: string): Promise<void> {
-    await app.request(`/api/agents/${ns}/${name}/push?version=1.0.0`, {
+    const pushed = await app.request(`/api/agents/${ns}/${name}/push?version=1.0.0`, {
       method: "POST",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/octet-stream" },
-      body: Buffer.from("fake-bundle"),
+      body: new Uint8Array(await validBundle(name)),
     });
+    if (pushed.status !== 200) throw new Error(`push answered ${pushed.status}`);
   }
 
   function patchVisibility(key: string, ns: string, name: string, body: unknown) {
@@ -1306,8 +1358,12 @@ describe("PATCH visibility + reads (#81)", () => {
     await pushAgent(a.key, "alice", "agent1");
     const toPublic = await patchVisibility(a.key, "alice", "agent1", { visibility: "public" });
     expect(toPublic.status).toBe(400);
-    expect(((await toPublic.json()) as { error: { code: string } }).error.code).toBe(
-      "PUBLIC_VISIBILITY_DISABLED",
+    // Disabled for now, and nothing promised in its place.
+    expect(((await toPublic.json()) as { error: { code: string; message: string } }).error).toEqual(
+      {
+        code: "PUBLIC_VISIBILITY_DISABLED",
+        message: "Public visibility is not available for now; agents are private-only.",
+      },
     );
     expect((await db.getAgent("alice", "agent1"))?.visibility).toBe("private");
     const toPrivate = await patchVisibility(a.key, "alice", "agent1", { visibility: "private" });
@@ -1366,14 +1422,15 @@ describe("PATCH /verify — verification policy", () => {
     }
 
     async function push(ownerKey: string, ns: string, name: string): Promise<void> {
-      await app.request(`/api/agents/${ns}/${name}/push?version=1.0.0`, {
+      const pushed = await app.request(`/api/agents/${ns}/${name}/push?version=1.0.0`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${ownerKey}`,
           "Content-Type": "application/octet-stream",
         },
-        body: Buffer.from("fake-bundle"),
+        body: new Uint8Array(await validBundle(name)),
       });
+      if (pushed.status !== 200) throw new Error(`push answered ${pushed.status}`);
     }
 
     function verifyAs(key: string, ns: string, name: string, verified = true) {
@@ -1490,17 +1547,18 @@ describe("push — API-key scope (#65)", () => {
     return key;
   }
 
-  function push(key: string, ns: string, name: string, version = "1.0.0") {
+  async function push(key: string, ns: string, name: string, version = "1.0.0") {
     return app.request(`/api/agents/${ns}/${name}/push?version=${version}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/octet-stream" },
-      body: Buffer.from("fake-bundle"),
+      body: new Uint8Array(await validBundle(name)),
     });
   }
 
   /** Account-key push that creates the agent; returns its db id. */
   async function createAgent(ownerKey: string, ns: string, name: string): Promise<string> {
-    await push(ownerKey, ns, name);
+    const pushed = await push(ownerKey, ns, name);
+    if (pushed.status !== 200) throw new Error(`push answered ${pushed.status}`);
     const agent = await db.getAgent(ns, name);
     if (!agent) throw new Error("agent missing after push");
     return agent.id;
@@ -1601,14 +1659,15 @@ describe("verify — API-key scope (#65)", () => {
       name: "acct",
     });
     for (const n of ["agent1", "agent2"]) {
-      await app.request(`/api/agents/alice/${n}/push?version=1.0.0`, {
+      const pushed = await app.request(`/api/agents/alice/${n}/push?version=1.0.0`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${acct.key}`,
           "Content-Type": "application/octet-stream",
         },
-        body: Buffer.from("fake-bundle"),
+        body: new Uint8Array(await validBundle(n)),
       });
+      if (pushed.status !== 200) throw new Error(`push answered ${pushed.status}`);
     }
     const a1 = await db.getAgent("alice", "agent1");
     if (!a1) throw new Error("agent1 missing");
@@ -1694,11 +1753,11 @@ describe("push rate limiting (#116)", () => {
 
   const authHeader = { Authorization: "Bearer dev-token" };
 
-  function pushReq(version: string, name = "rl-agent") {
+  async function pushReq(version: string, name = "rl-agent") {
     return app.request(`/api/agents/dev/${name}/push?version=${version}`, {
       method: "POST",
       headers: { ...authHeader, "Content-Type": "application/octet-stream" },
-      body: Buffer.from(`bundle-${version}`),
+      body: new Uint8Array(await validBundle(name)),
     });
   }
 
@@ -1766,16 +1825,27 @@ describe("push body cap (#116)", () => {
     });
   }
 
-  it("VT-4: an oversized push is refused 413 without the body being buffered (slow path)", async () => {
-    // `new Request(url, { body })` never sets content-length, so this exercises
-    // bodyLimit's stream-counting path — the one self-made clients hit.
-    const spy = vi.spyOn(Request.prototype, "arrayBuffer");
-    const res = await pushBody(Buffer.alloc(64 * 1024, 1));
+  it("an oversized push without Content-Length is refused 413, read no further than the cap", async () => {
+    // A body with no content-length — the one self-made clients send — is
+    // counted as the route reads it, after its authentication: the read stops
+    // at the first chunk past the cap, and the rest is never pulled.
+    let pulled = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulled >= 64 * 1024) return controller.close();
+        controller.enqueue(new Uint8Array(1024).fill(1));
+        pulled += 1024;
+      },
+    });
+    const res = await app.request("/api/agents/dev/cap-agent/push?version=1.0.0", {
+      method: "POST",
+      headers: { ...authHeader, "Content-Type": "application/octet-stream" },
+      body,
+      duplex: "half",
+    } as RequestInit);
     expect(res.status).toBe(413);
     expect((await res.json()).error.code).toBe("BUNDLE_TOO_LARGE");
-    // The proof that the cap ran BEFORE buffering: the handler's arrayBuffer()
-    // was never reached.
-    expect(spy).not.toHaveBeenCalled();
+    expect(pulled).toBeLessThanOrEqual(4 * 1024);
   });
 
   it("VT-4b: an oversized push is refused 413 on the Content-Length fast path", async () => {
@@ -1792,9 +1862,822 @@ describe("push body cap (#116)", () => {
   });
 
   it("VT-5: a body just under the cap passes, path unchanged", async () => {
-    const res = await pushBody(Buffer.alloc(512, 1)); // under the ~1 KB cap
+    const res = await pushBody(await validBundleOfSize(512, "cap-agent")); // under the ~1 KB cap
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.latest_version).toBe("1.0.0");
+  });
+});
+
+// The server's longest timeout and the account's bundle storage are checked
+// at the push, before anything is stored: a refused push leaves no agent and
+// no object. The account's numbers go to a master credential only.
+describe("push — the server's longest timeout and the account's storage", () => {
+  const MIB = 1024 * 1024;
+  const devAuth = { Authorization: "Bearer dev-token" };
+  let db: MemoryDb;
+  let storage: MemoryStorage;
+
+  beforeEach(() => {
+    db = new MemoryDb();
+    storage = new MemoryStorage();
+    logInfoSpy.mockClear();
+    logWarnSpy.mockClear();
+  });
+
+  function appWith(env: Record<string, string>) {
+    return createApp(storage, db, { quotaConfig: parseQuotaEnv(env) });
+  }
+
+  /** A bundle whose agent.yaml declares `timeout`. */
+  function agentBundle(name: string, timeout: string): Promise<Buffer> {
+    const yaml = [
+      `name: ${name}`,
+      "version: 1.0.0",
+      "model:",
+      "  provider: google",
+      "  name: gemini-2.5-flash",
+      "inputs:",
+      "  - name: q",
+      "    type: string",
+      "outputs:",
+      "  - name: answer",
+      "    type: string",
+      "environment:",
+      `  timeout: ${timeout}`,
+    ].join("\n");
+    return packAgentTar([{ name: "agent.yaml", content: Buffer.from(yaml) }]);
+  }
+
+  async function push(
+    app: ReturnType<typeof createApp>,
+    headers: Record<string, string>,
+    path: string,
+    body: Buffer,
+  ) {
+    const res = await app.request(`/api/agents/${path}/push?version=1.0.0`, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/octet-stream" },
+      body,
+    });
+    return {
+      status: res.status,
+      body: (await res.json()) as { error?: { code: string; message: string } },
+    };
+  }
+
+  /** An account with `plan`, and a key on it: every operation unless `operations` says otherwise. */
+  async function account(username: string, plan: string, operations?: string[]) {
+    const user = await db.createUser({ github_id: `gh-${username}`, username });
+    await db.updateUser(user.id, { plan });
+    const k = generateApiKey();
+    await db.createApiKey({
+      user_id: user.id,
+      key_hash: k.keyHash,
+      key_prefix: k.keyPrefix,
+      name: "k",
+      ...(operations ? { scopes: operations, scope_kind: "account" as const } : {}),
+    });
+    return { id: user.id, headers: { Authorization: `Bearer ${k.key}` } };
+  }
+
+  const refusals = () =>
+    logInfoSpy.mock.calls
+      .map(([fields]) => fields as Record<string, unknown>)
+      .filter((fields) => fields?.event === "quota_refused");
+
+  it("an agent declaring more than the maximum is refused 400 TIMEOUT_ABOVE_LIMIT; no agent, no object, one line", async () => {
+    const app = appWith({ SKRUN_RUN_MAX_TIMEOUT_S: "900" });
+    const res = await push(app, devAuth, "dev/slow", await agentBundle("slow", "1800s"));
+    expect(res).toEqual({
+      status: 400,
+      body: {
+        error: {
+          code: "TIMEOUT_ABOVE_LIMIT",
+          message: "This agent declares 1800 s; this server accepts at most 900 s.",
+        },
+      },
+    });
+    expect(await db.getAgent("dev", "slow")).toBeNull();
+    expect(await storage.get("dev/slow/1.0.0.agent")).toBeNull();
+    expect(refusals()).toEqual([
+      expect.objectContaining({ bound: "max_timeout", plan: "free", user_id: expect.any(String) }),
+    ]);
+
+    const within = await push(app, devAuth, "dev/slow", await agentBundle("slow", "900s"));
+    expect(within.status).toBe(200);
+  });
+
+  it("a push past the account's storage is refused 413 STORAGE_QUOTA_EXCEEDED with the account's numbers; up to the cap, stored", async () => {
+    const app = appWith({ SKRUN_QUOTA_STORAGE_MB: "1" });
+    const over = await push(app, devAuth, "dev/big", await validBundleOfSize(MIB + 1));
+    expect(over.status).toBe(413);
+    expect(over.body.error?.code).toBe("STORAGE_QUOTA_EXCEEDED");
+    expect(over.body.error?.message).toBe(
+      "This account's agents hold 0 B of the 1,048,576 B of bundle storage its plan allows; this bundle (1,048,577 B) does not fit. Delete a version no longer needed (DELETE /api/agents/:namespace/:name/versions/:version) to make room — or, for an agent's last version, the agent (DELETE /api/agents/:namespace/:name), which deletes its state and its model keys too, and removes it from the keys restricted to it.",
+    );
+    expect(await db.getAgent("dev", "big")).toBeNull();
+    expect(await storage.get("dev/big/1.0.0.agent")).toBeNull();
+    expect(refusals()).toEqual([
+      expect.objectContaining({ bound: "storage", plan: "free", user_id: expect.any(String) }),
+    ]);
+
+    expect((await push(app, devAuth, "dev/big", await validBundleOfSize(MIB))).status).toBe(200);
+    const full = await push(app, devAuth, "dev/small", await validBundleOfSize(500));
+    expect(full.status).toBe(413);
+    expect(full.body.error?.message).toContain("hold 1 MB of the 1 MB");
+  });
+
+  it("an account key reduced to pushing is told the bound, never the account's numbers", async () => {
+    const app = appWith({ SKRUN_QUOTA_STORAGE_MB: "1" });
+    const pusher = await account("pusher", "free", ["agent:push"]);
+    const res = await push(app, pusher.headers, "pusher/big", await validBundleOfSize(MIB + 1));
+    expect(res).toEqual({
+      status: 413,
+      body: {
+        error: {
+          code: "STORAGE_QUOTA_EXCEEDED",
+          message:
+            "This push would take this account past the bundle storage its plan allows; a version deleted from the account makes room — or, for an agent's last version, the agent, which deletes its state and its model keys too, and removes it from the keys restricted to it.",
+        },
+      },
+    });
+    expect(refusals()).toEqual([
+      expect.objectContaining({ bound: "storage", plan: "free", user_id: pusher.id }),
+    ]);
+  });
+
+  it("the storage of the caller's plan applies: its own value, free's when the setting does not name it, free's for a plan no setting names", async () => {
+    const app = appWith({
+      SKRUN_QUOTA_STORAGE_MB: "free=1,team=2",
+      SKRUN_QUOTA_CONCURRENT_RUNS: "free=2,pro=5",
+    });
+    const team = await account("team-account", "team");
+    const pro = await account("pro-account", "pro");
+    const ghost = await account("ghost-account", "ghost");
+
+    expect(
+      (await push(app, team.headers, "team-account/a", await validBundleOfSize(MIB + 1))).status,
+    ).toBe(200);
+    // A known plan the storage setting does not name gets free's value, silently.
+    const proRes = await push(app, pro.headers, "pro-account/a", await validBundleOfSize(MIB + 1));
+    expect(proRes.status).toBe(413);
+    // To the byte: rounded, 0 B and a bundle of 1 MB would seem to fit in 1 MB.
+    expect(proRes.body.error?.message).toContain("of the 1,048,576 B");
+    expect(logWarnSpy).not.toHaveBeenCalled();
+    // A plan no setting names gets free's value too, with one line naming it.
+    const ghostRes = await push(
+      app,
+      ghost.headers,
+      "ghost-account/a",
+      await validBundleOfSize(MIB + 1),
+    );
+    expect(ghostRes.status).toBe(413);
+    expect(logWarnSpy).toHaveBeenCalledTimes(1);
+    expect(logWarnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "quota_plan_unknown", plan: "ghost" }),
+      expect.any(String),
+    );
+  });
+
+  it("pushing the same version twice is refused 409 VERSION_EXISTS, the account at its storage too", async () => {
+    const app = appWith({ SKRUN_QUOTA_STORAGE_MB: "1" });
+    // Pushed again, it would take the account past its storage, were it stored.
+    const version = await validBundleOfSize(600 * 1024);
+    expect((await push(app, devAuth, "dev/twice", version)).status).toBe(200);
+    const again = await push(app, devAuth, "dev/twice", version);
+    expect(again.status).toBe(409);
+    expect(again.body.error?.code).toBe("VERSION_EXISTS");
+    expect(refusals()).toEqual([]);
+  });
+
+  it("a push from the registry and one from the agents directory, of one account at once: one stored, the other refused 413", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "skrun-push-turns-"));
+    const savedDir = process.env.SKRUN_AGENTS_DIR;
+    try {
+      mkdirSync(join(dir, "from-dir"));
+      writeFileSync(join(dir, "from-dir", "agent.yaml"), minimalAgentYaml("from-dir"));
+      // Random bytes do not compress: the bundle built from the directory stays near 600 KiB.
+      writeFileSync(join(dir, "from-dir", "data.bin"), randomBytes(600 * 1024));
+      process.env.SKRUN_AGENTS_DIR = dir;
+      const app = appWith({ SKRUN_QUOTA_STORAGE_MB: "1" });
+      // The dev token's account recorded first: two first requests at once
+      // could each record one.
+      expect((await app.request("/api/me", { headers: devAuth })).status).toBe(200);
+
+      // Each write waits until both pushes have read what the account holds, or
+      // a moment: pushes not taken one at a time would both have read 0 by then.
+      const sum = vi.spyOn(db, "sumBundleBytesByOwner");
+      const put = storage.put.bind(storage);
+      vi.spyOn(storage, "put").mockImplementation(async (key, data, opts) => {
+        const until = Date.now() + 200;
+        while (sum.mock.calls.length < 2 && Date.now() < until) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        return put(key, data, opts);
+      });
+
+      const fromRegistryBundle = await validBundleOfSize(600 * 1024, "from-registry");
+      const [fromRegistry, fromDir] = await Promise.all([
+        push(app, devAuth, "dev/from-registry", fromRegistryBundle),
+        app.request("/api/agents/scan/from-dir/push", { method: "POST", headers: devAuth }),
+      ]);
+      const statuses = [fromRegistry.status, fromDir.status].sort();
+      expect(statuses).toEqual([200, 413]);
+      expect(await storage.list("dev/")).toHaveLength(1);
+    } finally {
+      if (savedDir === undefined) delete process.env.SKRUN_AGENTS_DIR;
+      else process.env.SKRUN_AGENTS_DIR = savedDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["no setting", {}],
+    ["the server's longest timeout set", { SKRUN_RUN_MAX_TIMEOUT_S: "900" }],
+  ])("with %s, an agent.yaml naming a secret is refused 400 UNSUPPORTED_FIELD, by name; no agent, no object, no version, no quota line", async (_label, env) => {
+    const app = appWith(env);
+    const createVersion = vi.spyOn(db, "createVersion");
+    const yaml = [
+      "name: secretive",
+      "version: 1.0.0",
+      "model:",
+      "  provider: google",
+      "  name: gemini-2.5-flash",
+      "inputs:",
+      "  - name: q",
+      "    type: string",
+      "outputs:",
+      "  - name: answer",
+      "    type: string",
+      "environment:",
+      "  secrets: [X]",
+    ].join("\n");
+    const bundle = await packAgentTar([{ name: "agent.yaml", content: Buffer.from(yaml) }]);
+    const res = await push(app, devAuth, "dev/secretive", bundle);
+    expect(res).toEqual({
+      status: 400,
+      body: {
+        error: {
+          code: "UNSUPPORTED_FIELD",
+          message:
+            "environment.secrets is not yet supported — no secret is injected into a run. Leave the list empty, or remove it.",
+        },
+      },
+    });
+    expect(await db.getAgent("dev", "secretive")).toBeNull();
+    expect(await storage.list("dev/")).toEqual([]);
+    expect(createVersion).not.toHaveBeenCalled();
+    expect(refusals()).toEqual([]);
+  });
+
+  it("with no setting, a push is stored whatever its size or its timeout, and nothing of the account is read", async () => {
+    const app = appWith({});
+    const sum = vi.spyOn(db, "sumBundleBytesByOwner");
+    expect((await push(app, devAuth, "dev/open", await agentBundle("open", "99999s"))).status).toBe(
+      200,
+    );
+    expect(sum).not.toHaveBeenCalled();
+    expect(refusals()).toEqual([]);
+  });
+});
+
+// An agent's source belongs to a full-access credential. A key that carries
+// fewer than every operation — the "run-only" key a creator hands out — pulls
+// nothing; a session, the dev token and a full account key pull as before.
+describe("agent source — reads that take full access", () => {
+  const FULL_ACCESS_MESSAGE =
+    "Reading this requires full access: a session, the dev token, or an account-wide API key that carries every operation.";
+  const DELEGATED_MESSAGE = "This endpoint is not available to a resource-scoped API key.";
+  let SOURCE: Buffer;
+  beforeAll(async () => {
+    SOURCE = await validBundle("agent1");
+  });
+
+  let app: ReturnType<typeof createApp>;
+  let db: MemoryDb;
+  let owner: { id: string; fullKey: string };
+
+  beforeEach(async () => {
+    db = new MemoryDb();
+    app = createApp(new MemoryStorage(), db);
+    const user = await db.createUser({ github_id: "gh-alice", username: "alice" });
+    const fullKey = await mintKey(user.id, "account", ["agent:run", "agent:push", "agent:verify"]);
+    owner = { id: user.id, fullKey };
+    const pushed = await app.request("/api/agents/alice/agent1/push?version=1.0.0", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${fullKey}`, "Content-Type": "application/octet-stream" },
+      body: SOURCE,
+    });
+    expect(pushed.status).toBe(200);
+  });
+
+  async function mintKey(
+    userId: string,
+    scope_kind: "account" | "agents",
+    operations: string[],
+  ): Promise<string> {
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    const agent = await db.getAgent("alice", "agent1");
+    await db.createApiKey({
+      user_id: userId,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "k",
+      scopes: operations,
+      scope_kind,
+      agents: scope_kind === "agents" && agent ? [agent.id] : [],
+    });
+    return key;
+  }
+
+  type Header = Record<string, string>;
+  const reduced: Array<[string, () => Promise<Header>]> = [
+    [
+      "an account key that may only run agents",
+      async () => ({
+        Authorization: `Bearer ${await mintKey(owner.id, "account", ["agent:run"])}`,
+      }),
+    ],
+    [
+      "an account key with no operation",
+      async () => ({ Authorization: `Bearer ${await mintKey(owner.id, "account", [])}` }),
+    ],
+  ];
+  const master: Array<[string, () => Promise<Header>]> = [
+    [
+      "a session",
+      async () => ({ Cookie: `${sessionCookieName()}=${await createSession(db, owner.id)}` }),
+    ],
+    ["the dev token", async () => ({ Authorization: "Bearer dev-token" })],
+    ["a full account key", async () => ({ Authorization: `Bearer ${owner.fullKey}` })],
+  ];
+
+  for (const path of ["/api/agents/alice/agent1/pull", "/api/agents/alice/agent1/pull/1.0.0"]) {
+    describe(`GET ${path.replace("/api/agents/alice/agent1", "…")}`, () => {
+      it.each(reduced)("refuses %s", async (_label, headers) => {
+        const res = await app.request(path, { headers: await headers() });
+        expect(res.status).toBe(403);
+        expect(await res.json()).toEqual({
+          error: { code: "KEY_SCOPE_FORBIDDEN", message: FULL_ACCESS_MESSAGE },
+        });
+      });
+
+      it.each(master)("hands the source to %s", async (_label, headers) => {
+        const res = await app.request(path, { headers: await headers() });
+        expect(res.status).toBe(200);
+        expect(Buffer.from(await res.arrayBuffer())).toEqual(SOURCE);
+        expect(res.headers.get("X-Agent-Version")).toBe("1.0.0");
+      });
+
+      it("keeps the delegated key's own refusal", async () => {
+        const delegated = await mintKey(owner.id, "agents", ["agent:run", "agent:push"]);
+        const res = await app.request(path, { headers: { Authorization: `Bearer ${delegated}` } });
+        expect(res.status).toBe(403);
+        expect(await res.json()).toEqual({
+          error: { code: "KEY_SCOPE_FORBIDDEN", message: DELEGATED_MESSAGE },
+        });
+      });
+    });
+  }
+});
+
+// The versions list stays readable by any key that is not delegated, but the
+// parsed configuration of each version (model, tools, MCP servers, whose URLs
+// may carry a credential) is for a full-access credential only.
+describe("versions list — the configuration takes full access", () => {
+  const CONFIG = {
+    name: "agent1",
+    version: "1.0.0",
+    model: { provider: "anthropic", name: "a-model" },
+    mcp_servers: [{ name: "crm", url: "https://mcp.example/?token=secret" }],
+  };
+
+  let app: ReturnType<typeof createApp>;
+  let db: MemoryDb;
+  let ownerId: string;
+
+  beforeEach(async () => {
+    db = new MemoryDb();
+    app = createApp(new MemoryStorage(), db);
+    const user = await db.createUser({ github_id: "gh-alice", username: "alice" });
+    ownerId = user.id;
+    const agent = await db.createAgent({
+      namespace: "alice",
+      name: "agent1",
+      description: "",
+      owner_id: ownerId,
+    });
+    await db.createVersion(agent.id, {
+      version: "1.0.0",
+      size: 10,
+      bundle_key: "alice/agent1/1.0.0.agent",
+      config_snapshot: CONFIG,
+    });
+  });
+
+  async function keyHeader(scope_kind: "account" | "agents", operations: string[]) {
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    const agent = await db.getAgent("alice", "agent1");
+    await db.createApiKey({
+      user_id: ownerId,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "k",
+      scopes: operations,
+      scope_kind,
+      agents: scope_kind === "agents" && agent ? [agent.id] : [],
+    });
+    return { Authorization: `Bearer ${key}` };
+  }
+
+  async function versions(headers: Record<string, string>) {
+    const res = await app.request("/api/agents/alice/agent1/versions", { headers });
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  }
+
+  it.each([
+    ["an account key that may only run agents", ["agent:run"]],
+    ["an account key with no operation", []],
+  ])("lists the versions to %s, without their configuration", async (_label, operations) => {
+    const { status, body } = await versions(await keyHeader("account", operations));
+    expect(status).toBe(200);
+    const list = body.versions as Array<Record<string, unknown>>;
+    expect(list.map((v) => v.version)).toEqual(["1.0.0"]);
+    expect(list[0]).not.toHaveProperty("config_snapshot");
+    expect(JSON.stringify(body)).not.toContain("token=secret");
+  });
+
+  it.each([
+    [
+      "a session",
+      async () => ({ Cookie: `${sessionCookieName()}=${await createSession(db, ownerId)}` }),
+    ],
+    ["the dev token", async () => ({ Authorization: "Bearer dev-token" })],
+    ["a full account key", () => keyHeader("account", ["agent:run", "agent:push", "agent:verify"])],
+  ])("lists the versions to %s, with their configuration", async (_label, headers) => {
+    const { status, body } = await versions(await headers());
+    expect(status).toBe(200);
+    const list = body.versions as Array<Record<string, unknown>>;
+    expect(list.map((v) => v.version)).toEqual(["1.0.0"]);
+    expect(list[0]?.config_snapshot).toEqual(CONFIG);
+  });
+
+  it("keeps the delegated key's own refusal", async () => {
+    const { status, body } = await versions(await keyHeader("agents", ["agent:run"]));
+    expect(status).toBe(403);
+    expect(body).toEqual({
+      error: {
+        code: "KEY_SCOPE_FORBIDDEN",
+        message: "This endpoint is not available to a resource-scoped API key.",
+      },
+    });
+  });
+});
+
+// Setting the flag answers with the version: its configuration is for a
+// full-access credential only, like the versions list. Setting the flag to the
+// value it already has would otherwise be a plain read of the configuration.
+describe("verify — the configuration in the answer takes full access", () => {
+  const CONFIG = {
+    name: "agent1",
+    version: "1.0.0",
+    model: { provider: "anthropic", name: "a-model" },
+    mcp_servers: [{ name: "crm", url: "https://mcp.example/?token=secret" }],
+  };
+
+  let app: ReturnType<typeof createApp>;
+  let db: MemoryDb;
+  let ownerId: string;
+
+  beforeEach(async () => {
+    db = new MemoryDb();
+    // `owner` policy: the agent's owner may set the flag with any key that
+    // carries `agent:verify`, which is where the answer reaches a reduced key.
+    app = createApp(new MemoryStorage(), db, { verificationPolicy: "owner" });
+    const user = await db.createUser({ github_id: "gh-alice", username: "alice" });
+    ownerId = user.id;
+    const agent = await db.createAgent({
+      namespace: "alice",
+      name: "agent1",
+      description: "",
+      owner_id: ownerId,
+    });
+    await db.createVersion(agent.id, {
+      version: "1.0.0",
+      size: 10,
+      bundle_key: "alice/agent1/1.0.0.agent",
+      config_snapshot: CONFIG,
+    });
+  });
+
+  async function keyHeader(scope_kind: "account" | "agents", operations: string[]) {
+    const { key, keyHash, keyPrefix } = generateApiKey();
+    const agent = await db.getAgent("alice", "agent1");
+    await db.createApiKey({
+      user_id: ownerId,
+      key_hash: keyHash,
+      key_prefix: keyPrefix,
+      name: "k",
+      scopes: operations,
+      scope_kind,
+      agents: scope_kind === "agents" && agent ? [agent.id] : [],
+    });
+    return { Authorization: `Bearer ${key}` };
+  }
+
+  async function verify(headers: Record<string, string>) {
+    const res = await app.request("/api/agents/alice/agent1/versions/1.0.0/verify", {
+      method: "PATCH",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ verified: true }),
+    });
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  }
+
+  const FULL_OPERATIONS = ["agent:run", "agent:push", "agent:verify"];
+
+  it.each([
+    ["a delegated key that carries every operation", () => keyHeader("agents", FULL_OPERATIONS)],
+    [
+      "an account key that may run and verify only",
+      () => keyHeader("account", ["agent:run", "agent:verify"]),
+    ],
+  ])("sets the flag for %s, and answers without the configuration", async (_label, headers) => {
+    const { status, body } = await verify(await headers());
+    expect(status).toBe(200);
+    expect(body.version).toBe("1.0.0");
+    expect(body.verified).toBe(true);
+    expect(body).not.toHaveProperty("config_snapshot");
+    expect(JSON.stringify(body)).not.toContain("token=secret");
+  });
+
+  it.each([
+    [
+      "a session",
+      async () => ({
+        Cookie: `${sessionCookieName()}=${await createSession(db, ownerId)}`,
+        Origin: "http://localhost",
+      }),
+    ],
+    ["a full account key", () => keyHeader("account", FULL_OPERATIONS)],
+  ])("sets the flag for %s, and answers with the configuration", async (_label, headers) => {
+    const { status, body } = await verify(await headers());
+    expect(status).toBe(200);
+    expect(body.verified).toBe(true);
+    expect(body.config_snapshot).toEqual(CONFIG);
+  });
+});
+
+// A bundle no run could read is refused at the push, by the name the run
+// answers a stored one with — before anything is stored, whatever the server
+// bounds. The dashboard's upload sends its file to this route as it is.
+describe("push — a bundle that does not load is refused", () => {
+  let app: ReturnType<typeof createApp>;
+  let db: MemoryDb;
+  let storage: MemoryStorage;
+  const devAuth = { Authorization: "Bearer dev-token" };
+  /** A tool whose input schema holds an !!omap, where the schema takes any value: valid but for the tag. */
+  const OMAP_TOOL = [
+    "tools:",
+    "  - name: first",
+    "    description: Looks things up.",
+    "    input_schema:",
+    "      type: object",
+    "      properties:",
+    "        p: !!omap [a: 1, b: 2]",
+  ];
+
+  beforeEach(() => {
+    // A cap of 1 MB, so a bundle past it stays small to build.
+    vi.stubEnv("BUNDLE_MAX_DECOMPRESSED_MB", "1");
+    db = new MemoryDb();
+    storage = new MemoryStorage();
+    app = createApp(storage, db, {
+      quotaConfig: parseQuotaEnv({ SKRUN_QUOTA_STORAGE_MB: "1", SKRUN_RUN_MAX_TIMEOUT_S: "900" }),
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /** A bundle of `agentYaml` — and, `big`, of about 2 MB of text, past the cap once unpacked. */
+  function bundleOf(agentYaml: string, big = false): Promise<Buffer> {
+    return packAgentTar([
+      { name: "agent.yaml", content: Buffer.from(agentYaml) },
+      ...(big
+        ? [{ name: "data/blob.txt", content: Buffer.from("lorem ipsum\n".repeat(180_000)) }]
+        : []),
+    ]);
+  }
+
+  it.each([
+    [
+      "past the decompression cap",
+      413,
+      "BUNDLE_DECOMPRESSED_TOO_LARGE",
+      () => bundleOf(minimalAgentYaml("unloadable"), true),
+    ],
+    ["not a gzip-compressed tar", 400, "BUNDLE_CORRUPT", async () => Buffer.from("not-a-bundle")],
+    [
+      "with entries that contradict each other",
+      400,
+      "BUNDLE_CORRUPT",
+      () =>
+        packAgentTar([
+          { name: "agent.yaml", content: Buffer.from(minimalAgentYaml("unloadable")) },
+          { name: "x", content: Buffer.from("a file") },
+          { name: "x/y", content: Buffer.from("a file under it") },
+        ]),
+    ],
+    [
+      "without agent.yaml",
+      400,
+      "MISSING_CONFIG",
+      () => packAgentTar([{ name: "SKILL.md", content: Buffer.from("# unloadable\n") }]),
+    ],
+    [
+      "with an agent.yaml that is not valid",
+      400,
+      "INVALID_CONFIG",
+      () => bundleOf("name: unloadable"),
+    ],
+    [
+      "with an agent.yaml that holds a YAML alias",
+      400,
+      "INVALID_CONFIG",
+      () =>
+        bundleOf(
+          minimalAgentYaml("unloadable", [
+            "tools:",
+            "  - name: first",
+            "    description: &same Looks things up.",
+            "    input_schema: { type: object }",
+            "  - name: second",
+            "    description: *same",
+            "    input_schema: { type: object }",
+          ]),
+        ),
+    ],
+    [
+      "with an agent.yaml that declares %YAML 1.1",
+      400,
+      "INVALID_CONFIG",
+      () => bundleOf(`%YAML 1.1\n---\n${minimalAgentYaml("unloadable")}`),
+    ],
+    [
+      "with an agent.yaml that holds the tag !!omap",
+      400,
+      "INVALID_CONFIG",
+      () => bundleOf(minimalAgentYaml("unloadable", OMAP_TOOL)),
+    ],
+  ] as const)("%s: %s %s — no agent, no object, the account's storage unchanged", async (_case, status, code, bundle) => {
+    // The dev token's account recorded first, to read what it holds after.
+    const me = (await (await app.request("/api/me", { headers: devAuth })).json()) as {
+      id: string;
+    };
+    const res = await app.request("/api/agents/dev/unloadable/push?version=1.0.0", {
+      method: "POST",
+      headers: { ...devAuth, "Content-Type": "application/octet-stream" },
+      body: new Uint8Array(await bundle()),
+    });
+    expect(res.status).toBe(status);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(Object.keys(body)).toEqual(["error"]);
+    expect(body.error.code).toBe(code);
+    expect(body.error.message.length).toBeGreaterThan(0);
+    expect(await db.getAgent("dev", "unloadable")).toBeNull();
+    expect(await storage.list("dev/")).toEqual([]);
+    expect(await db.sumBundleBytesByOwner(me.id)).toBe(0);
+  });
+
+  it("past the cap, the message says more than the cap, names the setting, and what to do", async () => {
+    const res = await app.request("/api/agents/dev/unloadable/push?version=1.0.0", {
+      method: "POST",
+      headers: { ...devAuth, "Content-Type": "application/octet-stream" },
+      body: new Uint8Array(await bundleOf(minimalAgentYaml("unloadable"), true)),
+    });
+    expect(await res.json()).toEqual({
+      error: {
+        code: "BUNDLE_DECOMPRESSED_TOO_LARGE",
+        message:
+          "This bundle decompresses to more than 1 MB, the most this server unpacks (BUNDLE_MAX_DECOMPRESSED_MB). Make the agent smaller — leave out the files it does not need when it runs — and push it again; the server's operator can raise BUNDLE_MAX_DECOMPRESSED_MB.",
+      },
+    });
+  });
+
+  // An alias repeats the value its anchor names: a file under the limit
+  // could record a configuration a hundred times its size.
+  it("an alias, the message names it and says to write the value out", async () => {
+    const res = await app.request("/api/agents/dev/unloadable/push?version=1.0.0", {
+      method: "POST",
+      headers: { ...devAuth, "Content-Type": "application/octet-stream" },
+      body: new Uint8Array(
+        await bundleOf(
+          minimalAgentYaml("unloadable", ["environment: &env", "  timeout: 60s", "x_copy: *env"]),
+        ),
+      ),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error: {
+        code: "INVALID_CONFIG",
+        message:
+          "agent.yaml is not valid: YAML aliases are not accepted in agent.yaml: *env repeats the value anchored as &env. Write the value out in full wherever it is used.",
+      },
+    });
+  });
+
+  // agent.yaml is read as YAML 1.2: under %YAML 1.1, the yaml library's
+  // !!omap held the event loop 5.4 s for a file of 1 MB.
+  it("%YAML 1.1, the message says agent.yaml is read as YAML 1.2 and to remove the line", async () => {
+    const res = await app.request("/api/agents/dev/unloadable/push?version=1.0.0", {
+      method: "POST",
+      headers: { ...devAuth, "Content-Type": "application/octet-stream" },
+      body: new Uint8Array(await bundleOf(`%YAML 1.1\n---\n${minimalAgentYaml("unloadable")}`)),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error: {
+        code: "INVALID_CONFIG",
+        message:
+          "agent.yaml is not valid: agent.yaml is read as YAML 1.2: the directive %YAML 1.1 is not accepted. Remove that line.",
+      },
+    });
+  });
+
+  // The library resolves !!omap in a YAML 1.2 document too, and its check of
+  // the entries held the event loop 5 s for a file of 1 MB.
+  it("!!omap, the message names the tag and says to write a mapping", async () => {
+    const res = await app.request("/api/agents/dev/unloadable/push?version=1.0.0", {
+      method: "POST",
+      headers: { ...devAuth, "Content-Type": "application/octet-stream" },
+      body: new Uint8Array(await bundleOf(minimalAgentYaml("unloadable", OMAP_TOOL))),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error: {
+        code: "INVALID_CONFIG",
+        message:
+          "agent.yaml is not valid: The YAML tag !!omap is not accepted in agent.yaml. Remove it, and write the entries as a mapping.",
+      },
+    });
+  });
+});
+
+// agent.yaml holds the agent's configuration: past 128 KB — a fixed limit, no
+// setting — the push is refused, the file never parsed, nothing stored.
+describe("push — an agent.yaml past 128 KB is refused 413 CONFIG_TOO_LARGE", () => {
+  /** The limit: 128 KB. */
+  const LIMIT = 128 * 1024;
+  const devAuth = { Authorization: "Bearer dev-token" };
+  let app: ReturnType<typeof createApp>;
+  let db: MemoryDb;
+  let storage: MemoryStorage;
+
+  beforeEach(() => {
+    vi.stubEnv("BUNDLE_MAX_DECOMPRESSED_MB", undefined); // the default cap, 50 MB
+    db = new MemoryDb();
+    storage = new MemoryStorage();
+    app = createApp(storage, db);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  async function push(agentYaml: string): Promise<Response> {
+    return app.request("/api/agents/dev/wordy/push?version=1.0.0", {
+      method: "POST",
+      headers: { ...devAuth, "Content-Type": "application/octet-stream" },
+      body: new Uint8Array(await validBundle("wordy", agentYaml)),
+    });
+  }
+
+  it("at 128 KB, stored", async () => {
+    const res = await push(agentYamlOfSize(LIMIT, minimalAgentYaml("wordy")));
+    expect(res.status).toBe(200);
+    expect(await storage.list("dev/")).toEqual(["dev/wordy/1.0.0.agent"]);
+  });
+
+  it("one byte more: its size, the limit, where long content goes — no agent, no object", async () => {
+    const res = await push(agentYamlOfSize(LIMIT + 1, minimalAgentYaml("wordy")));
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({
+      error: {
+        code: "CONFIG_TOO_LARGE",
+        message:
+          "This bundle's agent.yaml is 131,073 B, more than the 128 KB (131,072 B) an agent.yaml may weigh. agent.yaml holds the agent's configuration: put long content — instructions, context, data — in SKILL.md, AGENTS.md or other files of the bundle, and push it again.",
+      },
+    });
+    expect(await db.getAgent("dev", "wordy")).toBeNull();
+    expect(await storage.list("dev/")).toEqual([]);
+  });
+
+  it("past 128 KB and not YAML: refused for its size, never parsed", async () => {
+    const res = await push(agentYamlOfSize(LIMIT + 1, "name: [unclosed"));
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("CONFIG_TOO_LARGE");
   });
 });

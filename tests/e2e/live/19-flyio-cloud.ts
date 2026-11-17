@@ -1,23 +1,22 @@
 /**
- * Phase 19 — Cloud E2E live smoke (SC-1 + SC-9 baseline).
+ * Phase 19 — Cloud E2E live smoke: the output's shape, and the machine's teardown.
  *
  * Hits a DEPLOYED Skrun api-server (mode=api-server, runtime=flyio) with
  * a real POST /run via SSE. Verifies the full chain end-to-end:
  *   1. /health 200
  *   2. POST /run streams SSE events
  *   3. `run_start` → `llm_complete` → `run_complete` arrive in order
- *   4. Final output JSON has the expected shape (SC-1 — parity with
- *      LocalAdapter)
- *   5. Machine spawned for the run was destroyed afterwards (SC-9)
+ *   4. Final output JSON has the expected shape (the same as the local
+ *      runtime's)
+ *   5. Machine spawned for the run was destroyed afterwards
  *
- * **NOT covered** (deferred from #15 scope, tracked as follow-up):
- *   - SC-7 (bundle download < 3s) — needs runner-side timing event
- *     payload that the current image doesn't emit explicitly. The total
- *     event-to-event timing we DO log gives a coarse upper bound.
- *   - SC-8 (file output presigned URLs retrievable) — requires running
- *     an agent that produces file outputs. email-drafter writes only
- *     JSON. A future iteration could push + run csv-to-executive-report
- *     or a synthetic file-emitting agent.
+ * **NOT covered here**:
+ *   - How long the bundle download takes: the `/init` phases of the
+ *     `runner_spawned` event carry it (`init_bundle_ms`), but this phase
+ *     asserts no bound on it.
+ *   - Downloading a run's output files: email-drafter writes only JSON.
+ *     Running an agent that produces files (csv-to-executive-report, or a
+ *     synthetic file-emitting agent) would cover it.
  *
  * Cloud-only — run on demand via `pnpm cloud:e2e:smoke` (NOT part of
  * `pnpm test:e2e:live`, the local-registry regression). SKIPs cleanly when
@@ -28,19 +27,55 @@
  *   FLY_TEST_APP_NAME       — sandbox runners app (same as production SKRUN_RUNNERS_APP)
  *   SKRUN_CLOUD_API_URL     — base URL of the deployed api-server
  *                             (e.g. https://skrun-cloud-api-test.fly.dev)
- *   SKRUN_CLOUD_API_TOKEN   — durable sk_live_* API key (OAuth deployments reject dev-token)
- *   SKRUN_CLOUD_TEST_AGENT  — agent ref (default "dev/email-drafter@1.0.0")
+ *   SKRUN_CLOUD_API_TOKEN   — an API key (OAuth deployments reject dev-token)
+ *   <PROVIDER>_API_KEY      — the caller's model key, sent in X-LLM-API-Key: a cloud
+ *                             server carries no model key of its own. Absent, the
+ *                             phase is skipped and says so.
+ * Optional env:
+ *   SKRUN_CLOUD_CALLER_PROVIDER — the provider of that key (default "google", the
+ *                             default agent's primary model)
+ *   SKRUN_CLOUD_TEST_AGENT  — agent ref ns/name[@version]. Default: email-drafter, in
+ *                             the namespace of the token's account (GET /api/me), at
+ *                             the version agents/email-drafter/agent.yaml carries —
+ *                             derived, so no account name is written here and no
+ *                             version goes stale.
  */
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { FlyMachinesApi } from "../../../packages/runtime/src/adapter/flyio/fly-api.js";
-import { results } from "./_ctx.js";
+import { ROOT, results } from "./_ctx.js";
 
 const PHASE = "flyio-cloud";
-const DEFAULT_AGENT = "dev/email-drafter@1.0.0";
+
+/** The default agent: a demo whose version is read from the repository. */
+const DEFAULT_AGENT_NAME = "email-drafter";
+const DEFAULT_CALLER_PROVIDER = "google";
+
+/** The top-level `version:` of an agent.yaml. */
+function repositoryVersion(agentName: string): string {
+  const yaml = readFileSync(join(ROOT, "agents", agentName, "agent.yaml"), "utf-8");
+  const match = /^version:\s*["']?([^"'\s#]+)["']?\s*(?:#.*)?$/m.exec(yaml);
+  if (!match) throw new Error(`agents/${agentName}/agent.yaml carries no top-level version`);
+  return match[1];
+}
+
+/** The namespace of the account the token belongs to. */
+async function tokenNamespace(apiUrl: string, apiToken: string): Promise<string> {
+  const res = await fetch(`${apiUrl}/api/me`, {
+    headers: { Authorization: `Bearer ${apiToken}` },
+  });
+  if (!res.ok) throw new Error(`GET /api/me returned ${res.status} — is the token valid here?`);
+  const me = (await res.json()) as { namespace?: unknown };
+  if (typeof me.namespace !== "string" || me.namespace === "") {
+    throw new Error("GET /api/me returned no namespace");
+  }
+  return me.namespace;
+}
 
 // Input matches email-drafter's required schema.
 const TEST_INPUT = {
-  context: "Phase 19 cloud-E2E live smoke — Skrun #15",
+  context: "Phase 19 cloud-E2E live smoke — Skrun",
   tone: "friendly",
   recipient: "engineering colleague",
 };
@@ -87,7 +122,6 @@ export async function run(): Promise<void> {
   const runnersApp = process.env.FLY_TEST_APP_NAME;
   const apiUrl = process.env.SKRUN_CLOUD_API_URL;
   const apiToken = process.env.SKRUN_CLOUD_API_TOKEN;
-  const agentRef = process.env.SKRUN_CLOUD_TEST_AGENT ?? DEFAULT_AGENT;
 
   if (!flyToken || !runnersApp || !apiUrl || !apiToken) {
     results.push({
@@ -102,22 +136,39 @@ export async function run(): Promise<void> {
     return;
   }
 
+  // The caller's key: the server holds none, as in production. The provider
+  // name is checked before use and never echoed — a key pasted there by mistake
+  // would otherwise land in the report.
+  const provider = (process.env.SKRUN_CLOUD_CALLER_PROVIDER ?? DEFAULT_CALLER_PROVIDER)
+    .trim()
+    .toLowerCase();
   const start = Date.now();
-  // agentRef = "dev/email-drafter@1.0.0" → namespace="dev", name="email-drafter", version="1.0.0"
-  const match = agentRef.match(/^([^/]+)\/([^@]+)(?:@(.+))?$/);
-  if (!match) {
+  if (!/^[a-z][a-z0-9]{1,31}$/.test(provider)) {
     results.push({
       agent: PHASE,
       feature: "cloud-e2e",
       passed: false,
-      duration: Date.now() - start,
+      duration: 0,
       cost: 0,
-      detail: `invalid SKRUN_CLOUD_TEST_AGENT format "${agentRef}" — expected ns/name[@version]`,
+      detail: "SKRUN_CLOUD_CALLER_PROVIDER is not a provider name (lowercase letters and digits)",
     });
     return;
   }
-  const [, ns, name, version] = match;
+  const keyVar = `${provider.toUpperCase()}_API_KEY`;
+  const callerKey = process.env[keyVar]?.trim();
+  if (!callerKey) {
+    results.push({
+      agent: PHASE,
+      feature: "cloud-e2e",
+      passed: true,
+      duration: 0,
+      cost: 0,
+      detail: `skipped — no caller key: set ${keyVar} (the server carries no model key), or SKRUN_CLOUD_CALLER_PROVIDER and that provider's key`,
+    });
+    return;
+  }
 
+  let agentRef = process.env.SKRUN_CLOUD_TEST_AGENT ?? `<account>/${DEFAULT_AGENT_NAME}`;
   try {
     // Step 1: /health 200 — surface a clear hint when the deployed app is
     // offline (e.g. parked / scaled to 0) instead of a raw fetch error.
@@ -135,13 +186,27 @@ export async function run(): Promise<void> {
       );
     }
 
-    // Step 2: POST /run with Accept: text/event-stream
+    // The agent: the one named, or the default derived from the account and
+    // the repository — "<ns>/email-drafter@<version of its agent.yaml>".
+    agentRef =
+      process.env.SKRUN_CLOUD_TEST_AGENT ??
+      `${await tokenNamespace(apiUrl, apiToken)}/${DEFAULT_AGENT_NAME}@${repositoryVersion(DEFAULT_AGENT_NAME)}`;
+    const match = agentRef.match(/^([^/]+)\/([^@]+)(?:@(.+))?$/);
+    if (!match) {
+      throw new Error(
+        `invalid SKRUN_CLOUD_TEST_AGENT format "${agentRef}" — expected ns/name[@version]`,
+      );
+    }
+    const [, ns, name, version] = match;
+
+    // Step 2: POST /run with Accept: text/event-stream, and the caller's key
     const runRes = await fetch(`${apiUrl}/api/agents/${ns}/${name}/run`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiToken}`,
         Accept: "text/event-stream",
+        "X-LLM-API-Key": JSON.stringify({ [provider]: callerKey }),
       },
       body: JSON.stringify({ input: TEST_INPUT, version }),
     });
@@ -151,7 +216,7 @@ export async function run(): Promise<void> {
       // a 401/403 with that token is the most common foot-gun — point at the fix.
       const authHint =
         (runRes.status === 401 || runRes.status === 403) && apiToken === "dev-token"
-          ? " — hint: OAuth deployments reject the dev-token shortcut; use a durable sk_live_ API key in SKRUN_CLOUD_API_TOKEN"
+          ? " — hint: OAuth deployments reject the dev-token shortcut; use an API key in SKRUN_CLOUD_API_TOKEN"
           : "";
       throw new Error(`POST /run returned ${runRes.status}${authHint}: ${bodyText}`);
     }
@@ -188,14 +253,14 @@ export async function run(): Promise<void> {
       throw new Error(`SSE stream ended before run_complete (events: ${observed.join(",")})`);
     }
 
-    // SC-1: output shape parity — email-drafter emits at least { subject, body }
+    // Output shape, the same as the local runtime's — email-drafter emits at least { subject, body }
     if (typeof finalOutput.subject !== "string" || typeof finalOutput.body !== "string") {
       throw new Error(
         `output missing expected fields (got keys: ${Object.keys(finalOutput).join(",")})`,
       );
     }
 
-    // Step 5: SC-9 — machine destroyed after run
+    // Step 5: the machine is destroyed after the run
     // Best-effort: list machines on the runners app, assert none remain
     // bearing the runId prefix. (Other live phases might have left orphans
     // but they should NOT match `skrun-run-${runId}-*`.)
@@ -206,7 +271,7 @@ export async function run(): Promise<void> {
     );
     if (lingering.length > 0) {
       throw new Error(
-        `SC-9 fail: ${lingering.length} machine(s) still alive after run with run_id ${runId}: ${lingering.map((m) => m.id).join(", ")}`,
+        `machine teardown failed: ${lingering.length} machine(s) still alive after run with run_id ${runId}: ${lingering.map((m) => m.id).join(", ")}`,
       );
     }
 
@@ -216,16 +281,21 @@ export async function run(): Promise<void> {
       passed: true,
       duration: Date.now() - start,
       cost: 0,
-      detail: `agent=${agentRef} run_id=${runId} events=${observed.join("→")} output_keys=${Object.keys(finalOutput).join(",")} machines_after=0`,
+      detail: `agent=${agentRef} caller_key=${provider} run_id=${runId} events=${observed.join("→")} output_keys=${Object.keys(finalOutput).join(",")} machines_after=0`,
     });
   } catch (err) {
+    // A server error can quote what it was sent; the key never reaches the report.
+    const message = (err instanceof Error ? err.message : String(err)).replaceAll(
+      callerKey,
+      "[redacted]",
+    );
     results.push({
       agent: PHASE,
       feature: "cloud-e2e",
       passed: false,
       duration: Date.now() - start,
       cost: 0,
-      detail: `error: ${err instanceof Error ? err.message : String(err)}`,
+      detail: `agent=${agentRef} caller_key=${provider} error: ${message}`,
     });
   }
 }

@@ -1,4 +1,10 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  type QueryClient,
+  type QueryState,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 
 // --- Types ---
 
@@ -167,6 +173,61 @@ export interface CreateKeyInput {
   expires_at?: string;
 }
 
+/**
+ * An account's fast runs of the rolling hour, in `GET /api/usage` — told only
+ * while a runner pool runs. A manual copy of the API's `FastRunsUsage`, like
+ * the other types of this file: same field names, nothing imported.
+ */
+export interface FastRunsUsage {
+  /** The runs per rolling hour entitled to a pooled machine; `null` when that bound is off, `0` for a plan that includes none. */
+  limit: number | null;
+  /** Those left now, never below 0; `null` when the bound is off. */
+  remaining: number | null;
+  /** When the next right comes back (ISO-8601); `null` when nothing comes back or the bound is off. */
+  resets_at: string | null;
+}
+
+/**
+ * The body of `GET /api/usage` — what the account consumes now. A manual copy
+ * of the API's `UsageResponse`: same field names, nothing imported.
+ */
+export interface UsageResponse {
+  /** The plan whose thresholds apply, as the server names it. */
+  plan: string;
+  /**
+   * `null` when the server sets no quota at all. The seats and the compute
+   * each `null` when their bound is off; the fast runs `null` only while no
+   * runner pool runs.
+   */
+  quotas: {
+    concurrent_runs: { limit: number; in_use: number } | null;
+    compute: {
+      limit_seconds: number;
+      /** The charged time of the window's runs, in whole seconds (rounded down). */
+      used_seconds: number;
+      /** The current window, aligned on UTC (ISO-8601): start included, end excluded. */
+      window: { start: string; end: string };
+    } | null;
+    fast_runs: FastRunsUsage | null;
+  } | null;
+}
+
+/**
+ * The body of `GET /api/instance` — what the instance tells whoever is signed
+ * in about itself: the links its dashboard shows. A manual copy of the API's
+ * `InstanceResponse`: same field names, nothing imported.
+ */
+export interface InstanceResponse {
+  links: {
+    /** Where the docs are: the operator's address, or this server's API reference (`/docs`). */
+    docs: string;
+    /** The operator's terms; `null` when none is set. */
+    terms: string | null;
+    /** The operator's privacy policy; `null` when none is set. */
+    privacy: string | null;
+  };
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -267,11 +328,171 @@ export function useMe() {
   });
 }
 
+/**
+ * The instance's links, read once per session: they change only when the
+ * server restarts. A failed read is asked again as the app's default `retry`
+ * says, and the links then fall back (`instanceLinks`).
+ */
+export function useInstance() {
+  return useQuery<InstanceResponse>({
+    queryKey: ["instance"],
+    queryFn: () => apiFetch("/instance"),
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+}
+
+/** One field of `value`, when `value` is an object; nothing otherwise. */
+function fieldOf(value: unknown, name: string): unknown {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)[name]
+    : undefined;
+}
+
+/**
+ * The links the dashboard shows, from the answer of `useInstance()` as it
+ * comes: each kept only when it is a string. With no answer — a read that
+ * failed or is still under way —, a field missing or not a string: the docs
+ * stay `/docs`, and no terms nor privacy link is shown.
+ */
+export function instanceLinks(data: InstanceResponse | undefined): {
+  docs: string;
+  terms: string | null;
+  privacy: string | null;
+} {
+  const links = fieldOf(data, "links");
+  const docs = fieldOf(links, "docs");
+  const terms = fieldOf(links, "terms");
+  const privacy = fieldOf(links, "privacy");
+  return {
+    docs: typeof docs === "string" ? docs : "/docs",
+    terms: typeof terms === "string" ? terms : null,
+    privacy: typeof privacy === "string" ? privacy : null,
+  };
+}
+
 export function useStats() {
   return useQuery<Stats>({
     queryKey: ["stats"],
     queryFn: () => apiFetch("/stats"),
     staleTime: 60_000,
+  });
+}
+
+/** The query of the account's usage — invalidated when a playground run ends. */
+export const USAGE_QUERY_KEY = ["usage"] as const;
+
+/**
+ * How long after an instant the usage changes at it is read again. A server
+ * whose clock is behind the browser's by less than this is past the instant
+ * too; one further behind answers as before it, and that answer is read again
+ * as one whose instant is already past.
+ */
+export const USAGE_REREAD_MARGIN_MS = 2_000;
+
+/** The bounds of a wait that grows with what calls for it: as long again, within these. */
+const WAIT_MIN_MS = 5_000;
+const WAIT_MAX_MS = 5 * 60_000;
+
+/** The soonest a read is set: a delay of 0 sets no timer at all. */
+const SOONEST_MS = 1;
+
+/** The longest delay a timer holds (2^31 − 1 ms, about 24.8 days): a longer one fires at once. */
+const LONGEST_TIMER_MS = 2_147_483_647;
+
+/** The wait before a read when what calls for it began `elapsed` ago: as long again, 5 s to 5 min. */
+function growingWait(elapsed: number): number {
+  return Math.min(Math.max(elapsed, WAIT_MIN_MS), WAIT_MAX_MS);
+}
+
+/** A refused answer — a 4xx: asking again would get the same. */
+function isRefusal(error: unknown): boolean {
+  return error instanceof ApiError && error.status < 500;
+}
+
+/** The usage query, as the delay reads it. */
+interface UsageQuery {
+  state: QueryState<UsageResponse>;
+}
+
+/** When the failures of each usage query began: its first failure since its last answer. */
+const failuresBegan = new WeakMap<UsageQuery, number>();
+
+/** When the query's failures since its last answer began — the last failure, for the first of them. */
+function failingSince(query: UsageQuery): number {
+  const { dataUpdatedAt, errorUpdatedAt } = query.state;
+  const began = failuresBegan.get(query);
+  if (began !== undefined && began > dataUpdatedAt) return began;
+  failuresBegan.set(query, errorUpdatedAt);
+  return errorUpdatedAt;
+}
+
+/**
+ * The delay until the usage is read again; `false` when nothing calls for a
+ * read. While a read is under way, or waits — for the network, or for its tab
+ * to come back to the front before it is tried again —, none: its outcome
+ * sets the next. After a refusal, none. After any other failure, the usage is
+ * read again after as long as has passed since its failures began, 5 s at
+ * least and 5 min at most, counted from the last one, until an answer comes.
+ * After an answer, at the instants where the usage changes by itself: the end
+ * of the compute window, the return of a fast run. One still to come when the
+ * answer arrived is read the margin after it. One already past by then says
+ * the server's clock is behind the browser's, not yet at it: the answer is
+ * read again after as long as had passed since that instant, 5 s at least and
+ * 5 min at most, until an answer moves past it. The nearer read wins. Each is
+ * set at a fixed moment, so a render does not put it back, and one whose
+ * moment has gone by with nothing after it — a timer held back in a hidden
+ * tab — is made at once. The answer is read as it comes: a field missing, or
+ * not a text that reads as a date, gives no instant.
+ */
+function usageRereadDelay(query: UsageQuery, now: number): number | false {
+  const { state } = query;
+  if (state.fetchStatus !== "idle") return false;
+  let next: number;
+  if (state.status === "error") {
+    if (isRefusal(state.error)) return false;
+    const last = state.errorUpdatedAt;
+    next = last + growingWait(last - failingSince(query));
+  } else {
+    const receivedAt = state.dataUpdatedAt;
+    const quotas = state.data?.quotas;
+    const reads = [quotas?.compute?.window?.end, quotas?.fast_runs?.resets_at]
+      .map((value: unknown) => (typeof value === "string" ? Date.parse(value) : Number.NaN))
+      .map((at) =>
+        at > receivedAt ? at + USAGE_REREAD_MARGIN_MS : receivedAt + growingWait(receivedAt - at),
+      )
+      .filter((read) => !Number.isNaN(read));
+    if (reads.length === 0) return false;
+    next = Math.min(...reads);
+  }
+  return Math.min(Math.max(next - now, SOONEST_MS), LONGEST_TIMER_MS);
+}
+
+type AppRetry = NonNullable<ReturnType<QueryClient["getDefaultOptions"]>["queries"]>["retry"];
+
+/** Whether the app's default `retry` asks again — read as the query library reads it: 3 tries when unset. */
+function appRetries(retry: AppRetry, failures: number, error: Error): boolean {
+  if (typeof retry === "function") return retry(failures, error);
+  if (typeof retry === "number") return failures < retry;
+  return retry ?? failures < 3;
+}
+
+/**
+ * The account's usage. Its freshness is the app's default: the numbers move
+ * with every run, so it is kept shorter than the statistics'. It is read
+ * again when it changes by itself, in a background tab too — the app never
+ * reads again when a tab comes back to the front. A refused answer (a 4xx) is
+ * not asked again. Any other failure is asked again as the app's default
+ * `retry` says, then read again after a wait that grows, 5 s to 5 min, until
+ * an answer comes.
+ */
+export function useUsage() {
+  const appRetry = useQueryClient().getDefaultOptions().queries?.retry;
+  return useQuery<UsageResponse>({
+    queryKey: USAGE_QUERY_KEY,
+    queryFn: () => apiFetch("/usage"),
+    retry: (failures, error) => !isRefusal(error) && appRetries(appRetry, failures, error),
+    refetchInterval: (query) => usageRereadDelay(query, Date.now()),
+    refetchIntervalInBackground: true,
   });
 }
 

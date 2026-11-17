@@ -14,7 +14,7 @@
  * the default `admin`. The non-admin `owner`/`disabled` behaviors (owner
  * self-verify, the run-gate matrix, the attestation `kind`) need a non-admin
  * caller and are covered by the in-memory suite (run.test.ts / registry.test.ts),
- * which mints real sk_live keys.
+ * which mints real API keys.
  *
  * Self-bootstrapping: pushes its own fixture under stable version 9.22.1 and
  * DELETEs at the end (dev-token = admin).
@@ -23,7 +23,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REGISTRY, results, skrun, TOKEN } from "./_ctx.js";
+import { pushFixture, REGISTRY, results, skrun, TOKEN } from "./_ctx.js";
 
 const NS = "dev";
 const AGENT = "verification-policy-live";
@@ -36,7 +36,7 @@ async function deleteAgent(): Promise<void> {
   });
 }
 
-function buildAndPush(): string {
+async function buildAndPush(): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), `skrun-live-22-${V1}-`));
   writeFileSync(
     join(dir, "SKILL.md"),
@@ -56,7 +56,7 @@ Reply with the literal string "ok".
 version: ${V1}
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
 inputs:
   - name: task
     type: string
@@ -67,11 +67,7 @@ outputs:
 `,
   );
   skrun(["build"], dir);
-  try {
-    skrun(["push"], dir);
-  } catch {
-    // 409 if the version was already pushed in a prior run — proceed.
-  }
+  await pushFixture(dir);
   return dir;
 }
 
@@ -104,7 +100,7 @@ export async function run(): Promise<void> {
   await deleteAgent();
   let dir: string | null = null;
   try {
-    dir = buildAndPush();
+    dir = await buildAndPush();
     const res = await fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}/versions/${V1}/verify`, {
       method: "PATCH",
       headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },

@@ -3,7 +3,7 @@ import { createLogger } from "@skrun-dev/runtime";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { getCookie, setCookie } from "hono/cookie";
-import { generateApiKey } from "../auth/api-key.js";
+import { API_KEY_PREFIX, generateApiKey } from "../auth/api-key.js";
 import { isDevAuthEnabled } from "../auth/dev-auth.js";
 import {
   computeExpiresIn,
@@ -26,7 +26,6 @@ import {
   destroySession,
   getSessionCookieOptions,
   isSecureCookie,
-  sessionCookieDomain,
   sessionCookieErasures,
   sessionCookieName,
 } from "../auth/session.js";
@@ -34,18 +33,82 @@ import { isGithubUserAllowed } from "../auth/signup-allowlist.js";
 import type { DbAdapter } from "../db/adapter.js";
 import { API_KEY_DEFAULT_SCOPES } from "../db/schema.js";
 import { getUser } from "../middleware/auth.js";
+import type { OperatorSite } from "../operator-site.js";
+import type { DeletionJournal } from "../services/deletion-journal.js";
 import { resolveDefaultKeyExpiry } from "../services/key-expiry.js";
 import type { VerificationPolicy } from "../services/verification-policy.js";
-import { externalBaseUrl, publicOrigin } from "../utils/external-url.js";
+import { type ErrorFields, errorFields } from "../utils/error-fields.js";
+import { externalBaseUrl } from "../utils/external-url.js";
 import { requireMasterCredential } from "./_helpers.js";
 
 const logger = createLogger("auth");
 
-const OAUTH_STATE_COOKIE = "skrun_oauth_state";
+/** The shape of every id a backend mints for a key (randomUUID()), in any case. */
+const API_KEY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * How long a revocation waits for its deletion journal record. Past it, the
+ * revocation goes ahead as on a record that could not be written — logged, and
+ * the key goes —: a key revoked because it was stolen must stop working now,
+ * not once a store that does not answer gives up, its own retries included.
+ * The write goes on by itself, and may still land after the key is gone.
+ */
+export const REVOCATION_JOURNAL_WAIT_MS = 5_000;
+
+/** What a revocation logs when its journal record took longer than REVOCATION_JOURNAL_WAIT_MS. */
+export class RevocationJournalTimeout extends Error {
+  constructor() {
+    super(`the deletion journal record was not written within ${REVOCATION_JOURNAL_WAIT_MS} ms`);
+    this.name = "RevocationJournalTimeout";
+  }
+}
+
+/**
+ * `write`, waited on for REVOCATION_JOURNAL_WAIT_MS at most: past it, rejected
+ * with a RevocationJournalTimeout while the write goes on. Its outcome is
+ * handled whenever it comes — a rejection after the wait is nobody's —, and the
+ * timer is cleared as soon as the write settles.
+ */
+function waitForRecord(write: Promise<void>): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new RevocationJournalTimeout()),
+      REVOCATION_JOURNAL_WAIT_MS,
+    );
+    write.then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
+ * The steps of the OAuth callback, in order, as its failure log names them.
+ * `github` is the token exchange and the profile fetch; every other step is this
+ * server's own work, once GitHub has answered.
+ */
+type OAuthCallbackStage = "github" | "allowlist" | "user" | "device" | "session";
+
+/**
+ * Anti-replay cookie of the GitHub round-trip: it carries the `state` that the
+ * callback must see come back. `__Host-` wherever the Secure flag applies — a
+ * sibling host of the domain cannot set a `__Host-` cookie, so it cannot plant a
+ * `state` of its own choosing and have a victim's browser finish a sign-in it
+ * started (the victim would land signed in to the other party's account).
+ */
+function oauthStateCookieName(): string {
+  return deviceCookiesAreSecure() ? "__Host-skrun_oauth_state" : "skrun_oauth_state";
+}
 
 /**
  * A legacy CLI (pre-device-flow) opened `/auth/github?cli_callback=…` and expected
- * its `sk_live` key back via the loopback URL. That flow is removed — it leaked the
+ * its API key back via the loopback URL. That flow is removed — it leaked the
  * key in the URL (browser history / Referer / logs). Tell the user to update instead
  * of failing silently.
  */
@@ -61,14 +124,26 @@ code{background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:13px;font-fa
 <p>Update with <code>npm i -g @skrun-dev/cli</code>, then run <code>skrun login</code> again.</p></div></body></html>`;
 }
 
-/** Marks an in-progress CLI device-login authorization (set by POST /device). */
-const DEVICE_USER_CODE_COOKIE = "skrun_device_user_code";
+/**
+ * Marks an in-progress CLI device-login authorization (set by POST /device).
+ *
+ * `__Host-` wherever the Secure flag applies. Without the prefix a sibling host of
+ * the domain could set this cookie on the parent domain, and a victim who then
+ * signed in on the web would be taken down the device branch of the callback —
+ * the other party's code bound to the victim's account. The prefix leaves the
+ * site policy alone, so the cookie still survives the GitHub round-trip.
+ */
+function deviceUserCodeCookieName(): string {
+  return deviceCookiesAreSecure() ? "__Host-skrun_device_user_code" : "skrun_device_user_code";
+}
 
 /**
- * Whether the consent cookies carry the `Secure` flag.
+ * Whether the cookies of the sign-in round-trip carry the `Secure` flag — the
+ * consent cookie, the device binding and the OAuth `state`.
  *
- * Also decides the CSRF cookie's name, because `__Host-` is refused by a browser
- * — and raised on by hono's serialiser — without it.
+ * Also decides the name of all three, because `__Host-` is refused by a browser
+ * — and raised on by hono's serialiser — without it. One function for the name
+ * and the flag, so the two can never disagree.
  */
 function deviceCookiesAreSecure(): boolean {
   // The same flag as the session cookie's — one reader of the environment.
@@ -78,10 +153,11 @@ function deviceCookiesAreSecure(): boolean {
 /**
  * CSRF double-submit cookie for the /device consent form.
  *
- * `__Host-` wherever the Secure flag applies. The condition is DIFFERENT from the
- * session cookie's, which also needs a configured domain, and the difference is
- * deliberate: this cookie depends on no domain — it is set and read by the same
- * origin seconds apart — so the prefix protects it everywhere it can be set. What
+ * `__Host-` wherever the Secure flag applies. The session cookie is prefixed under
+ * the same flag, but a configured domain switches it to `__Secure-`, because
+ * `__Host-` forbids a `Domain` attribute. This cookie never takes a domain — it is
+ * set and read by the same origin seconds apart — so `__Host-` protects it
+ * everywhere it can be set. What
  * the prefix buys is the one thing no other attribute does: a sibling host of the
  * domain CANNOT set a `__Host-` cookie, so it cannot plant the value that the
  * double-submit check compares against.
@@ -93,6 +169,18 @@ function deviceCsrfCookieName(): string {
   return deviceCookiesAreSecure() ? "__Host-skrun_device_csrf" : "skrun_device_csrf";
 }
 
+/**
+ * The options that erase a binding cookie (the OAuth `state` or the device
+ * binding). `secure` is not decoration: under the prefix, hono raises before
+ * writing the header rather than emit a `__Host-` cookie without it, and the
+ * callback would answer 500 on every production sign-in — with nothing locally
+ * to show it, since the prefix is off there. One factory for every erasure site,
+ * because a site written by hand is the one that forgets.
+ */
+function bindingCookieErasure(): { maxAge: number; path: string; secure: boolean } {
+  return { maxAge: 0, path: "/", secure: deviceCookiesAreSecure() };
+}
+
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -102,12 +190,48 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
+/** The outgoing-link mark the dashboard draws (IconExternal), inline. */
+const NEW_TAB_MARK =
+  '<svg width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 2H2v8h8V7M7 2h3v3M10 2L5.5 6.5"/></svg>';
+
+// Travels with the notice and only with it: a page that shows no notice carries
+// none of these bytes, so it stays exactly what it was. Not in the page's own
+// <style> block for that reason.
+const CONSENT_STYLE =
+  "<style>.consent{margin:12px 0 0;font-size:12px;line-height:1.5;color:#6b7280}" +
+  ".consent a{color:inherit;text-decoration:underline;text-underline-offset:2px;white-space:nowrap}" +
+  ".consent a:hover{color:#111827}.consent svg{margin-left:2px}" +
+  "@media(prefers-color-scheme:dark){.consent{color:#9ca3af}.consent a:hover{color:#f3f4f6}}</style>";
+
+/**
+ * A link to one of the operator's documents. It opens in a new tab, so a consent
+ * in progress is not lost, and sends no referrer: the page's address carries the
+ * one-time code.
+ */
+function consentLink(href: string, label: string): string {
+  return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" aria-label="${label} (opens in a new tab)">${label}${NEW_TAB_MARK}</a>`;
+}
+
+/**
+ * The line under the sign-in button naming the operator's terms and privacy
+ * policy, one link per address set; the empty string when neither is set.
+ */
+function consentNotice(links: { terms: string | undefined; privacy: string | undefined }): string {
+  const parts: string[] = [];
+  if (links.terms) parts.push(`agree to the ${consentLink(links.terms, "Terms")}`);
+  if (links.privacy) parts.push(`acknowledge the ${consentLink(links.privacy, "Privacy Policy")}`);
+  if (parts.length === 0) return "";
+  return `${CONSENT_STYLE}<p class="consent">By continuing, you ${parts.join(" and ")}.</p>`;
+}
+
 /**
  * The CLI device-login consent page. States what is requesting access and warns
  * against device-code phishing. The CSRF token is a double-submit value (also set
- * in a cookie) so a cross-origin page cannot forge the form POST.
+ * in a cookie) so a cross-origin page cannot forge the form POST. `notice` is the
+ * operator's terms and privacy line, inserted under the button — empty when the
+ * operator set neither address.
  */
-function devicePage(userCode: string, csrf: string): string {
+function devicePage(userCode: string, csrf: string, notice: string): string {
   const uc = escapeHtml(userCode);
   const token = escapeHtml(csrf);
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -127,7 +251,7 @@ code{background:#f3f4f6;padding:1px 5px;border-radius:4px;font-family:ui-monospa
 <label for="user_code">One-time code</label>
 <input id="user_code" name="user_code" value="${uc}" autocomplete="off" autocapitalize="characters" spellcheck="false" required>
 <input type="hidden" name="csrf" value="${token}">
-<button type="submit">Continue with GitHub</button></form>
+<button type="submit">Continue with GitHub</button></form>${notice}
 <p class="warn">⚠️ Only continue if you just ran <code>skrun login</code> yourself. Never enter a code someone sent you.</p>
 </div></body></html>`;
 }
@@ -170,8 +294,10 @@ function notAuthorizedPage(): string {
 }
 
 /**
- * Where a finished browser login lands — decided by this server's configuration,
- * never read from the request.
+ * The origin a finished browser login lands on — decided by this server's
+ * configuration, as the start validated it, never read from the request. It is
+ * given the canonical URL and the cookie domain `createApp` read, and reads
+ * nothing else: not the environment, which a request never consults for this.
  *
  * `undefined` means "keep today's behaviour": `/dashboard` on success, and the
  * JSON / HTML error responses this route has always given. The switch is
@@ -188,25 +314,47 @@ function notAuthorizedPage(): string {
  * deliberately not carried over: the site sits at the apex of the cookie's
  * domain, and nothing says it listens on the API's port.
  *
- * `undefined` is also the answer if the canonical origin is somehow unreadable.
- * That cannot happen after a successful boot, and if it did the fallback is the
- * behaviour of a deployment that configured nothing — never a redirect built
- * from a value we could not validate.
+ * `undefined` is also the answer without a canonical URL. That cannot happen
+ * after a successful boot, and if it did the fallback is the behaviour of a
+ * deployment that configured nothing — never a redirect built from a value that
+ * was not validated.
  */
-function loginReturnOrigin(): string | undefined {
-  const domain = sessionCookieDomain();
-  if (domain === undefined) return undefined;
-  const canonical = publicOrigin();
-  if (canonical === undefined) return undefined;
-  return `${new URL(canonical).protocol}//${domain}`;
+function loginReturnOrigin(
+  canonicalUrl: URL | undefined,
+  cookieDomain: string | undefined,
+): string | undefined {
+  if (cookieDomain === undefined) return undefined;
+  if (canonicalUrl === undefined) return undefined;
+  return `${canonicalUrl.protocol}//${cookieDomain}`;
 }
 
 export function createAuthRoutes(
   db: DbAdapter,
   authMiddleware: MiddlewareHandler,
-  verificationPolicy: VerificationPolicy = "admin",
+  // The policy createApp resolved at start; readVerificationPolicy holds its default.
+  verificationPolicy: VerificationPolicy,
+  // The operator's own site, read once at start by createApp.
+  site: OperatorSite,
+  // The deletion journal, when the operator keeps one: a revocation is recorded
+  // there before its row goes. Absent, nothing is recorded.
+  deletionJournal?: DeletionJournal,
 ): Hono {
   const router = new Hono();
+
+  // Where a finished browser login lands: the configured path on the site's
+  // origin (its root unless the operator set one), or `undefined` for today's
+  // behaviour — see loginReturnOrigin. Resolved here, once, while the routes are
+  // built at start: no request resolves it again, so the value the start
+  // validated is the value every callback serves.
+  const returnOrigin = loginReturnOrigin(site.canonicalUrl, site.cookieDomain);
+  const returnTo =
+    returnOrigin === undefined ? undefined : `${returnOrigin}${site.loginReturnPath}`;
+
+  // The operator's terms and privacy line, shown under the sign-in button of the
+  // consent page and of /login — built once, from the addresses the start
+  // validated; the empty string when neither is set, which leaves both pages as
+  // they were.
+  const notice = consentNotice(site.links);
 
   // ==================== OAuth Routes ====================
 
@@ -237,9 +385,9 @@ export function createAuthRoutes(
     const state = randomUUID();
 
     // Store state in a short-lived cookie for CSRF protection
-    setCookie(c, OAUTH_STATE_COOKIE, state, {
+    setCookie(c, oauthStateCookieName(), state, {
       httpOnly: true,
-      secure: isSecureCookie(),
+      secure: deviceCookiesAreSecure(),
       sameSite: "Lax",
       path: "/",
       maxAge: 300, // 5 minutes
@@ -258,15 +406,14 @@ export function createAuthRoutes(
       );
     }
 
-    // Read once, and note what is NOT read: no `return_to`, no `next`, no
-    // `redirect_uri`, in the query string or anywhere else. There is no allowlist
-    // to get wrong because there is no caller-supplied destination to validate —
-    // the open-redirect family is absent by construction, not guarded against.
-    const returnOrigin = loginReturnOrigin();
-
+    // The destination is `returnTo`, resolved at start — and note what is NOT
+    // read: no `return_to`, no `next`, no `redirect_uri`, in the query string or
+    // anywhere else. There is no allowlist to get wrong because there is no
+    // caller-supplied destination to validate — the open-redirect family is
+    // absent by construction, not guarded against.
     const code = c.req.query("code");
     const state = c.req.query("state");
-    const storedState = getCookie(c, OAUTH_STATE_COOKIE);
+    const storedState = getCookie(c, oauthStateCookieName());
 
     // Three of the four technical failures live here — a missing state, a state
     // that does not match, and a cancellation at GitHub (which comes back with
@@ -275,7 +422,7 @@ export function createAuthRoutes(
     // callback which half of the handshake they got wrong, and would tell a
     // support reader nothing they could act on.
     if (!code || !state || state !== storedState) {
-      if (returnOrigin) return c.redirect(`${returnOrigin}/?login=failed`);
+      if (returnTo) return c.redirect(`${returnTo}?login=failed`);
       return c.json(
         { error: { code: "INVALID_OAUTH_CALLBACK", message: "Invalid or missing OAuth state" } },
         400,
@@ -283,8 +430,11 @@ export function createAuthRoutes(
     }
 
     // Clear the state cookie
-    setCookie(c, OAUTH_STATE_COOKIE, "", { maxAge: 0, path: "/" });
+    setCookie(c, oauthStateCookieName(), "", bindingCookieErasure());
 
+    // Where the callback stands, for the log line of a failure: GitHub's two
+    // calls first, then this server's own steps.
+    let stage: OAuthCallbackStage = "github";
     try {
       // biome-ignore lint/style/noNonNullAssertion: checked by isOAuthConfigured()
       const clientId = process.env.GITHUB_CLIENT_ID!;
@@ -294,6 +444,7 @@ export function createAuthRoutes(
       const accessToken = await exchangeCodeForToken(clientId, clientSecret, code);
       const ghUser = await fetchGithubUser(accessToken);
 
+      stage = "allowlist";
       // Signup allowlist: when SKRUN_ALLOWED_GITHUB_USERS is set, only listed GitHub
       // accounts may create an account / log in (web + device). Unset = open. Runs
       // before the upsert so a rejected login leaves no user behind.
@@ -303,11 +454,11 @@ export function createAuthRoutes(
         // poll gets `expired_token` (an existing state) instead of a stale `pending`,
         // and clear the binding cookie. The cookie holds the user_code; consume runs
         // on the device_code_hash, so look the row up first.
-        const deviceUserCode = getCookie(c, DEVICE_USER_CODE_COOKIE);
+        const deviceUserCode = getCookie(c, deviceUserCodeCookieName());
         if (deviceUserCode) {
           const dc = await db.getDeviceCodeByUserHash(hashCode(deviceUserCode.toUpperCase()));
           if (dc) await db.consumeDeviceCode(dc.device_code_hash);
-          setCookie(c, DEVICE_USER_CODE_COOKIE, "", { maxAge: 0, path: "/" });
+          setCookie(c, deviceUserCodeCookieName(), "", bindingCookieErasure());
         }
         // The device work above happens on BOTH sides of this exit: the branch is
         // shared by the web and device journeys, and the CLI learns of the refusal
@@ -316,10 +467,11 @@ export function createAuthRoutes(
         // `denied` says that the account which just authenticated — the visitor's
         // own — is not admitted. It names neither the account nor the mechanism,
         // which is the same promise the generic page below already makes.
-        if (returnOrigin) return c.redirect(`${returnOrigin}/?login=denied`);
+        if (returnTo) return c.redirect(`${returnTo}?login=denied`);
         return c.html(notAuthorizedPage(), 403);
       }
 
+      stage = "user";
       // Upsert user in DB
       let user = await db.getUserByGithubId(String(ghUser.id));
       if (user) {
@@ -331,47 +483,71 @@ export function createAuthRoutes(
         // biome-ignore lint/style/noNonNullAssertion: checked by isOAuthConfigured()
         user = (await db.getUserById(user.id))!;
       } else {
-        user = await db.createUser({
+        // A new account: its namespace is the login, sanitized, or the first
+        // free `<base>--N` when that name is taken. Chosen once, never renamed.
+        const created = await db.createOAuthUser({
           github_id: String(ghUser.id),
-          username: ghUser.login.toLowerCase(),
+          login: ghUser.login,
           email: ghUser.email ?? undefined,
           avatar_url: ghUser.avatar_url ?? undefined,
         });
+        user = created.user;
+        if (created.derived !== null) {
+          // The internal id and N only: the login and the GitHub id name the
+          // person, and the namespace is the login plus N.
+          logger.info(
+            { event: "namespace_derived", user_id: user.id, n: created.derived },
+            "New account given a derived namespace",
+          );
+        }
       }
 
+      stage = "device";
       // Device-login flow: if this browser is completing a CLI device
       // authorization, bind the device code to the now-authenticated user and
       // stop here — the CLI receives the token by polling, never via a URL.
-      const deviceUserCode = getCookie(c, DEVICE_USER_CODE_COOKIE);
+      const deviceUserCode = getCookie(c, deviceUserCodeCookieName());
       if (deviceUserCode) {
-        setCookie(c, DEVICE_USER_CODE_COOKIE, "", { maxAge: 0, path: "/" });
+        setCookie(c, deviceUserCodeCookieName(), "", bindingCookieErasure());
         const ok = await db.authorizeDeviceCode(hashCode(deviceUserCode.toUpperCase()), user.id);
         return ok ? c.html(deviceDonePage()) : c.html(deviceErrorPage(), 400);
       }
 
+      stage = "session";
       // Web flow: create session cookie
       const sessionId = await createSession(db, user.id);
       const cookieOpts = getSessionCookieOptions();
       setCookie(c, sessionCookieName(), sessionId, cookieOpts);
 
-      // Back to the site — the configured origin's root, or the dashboard this
-      // server serves itself. A success carries no query parameter at all, so
-      // "did a login just happen" is not something a page can be told by a link
-      // someone else wrote.
-      return c.redirect(returnOrigin ? `${returnOrigin}/` : "/dashboard");
+      // Back to the site — the configured path on its origin, its root by
+      // default — or the dashboard this server serves itself. A success carries
+      // no query parameter at all, so "did a login just happen" is not something
+      // a page can be told by a link someone else wrote.
+      return c.redirect(returnTo ?? "/dashboard");
     } catch (err) {
       // The detail belongs in the operator's log, and only there. It used to be
       // handed to the browser, where it is worth nothing to the visitor and where
       // an exception message is one refactor away from carrying an internal URL
       // or a provider response body.
-      logger.error(
-        {
-          event: "oauth_exchange_failed",
-          error: err instanceof Error ? err.message : String(err),
-        },
-        "GitHub OAuth exchange failed",
-      );
-      if (returnOrigin) return c.redirect(`${returnOrigin}/?login=failed`);
+      if (stage === "github") {
+        // GitHub's own message: what tells an outage at GitHub from a
+        // misconfigured OAuth app.
+        logger.error(
+          {
+            event: "oauth_exchange_failed",
+            error: err instanceof Error ? err.message : String(err),
+          },
+          "GitHub OAuth exchange failed",
+        );
+      } else {
+        // Past GitHub the failure is this server's own: the step it happened at,
+        // and the error's class and code, never its message.
+        logger.error(
+          { event: "oauth_callback_failed", stage, ...errorFields(err) },
+          "OAuth callback failed after GitHub answered",
+        );
+      }
+      if (returnTo) return c.redirect(`${returnTo}?login=failed`);
       return c.json(
         { error: { code: "OAUTH_FAILED", message: "OAuth authentication failed" } },
         500,
@@ -447,7 +623,7 @@ export function createAuthRoutes(
       path: "/",
       maxAge: 600,
     });
-    return c.html(devicePage(userCode, csrf));
+    return c.html(devicePage(userCode, csrf, notice));
   });
 
   // POST /device — confirm the user_code, bind it to this browser, run GitHub OAuth.
@@ -484,7 +660,7 @@ export function createAuthRoutes(
 
     // Bind the in-progress authorization to this browser (survives the GitHub
     // round-trip via SameSite=Lax), then hand off to the existing OAuth leg.
-    setCookie(c, DEVICE_USER_CODE_COOKIE, userCode, {
+    setCookie(c, deviceUserCodeCookieName(), userCode, {
       httpOnly: true,
       secure: deviceCookiesAreSecure(),
       sameSite: "Lax",
@@ -503,7 +679,7 @@ export function createAuthRoutes(
     return c.redirect("/auth/github");
   });
 
-  // POST /auth/device/token — the CLI polls here; on success the sk_live is in the
+  // POST /auth/device/token — the CLI polls here; on success the API key is in the
   // response body (minted at poll-success), never a URL.
   router.post("/auth/device/token", async (c) => {
     let body: { device_code?: string; code_verifier?: string };
@@ -558,7 +734,7 @@ export function createAuthRoutes(
       return c.json({ error: { code: "invalid_grant", message: "PKCE verification failed" } }, 400);
     }
 
-    // Authorized + PKCE ok → mint the sk_live now and consume the code.
+    // Authorized + PKCE ok → mint the API key now and consume the code.
     // biome-ignore lint/style/noNonNullAssertion: an authorized code always has a user_id
     const userId = dc.user_id!;
     const user = await db.getUserById(userId);
@@ -590,6 +766,12 @@ export function createAuthRoutes(
 
   // GET /login — login page matching dashboard design system
   router.get("/login", (c) => {
+    // The operator's own sign-in page, when they set one: a temporary redirect —
+    // a permanent one would be cached past a change of configuration — to the
+    // address in the form the start validated and normalised, with nothing of
+    // the request carried over, no query and no path. It applies whether or not
+    // GitHub sign-in is configured here: the page is the operator's choice.
+    if (site.loginPageUrl) return c.redirect(site.loginPageUrl);
     const oauthEnabled = isOAuthConfigured();
     const devAuthEnabled = isDevAuthEnabled();
     const html = `<!DOCTYPE html>
@@ -683,10 +865,10 @@ export function createAuthRoutes(
         ? `<a href="/auth/github" class="btn btn-github">
             <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
             Sign in with GitHub
-          </a>`
+          </a>${notice}`
         : devAuthEnabled
           ? '<p class="note">OAuth is not configured on this instance.<br>Use <code>Bearer dev-token</code> for local development.</p>'
-          : '<p class="note">This instance requires authentication.<br>Configure GitHub OAuth, or use an API key (<code>sk_live_*</code>).</p>'
+          : `<p class="note">This instance requires authentication.<br>Configure GitHub OAuth, or use an API key (<code>${API_KEY_PREFIX}*</code>).</p>`
     }
     <div class="footer">
       <a href="/docs" target="_blank">API Docs</a>
@@ -705,12 +887,13 @@ export function createAuthRoutes(
     if (sessionId) {
       await destroySession(db, sessionId);
     }
-    // Every name and every scope still in play, not just the one this instance
-    // would set today. A deployment that has just turned the domain on faces
-    // browsers still carrying the host-only cookie under the old name, and an
-    // erasure aimed only at the new one would leave that cookie signing the user
-    // in for the rest of its seven days. The factory bounds the list (one, two or
-    // four) and carries the `secure` flag a prefixed name requires.
+    // Every name the session cookie can carry, on every scope still addressable,
+    // not just the one this instance would set today. A deployment that has just
+    // changed its configuration faces browsers still carrying the cookie under an
+    // old name or scope, and an erasure aimed only at the current one would leave
+    // that cookie signing the user in for the rest of its seven days. The factory
+    // drops what hono refuses to write (one, two, three or five entries) and
+    // carries the `secure` flag a prefixed name requires.
     for (const { name, options } of sessionCookieErasures()) {
       setCookie(c, name, "", options);
     }
@@ -747,7 +930,7 @@ export function createAuthRoutes(
 
     // Key management is account-administration: a delegated or operation-limited
     // key cannot mint another key (no privilege escalation). Master credential
-    // = a session, a dev-token, or an account-wide + full sk_live key.
+    // = a session, a dev-token, or an account-wide + full API key.
     const denied = requireMasterCredential(c);
     if (denied) return denied;
 
@@ -914,18 +1097,49 @@ export function createAuthRoutes(
     );
   });
 
-  // DELETE /api/keys/:id — revoke an API key (requires auth, must own the key)
+  // DELETE /api/keys/:id — revoke an API key (requires auth, must own the key).
+  // The order: a master credential; an id that is a UUID — every backend mints
+  // its ids with randomUUID(), and Postgres would refuse to compare anything
+  // else with one; the key read among the caller's own, before anything is
+  // written; then, with a deletion journal, the record of the revocation; then
+  // the row. The record comes only once the key is known to be the caller's:
+  // written earlier, any caller could plant one for someone else's key. A
+  // record that cannot be written never stops the revocation — a stolen key
+  // must stop working now —: it is logged, and the key goes; one that takes
+  // longer than REVOCATION_JOURNAL_WAIT_MS is not waited on past it.
   router.delete("/api/keys/:id", authMiddleware, async (c) => {
     const user = getUser(c);
     const denied = requireMasterCredential(c);
     if (denied) return denied;
-    const keyId = c.req.param("id");
-
-    const deleted = await db.deleteApiKeyByOwner(keyId, user.id);
-    if (!deleted) {
-      return c.json(
+    const notFound = () =>
+      c.json(
         { error: { code: "NOT_FOUND", message: "API key not found or not owned by you" } },
         404,
+      );
+    const keyId = c.req.param("id");
+    if (!API_KEY_ID.test(keyId)) return notFound();
+
+    // Compared in lower case, as the database compares a UUID.
+    const wanted = keyId.toLowerCase();
+    const key = (await db.listApiKeys(user.id)).find((k) => k.id.toLowerCase() === wanted);
+    if (!key) return notFound();
+
+    let journalFailure: ErrorFields | undefined;
+    if (deletionJournal) {
+      try {
+        await waitForRecord(deletionJournal.record("api-key", key.id));
+      } catch (err) {
+        journalFailure = errorFields(err);
+      }
+    }
+
+    const deleted = await db.deleteApiKeyByOwner(key.id, user.id);
+    // Revoked meanwhile by another request, which wrote its own record.
+    if (!deleted) return notFound();
+    if (journalFailure) {
+      logger.error(
+        { event: "api_key_revocation_journal_failed", key_id: key.id, ...journalFailure },
+        "API key revoked, but its deletion journal record could not be written, or not in time: a database restored from an earlier copy may bring this key back",
       );
     }
 

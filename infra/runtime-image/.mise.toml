@@ -12,8 +12,21 @@
 # (stable for 5+ years) which is good enough for CMA agent_toolset
 # alignment (Ruby is used by a minority of skills; 3.2 vs 3.3 minor
 # differences don't affect tool usage in skill scripts).
+#
+# NOTE on Node: 2026-10-03 — 22.12.0 -> 22.23.3, the latest 22.x on
+# nodejs.org/dist/index.json that day (it ships npm 10.9.9). undici 8,
+# which the runtime and the API pull, declares engines.node >=22.19.0:
+# the image ran below that floor, and npm ci warned EBADENGINE at every
+# build. The latest 22.x rather than 22.19.0 itself, for the security
+# releases published since. The floor of both install manifests and of
+# their locks' root is >=22.19.0; tests/e2e/node-floors.test.ts fails
+# when this pin, or that floor, no longer admits a package the image's
+# locks install. Bump NPM_VERSION in update-locks.sh with this pin.
+# 2026-10-27 — 22.23.3 -> 22.23.4, a security release (dated 2026-10-20
+# on nodejs.org/dist/index.json, the latest 22.x that day). It still
+# ships npm 10.9.9, so NPM_VERSION in update-locks.sh is unchanged.
 
 [tools]
-node = "22.12.0"
+node = "22.23.4"
 go = "1.22.10"
 rust = "1.77.2"

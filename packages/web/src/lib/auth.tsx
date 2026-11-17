@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { setAuthToken } from "./api-client";
 
 export interface AuthUser {
@@ -35,10 +35,40 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+/**
+ * The model key typed in the Playground. It lives in this provider's memory
+ * only — never in Web Storage — so it outlives a move between dashboard pages
+ * but not a reload, a closed tab, or a sign-out (which clears it). The
+ * session's provider holds it so that sign-out clears it in the same place.
+ */
+interface LlmKeyContextValue {
+  llmKey: string;
+  setLlmKey: (key: string) => void;
+}
+
+const LlmKeyContext = createContext<LlmKeyContextValue | null>(null);
+
+/** Where the dashboard up to 1.2.1 kept that key, in `localStorage`. Removed at load, never read. */
+const LEGACY_LLM_KEY_STORAGE = "skrun-llm-key";
+
+/** Removes a key an earlier dashboard left in `localStorage`. Storage access can throw (blocked site data): ignored. */
+function removeLegacyLlmKey(): void {
+  try {
+    window.localStorage.removeItem(LEGACY_LLM_KEY_STORAGE);
+  } catch {
+    // Storage unavailable: there is nothing this page can remove.
+  }
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isOAuthMode, setIsOAuthMode] = useState(false);
+  const [llmKey, setLlmKey] = useState("");
+
+  useEffect(() => {
+    removeLegacyLlmKey();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -94,6 +124,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const logout = useCallback(async () => {
+    // Cleared first: the key does not wait on the sign-out request.
+    setLlmKey("");
     try {
       await fetch("/auth/logout", { method: "POST", credentials: "same-origin" });
     } catch {
@@ -102,9 +134,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     window.location.href = "/login";
   }, []);
 
+  // Both values memoized: a keystroke in the key field re-renders this provider,
+  // and must not re-render every reader of the session.
+  const authValue = useMemo(
+    () => ({ user, isLoading, isOAuthMode, logout }),
+    [user, isLoading, isOAuthMode, logout],
+  );
+  const llmKeyValue = useMemo(() => ({ llmKey, setLlmKey }), [llmKey]);
+
   return (
-    <AuthContext.Provider value={{ user, isLoading, isOAuthMode, logout }}>
-      {children}
+    <AuthContext.Provider value={authValue}>
+      <LlmKeyContext.Provider value={llmKeyValue}>{children}</LlmKeyContext.Provider>
     </AuthContext.Provider>
   );
 }
@@ -112,5 +152,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 export function useAuth(): AuthContextValue {
   const ctx = useContext(AuthContext);
   if (!ctx) throw new Error("useAuth must be used within AuthProvider");
+  return ctx;
+}
+
+export function useLlmKey(): LlmKeyContextValue {
+  const ctx = useContext(LlmKeyContext);
+  if (!ctx) throw new Error("useLlmKey must be used within AuthProvider");
   return ctx;
 }

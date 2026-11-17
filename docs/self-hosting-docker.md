@@ -10,14 +10,16 @@ default.
 > → Prefer to install components yourself? See the bare-metal
 > [self-hosting guide](./self-hosting.md#bare-metal-install).
 
-> **Note — dashboard UI:** the published image serves the operator dashboard at `/dashboard` out of the box — the same console as the bare-metal install. Set `SKRUN_DASHBOARD=off` for a headless, API-only deployment.
+> **Note — dashboard UI:** the published image serves the operator dashboard at `/dashboard` out of the box — the same console as the bare-metal install. Set `SKRUN_DASHBOARD=off` in `infra/.env` for a headless, API-only deployment.
 
 ---
 
 ## Prerequisites
 
-- **Docker Engine ≥ 24** with the `compose` plugin (`docker compose
-  version` should print 2.x).
+- **Docker Engine ≥ 24 and Docker Compose ≥ 2.24** (`docker compose
+  version`). The compose file reads `infra/.env` through an `env_file`
+  entry marked optional, a form Compose 2.24 introduced: an older Compose
+  refuses the whole file.
 - **A domain name** if you want TLS. Caddy fetches a Let's Encrypt
   certificate automatically when you point an A/AAAA record at the
   host. For local-only testing, leave the domain unset and the API
@@ -26,31 +28,39 @@ default.
   Mistral, Groq, or xAI. Multiple keys can coexist; agents pick a
   provider via `model.provider` in their `agent.yaml`.
 - **~2 GB RAM, 2 vCPU** is plenty for self-host single-tenant. The
-  API server is I/O-bound — agent code runs in spawned sandbox
-  machines, not in the API process.
+  API server is mostly I/O-bound. With the stack's default `local`
+  runtime, an agent's scripts run as child processes in the API
+  container — no sandbox machine is spawned — so heavy scripts count
+  against that budget.
 
 ---
 
 ## Quick start
 
 ```bash
-# 1. Clone + copy the env template.
+# 1. Clone + copy the env template to infra/.env, next to the compose file —
+#    where Compose reads it, whatever folder you run it from.
 git clone https://github.com/skrun-dev/skrun.git
 cd skrun
-cp .env.example .env
+cp .env.example infra/.env
 
-# 2. Generate the three stack credentials. The stack has NO defaults for
-#    these. Forget them and it stops at a `skrun-preflight` container that
-#    names the missing variable, rather than booting on a password printed
-#    in this repository.
+# 2. Generate the stack's own values, added at the END of infra/.env: when a
+#    name appears twice in the file, its last line wins. The three stack
+#    credentials have NO defaults. Forget them and the stack stops at a
+#    `skrun-preflight` container that names the missing variable, rather than
+#    booting on a password printed in this repository. CORS_ORIGIN is the
+#    address this quick start serves the API on — the API refuses to start in
+#    production without one. The webhook key signs the webhooks the API sends.
 {
   echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)"
   echo "S3_ACCESS_KEY_ID=$(openssl rand -hex 8)"
   echo "S3_SECRET_ACCESS_KEY=$(openssl rand -hex 24)"
-} >> .env
+  echo "CORS_ORIGIN=http://localhost"
+  echo "WEBHOOK_SIGNING_KEY=$(openssl rand -hex 32)"
+} >> infra/.env
 
-# 3. Edit .env — fill at least one LLM key.
-$EDITOR .env
+# 3. Edit infra/.env — uncomment and fill at least one LLM key.
+$EDITOR infra/.env
 
 # 4. Bring up the stack.
 docker compose -f infra/docker-compose.yml up -d
@@ -78,8 +88,8 @@ a re-architecture. Use this when you care about:
 
 - **Sharing state across multiple API processes** (Postgres is the
   source of truth; you can horizontally scale the API service).
-- **Hosting bundles at scale** (MinIO supports presigned URLs, so the
-  API doesn't proxy bundle downloads).
+- **Hosting bundles at scale** (they live in MinIO, an S3-compatible
+  store, rather than on the API container's disk).
 - **MCP server connection caching** (Redis-backed in a future release;
   TTL-cached in-memory today).
 
@@ -87,8 +97,7 @@ a re-architecture. Use this when you care about:
 
 Strips Postgres / MinIO / Redis, falling back to the API's built-in
 SQLite + LocalStorage defaults. Smaller footprint, single-writer DB,
-served via the API's own `/api/files/:id/content` proxy instead of
-presigned URLs. Use this when:
+bundles on the API container's own disk instead of MinIO. Use this when:
 
 - You're the only operator on the host.
 - You don't expect more than a few hundred runs / day.
@@ -125,11 +134,19 @@ and MinIO treats an empty `MINIO_ROOT_USER` as unset and boots on
 Caddy fronts the API on `:80` and `:443`. To enable TLS:
 
 ```bash
-# Set your domain in .env (and add an A/AAAA record at it):
-echo "DOMAIN=skrun.example.com" >> .env
+# Add your domain (and an A/AAAA record at it), and the address the API is
+# now served on, at the END of infra/.env. The quick start already wrote a
+# CORS_ORIGIN line there: when a name is set twice in the file, its last line
+# wins — this one. Changing that line in place works too.
+{
+  echo "DOMAIN=skrun.example.com"
+  echo "CORS_ORIGIN=https://skrun.example.com"
+} >> infra/.env
 
-# Restart Caddy — it fetches a Let's Encrypt cert automatically.
-docker compose -f infra/docker-compose.yml restart caddy
+# Apply it: `up -d` recreates the services whose settings changed — Caddy
+# fetches a Let's Encrypt cert, the API reads its new CORS_ORIGIN. `restart`
+# would keep the old values.
+docker compose -f infra/docker-compose.yml up -d
 ```
 
 The shipped [`Caddyfile.example`](../infra/Caddyfile.example) enables
@@ -150,26 +167,54 @@ Cloudflare Tunnel), make sure SSE is configured similarly:
 
 ## Operator `.env` template
 
-The full list of env vars lives in [`.env.example`](../.env.example).
+The stack's settings live in `infra/.env`, copied from
+[`.env.example`](../.env.example), where the full list of env vars lives:
+the stack hands the whole file to the API, except the names
+`infra/docker-compose.yml` fixes for the `api` service, which win over it.
 The minimum to set in production:
 
 ```ini
 # At least one LLM key
 ANTHROPIC_API_KEY=sk-ant-...
 
-# CORS — REQUIRED in production (deny-by-default)
-CORS_ORIGIN=https://dashboard.example.com
+# CORS — REQUIRED in production (deny-by-default). The quick start wrote it at
+# the end of this file; the Domain + TLS step above appends your domain's.
+# CORS_ORIGIN=https://skrun.example.com
 
-# Webhook HMAC — REQUIRED for async-mode webhooks
-WEBHOOK_SIGNING_KEY=$(openssl rand -hex 32)
+# Webhook HMAC — REQUIRED for async-mode webhooks; without it, webhooks are
+# refused. The quick start generated it at the end of this file; to rotate it,
+# run the shell line below. A command written in this file is never run — its
+# text would become the key.
+# WEBHOOK_SIGNING_KEY=
 
 # Domain (Caddy uses this for the TLS cert)
 DOMAIN=skrun.example.com
 ```
 
-Postgres / MinIO / Redis credentials default to safe-for-dev values
-when unset — override them for production. Compose mounts each
-service's data to a named volume so restarts don't lose state.
+```bash
+echo "WEBHOOK_SIGNING_KEY=$(openssl rand -hex 32)" >> infra/.env
+```
+
+The quick start already wrote `CORS_ORIGIN` and `WEBHOOK_SIGNING_KEY` at the
+end of `infra/.env`, which is why the block above leaves them commented. To
+change one, change that line, or add one after it: when a name is set twice in
+the file, its last line wins, and an earlier one — such as the template's line,
+once uncommented — is ignored without a word. A line that sets the name to
+nothing (`WEBHOOK_SIGNING_KEY=`), added last, wins too: the API then reads it
+as unset.
+
+Compose reads `infra/.env` with its own syntax, not as plain text. Outside
+single quotes, `$name` and `${name}` are replaced by the value of the variable
+`name` (`abc$def` arrives as `abc` followed by the value of a variable named
+`def`, if one is set), and `$$` stands for one `$`. Outside quotes, a `#`
+preceded by a space, past the first character of the value, starts a comment:
+`NAME=abc #note` sets `abc`. A value that contains a `$` or a `#` goes between
+single quotes: `NAME='abc$def'`.
+
+Postgres and MinIO have no default credentials: the stack refuses to
+start without the three of step 2 of the quick start. Redis, reachable
+only on the compose network, has none. Compose mounts each service's
+data to a named volume so restarts don't lose state.
 
 ---
 
@@ -179,6 +224,10 @@ service's data to a named volume so restarts don't lose state.
 # Tail logs (per-service or all)
 docker compose -f infra/docker-compose.yml logs -f api
 docker compose -f infra/docker-compose.yml logs -f
+
+# Apply a change to infra/.env: recreates the services whose settings
+# changed. Never `restart` for this — it keeps the old values.
+docker compose -f infra/docker-compose.yml up -d
 
 # Restart one service (e.g. after a Caddyfile edit)
 docker compose -f infra/docker-compose.yml restart caddy
@@ -192,6 +241,13 @@ docker compose -f infra/docker-compose.yml down -v
 # Open a shell in the API container (for one-off DB queries etc.)
 docker compose -f infra/docker-compose.yml exec api sh
 ```
+
+Whenever Compose stops the API — `stop`, `down`, the recreate of an upgrade —
+it gives it 30 seconds before killing it, where Docker's default is 10: the
+API uses them to end its runs in flight (see
+[Stopping the server](./self-hosting.md#stopping-the-server)). The value is
+`stop_grace_period` on the `api` service of `infra/docker-compose.yml`; the
+minimal overlay inherits it.
 
 ---
 
@@ -210,7 +266,7 @@ docker compose -f infra/docker-compose.yml logs -f api
 
 The image tag defaults to `:latest` (the latest stable release). For the
 dev / pre-release line use `:edge` (the always-resolvable latest build); pin a
-concrete `:vX.Y.Z` in `.env` for stricter reproducibility:
+concrete `:vX.Y.Z` in `infra/.env` for stricter reproducibility:
 
 ```ini
 RUNTIME_IMAGE_TAG=v0.9.0

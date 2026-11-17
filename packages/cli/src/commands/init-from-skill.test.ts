@@ -10,6 +10,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseAgentYaml } from "@skrun-dev/schema";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const askTextMock = vi.fn();
@@ -82,5 +83,47 @@ Body.
       force: true,
     };
     expect(opts).not.toHaveProperty("namespace");
+  });
+});
+
+// The agent.yaml an imported skill gets declares nothing that no code honours:
+// no filesystem (retired), no secrets list (an empty one says nothing, and
+// invites a value that validation refuses).
+describe("initFromSkill — the agent.yaml it writes", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "skrun-init-from-skill-test-"));
+    writeFileSync(
+      join(dir, "SKILL.md"),
+      "---\nname: my-skill\ndescription: A test skill\n---\n\n# my-skill\n\nBody.\n",
+    );
+    askTextMock.mockReset();
+    askModelMock.mockReset();
+    // The input prompt, then the network prompt: no domain.
+    askTextMock.mockResolvedValueOnce("query:string");
+    askTextMock.mockResolvedValueOnce("");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("declares neither filesystem nor secrets, read as text and as YAML", async () => {
+    await initFromSkill(dir, {
+      model: "anthropic/claude-sonnet-4-20250514",
+      force: true,
+    });
+    const yaml = readFileSync(join(dir, "agent.yaml"), "utf-8");
+    const declared = yaml
+      .split(/\r?\n/)
+      .filter((line) => /^\s*(filesystem|secrets)\s*:/.test(line));
+    expect(declared).toEqual([]);
+    const environment = parseAgentYaml(yaml).config.environment;
+    expect(environment).not.toHaveProperty("filesystem");
+    expect(environment).not.toHaveProperty("secrets");
+    // Not vacuous: the block is there, with what the importer does write.
+    expect(environment.timeout).toBe("300s");
+    expect(yaml).toMatch(/^environment:$/m);
   });
 });

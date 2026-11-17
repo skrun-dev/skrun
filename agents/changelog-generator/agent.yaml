@@ -1,12 +1,12 @@
 name: changelog-generator
-version: 0.2.0
+version: 0.3.1
 
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
   fallback:
     provider: google
-    name: gemini-2.5-flash-lite
+    name: gemini-3.5-flash-lite
 
 tool_choice: write_artifact
 
@@ -76,10 +76,7 @@ outputs:
 environment:
   networking:
     allowed_hosts: []
-  filesystem: read-write
-  secrets: []
   timeout: 180s
-  sandbox: strict
 
 state:
   type: none

@@ -1,13 +1,17 @@
 name: pdf-processing
-version: 1.1.0
+version: 1.2.1
 
+# v1.2.0: Gemini 3.8 Flash, with Gemini 3.5 Flash-Lite as fallback.
 # v1.1.0: vision-native. Accepts a PDF directly via Skrun's multimodal-inputs.
 # The LLM reads the PDF with its native document capability — no upstream extraction tool needed.
 # v1.0.0 (text-mode + extract tool placeholder) is removed.
 
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
+  fallback:
+    provider: google
+    name: gemini-3.5-flash-lite
 
 inputs:
   - name: pdf
@@ -34,10 +38,7 @@ outputs:
 environment:
   networking:
     allowed_hosts: []
-  filesystem: read-only
-  secrets: []
   timeout: 120s
-  sandbox: strict
 
 state:
   type: none

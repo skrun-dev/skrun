@@ -2,12 +2,18 @@ import { createHash } from "node:crypto";
 import { createLogger } from "@skrun-dev/runtime";
 import type { Context, MiddlewareHandler } from "hono";
 import { getCookie, setCookie } from "hono/cookie";
-import { hashApiKey, isApiKeyFormat } from "../auth/api-key.js";
+import {
+  API_KEY_PREFIX,
+  hashApiKey,
+  isApiKeyFormat,
+  RETIRED_API_KEY_PREFIX,
+} from "../auth/api-key.js";
 import { isDevAuthEnabled } from "../auth/dev-auth.js";
 import { isOAuthConfigured } from "../auth/github-oauth.js";
 import { sessionCookieErasures, sessionCookieName, validateSession } from "../auth/session.js";
 import type { DbAdapter } from "../db/adapter.js";
 import type { UserContext } from "../types.js";
+import { errorFields } from "../utils/error-fields.js";
 
 const logger = createLogger("auth-middleware");
 const USER_CONTEXT_KEY = "user";
@@ -31,13 +37,28 @@ function countCookieOccurrences(rawHeader: string | null, name: string): number 
 }
 
 /**
+ * Whether `token` starts with `prefix`, ignoring letter case: a key typed or
+ * copied in another case is still a key, never a dev token.
+ */
+function startsWithPrefix(token: string, prefix: string): boolean {
+  return token.slice(0, prefix.length).toLowerCase() === prefix.toLowerCase();
+}
+
+/**
  * Create the auth middleware with DB access.
  *
  * Auth chain (checked in order):
- * 0. A session cookie sent more than once → no cookie auth at all (see below)
+ * 0. A `__Secure-` session cookie sent more than once → no cookie auth at all (see below)
  * 1. Session cookie → web auth (OAuth login)
- * 2. Bearer sk_live_* → API key (programmatic)
- * 3. Bearer dev-token → dev mode (only when OAuth is NOT configured)
+ * 2. Bearer starting with the key prefix (`API_KEY_PREFIX`), in any letter case
+ *    → API key (programmatic): a well-formed key (length, alphabet, checksum —
+ *    the prefix in its own case) is looked up by hash; a malformed one → 401
+ *    "Invalid API key" without a database read
+ * 2b. Bearer starting with the retired key prefix (`RETIRED_API_KEY_PREFIX`), in
+ *    any letter case → 401 "Invalid API key", without a database read, whatever
+ *    the mode
+ * 3. Any other bearer → dev token (only when SKRUN_DEV_AUTH is on and OAuth is
+ *    NOT configured). A key-shaped bearer never gets here: 2 and 2b answer first.
  * 4. Otherwise → 401
  */
 export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
@@ -64,11 +85,22 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
     // refused on every request — which is the outcome that matters. Reading the
     // erasure as the protection would be reading the courtesy as the lock.
     //
-    // Only when the name is prefixed, and that condition is load-bearing: without
-    // the prefix a duplicate is LEGITIMATE during the transition, since the old
-    // host-only cookie and the new domain-scoped one carry the same name. Under
-    // the prefix the two names differ by construction, so a duplicate can only
-    // have been planted.
+    // Only under `__Secure-`, and that condition is load-bearing: without a prefix
+    // a duplicate is LEGITIMATE during the transition, since the old host-only
+    // cookie and the new domain-scoped one carry the same name. Under the prefix
+    // the two names differ by construction, so a duplicate is planted — or left
+    // by a change of the configured domain between two valid parents of the host
+    // (the boot check accepts either), the one case this refusal cannot tell
+    // apart: the old-scope cookie cannot be erased from here, so cookie sign-in
+    // stays refused until it expires or the user clears it. Documented for
+    // operators next to the variable.
+    //
+    // `__Secure-` and not `__Host-`, on purpose. A browser identifies a cookie by
+    // name, host and path; `__Host-` fixes the host (no `Domain`) and the path
+    // (`/`), so a conforming browser holds at most one cookie of that name for
+    // this host and can never send it twice. A duplicate of it can only come from
+    // a client writing its own header, and there is no victim to protect there.
+    // Extending the check to it would add a guard no real scenario can trip.
     const cookieName = sessionCookieName();
     const duplicated =
       cookieName.startsWith("__Secure-") &&
@@ -98,14 +130,13 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
         // A database failure is NOT an absent session. Treating it as one would
         // log every signed-in user out in silence the day the sessions table is
         // missing — a fault whose only symptom is behaviour that looks correct.
-        // A bare throw is not enough either: this app registers no global error
-        // handler, so it would produce a 500 without the one line that tells
-        // "the store is down" apart from "nobody is signed in".
+        // A bare throw is not enough either: the app's error handler would log it
+        // as an unhandled error under this middleware's route pattern and answer
+        // a bare text 500 — neither says "the session store is down", which is
+        // what this event name and this JSON answer tell apart from "nobody is
+        // signed in".
         logger.error(
-          {
-            event: "session_lookup_failed",
-            error: err instanceof Error ? err.message : String(err),
-          },
+          { event: "session_lookup_failed", ...errorFields(err) },
           "Session lookup failed",
         );
         return c.json({ error: { code: "INTERNAL_ERROR", message: "Session lookup failed" } }, 500);
@@ -143,8 +174,13 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
         return c.json({ error: { code: "UNAUTHORIZED", message: "Empty token" } }, 401);
       }
 
-      // --- 2. API key (sk_live_*) ---
-      if (isApiKeyFormat(token)) {
+      // --- 2. API key: a bearer that starts with the key prefix, in any case ---
+      if (startsWithPrefix(token, API_KEY_PREFIX)) {
+        // Malformed (length, alphabet, checksum, the prefix in another case):
+        // no key can match, so no read.
+        if (!isApiKeyFormat(token)) {
+          return c.json({ error: { code: "UNAUTHORIZED", message: "Invalid API key" } }, 401);
+        }
         const keyHash = hashApiKey(token);
         const apiKey = await db.getApiKeyByHash(keyHash);
         if (!apiKey) {
@@ -167,10 +203,7 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
         // Update last_used_at (non-blocking)
         db.updateApiKeyLastUsed(apiKey.id).catch((err) =>
           logger.warn(
-            {
-              event: "last_used_update_failed",
-              error: err instanceof Error ? err.message : String(err),
-            },
+            { event: "last_used_update_failed", ...errorFields(err) },
             "Best-effort API-key last_used update failed (non-blocking)",
           ),
         );
@@ -197,6 +230,13 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
         };
         c.set(USER_CONTEXT_KEY, ctx);
         return next();
+      }
+
+      // --- 2b. A key of the retired format: refused like any invalid key, in
+      // both modes and any letter case, before the dev-token fallback could
+      // make it an account ---
+      if (startsWithPrefix(token, RETIRED_API_KEY_PREFIX)) {
+        return c.json({ error: { code: "UNAUTHORIZED", message: "Invalid API key" } }, 401);
       }
 
       // --- 3. Dev-token fallback (fail-secure: explicit opt-in via SKRUN_DEV_AUTH) ---
@@ -230,6 +270,9 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
           role: "admin",
           // dev-token = master credential (self-host operator).
           key: null,
+          // No users row behind the id: mark it, rather than let a reader guess
+          // from the id's shape.
+          ...(devUser ? {} : { syntheticAccount: true as const }),
         };
         c.set(USER_CONTEXT_KEY, ctx);
         return next();
@@ -240,7 +283,7 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
         {
           error: {
             code: "UNAUTHORIZED",
-            message: "Invalid authentication. Use an API key (sk_live_*) or sign in via OAuth.",
+            message: `Invalid authentication. Use an API key (${API_KEY_PREFIX}*) or sign in via OAuth.`,
           },
         },
         401,
@@ -254,7 +297,7 @@ export function createAuthMiddleware(db: DbAdapter): MiddlewareHandler {
         error: {
           code: "UNAUTHORIZED",
           message: oauthMode
-            ? "Authentication required. Sign in via OAuth or use an API key (sk_live_*)."
+            ? `Authentication required. Sign in via OAuth or use an API key (${API_KEY_PREFIX}*).`
             : "Missing or invalid Authorization header. Use: Bearer <token>",
           oauth: oauthMode,
         },

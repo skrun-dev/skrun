@@ -155,23 +155,36 @@ interface CardProps {
   children?: ReactNode;
   className?: string;
   pad?: boolean;
+  /**
+   * Makes the card a region named by its title: the title carries this id,
+   * and the card is a `<section>` labelled by it. Without it, or without a
+   * title to carry it, a `<div>`.
+   */
+  titleId?: string;
 }
 
-export function Card({ title, action, children, className = "", pad = true }: CardProps) {
+export function Card({ title, action, children, className = "", pad = true, titleId }: CardProps) {
+  // An id no title carries would label the card with nothing.
+  const labelledBy = title ? titleId : undefined;
+  const Root = labelledBy ? "section" : "div";
   return (
-    <div
+    <Root
+      aria-labelledby={labelledBy}
       className={`rounded-lg border border-gray-200 dark:border-gray-900 bg-white dark:bg-gray-950/40 ${className}`}
     >
       {(title || action) && (
         <div className="flex items-center justify-between px-4 h-10 border-b border-gray-100 dark:border-gray-900">
-          <h3 className="text-[12.5px] font-semibold text-gray-900 dark:text-gray-100 tracking-tight">
+          <h3
+            id={labelledBy}
+            className="text-[12.5px] font-semibold text-gray-900 dark:text-gray-100 tracking-tight"
+          >
             {title}
           </h3>
           {action}
         </div>
       )}
       {children && <div className={pad ? "p-4" : ""}>{children}</div>}
-    </div>
+    </Root>
   );
 }
 

@@ -16,7 +16,7 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { REGISTRY, ROOT, results, skrun, TOKEN, verifyLatestVersion } from "./_ctx.js";
+import { pushFixture, REGISTRY, ROOT, results, skrun, TOKEN, verifyLatestVersion } from "./_ctx.js";
 
 /**
  * Best-effort cleanup helper for a single version of `dev/<agentSlug>`. Calls
@@ -66,11 +66,7 @@ async function runForcedToolCallScenario(
   let totalCost = 0;
   try {
     skrun(["build"], agentDir);
-    try {
-      skrun(["push"], agentDir);
-    } catch {
-      // already pushed at this version — skip
-    }
+    await pushFixture(agentDir);
     await verifyLatestVersion("dev", agentSlug);
 
     const runs = 3;
@@ -181,11 +177,7 @@ export async function run(): Promise<void> {
     let cost = 0;
     try {
       skrun(["build"], dir);
-      try {
-        skrun(["push"], dir);
-      } catch {
-        // already pushed at this version
-      }
+      await pushFixture(dir);
       await verifyLatestVersion("dev", "email-drafter");
 
       const runRes = await fetch(`${REGISTRY}/api/agents/dev/email-drafter/run`, {

@@ -323,3 +323,112 @@ describe("GoogleProvider — cache usage extraction (#68)", () => {
     expect(response.usage.cacheReadTokens).toBe(1500);
   });
 });
+
+describe("GoogleProvider — thinking tokens count as output", () => {
+  beforeEach(() => {
+    mocks.generateContent.mockReset();
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // Gemini returns a thinking model's reasoning apart from the candidates:
+  // totalTokenCount = promptTokenCount + thoughtsTokenCount +
+  // candidatesTokenCount. Google bills the thinking at the output rate, so
+  // it belongs in completionTokens — and the four usage terms still add up to
+  // the total, nothing counted twice, nothing left out.
+  function answer(usageMetadata: Record<string, number>) {
+    mocks.generateContent.mockResolvedValueOnce({
+      response: { candidates: [{ content: { parts: [{ text: "ok" }] } }], usageMetadata },
+    });
+    return new GoogleProvider("test-key").call(makeRequest([{ kind: "text", text: "hi" }]));
+  }
+
+  function sum(usage: {
+    promptTokens: number;
+    completionTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  }) {
+    return (
+      usage.promptTokens +
+      usage.completionTokens +
+      (usage.cacheReadTokens ?? 0) +
+      (usage.cacheWriteTokens ?? 0)
+    );
+  }
+
+  it("adds the thinking tokens to the completion tokens", async () => {
+    const response = await answer({
+      promptTokenCount: 321,
+      candidatesTokenCount: 16,
+      thoughtsTokenCount: 259,
+      totalTokenCount: 596,
+    });
+
+    expect(response.usage).toEqual({ promptTokens: 321, completionTokens: 275 });
+    expect(sum(response.usage)).toBe(596);
+  });
+
+  it("with a cache hit too: the cached part is read apart, the thinking is output", async () => {
+    const response = await answer({
+      promptTokenCount: 8000,
+      cachedContentTokenCount: 4096,
+      candidatesTokenCount: 200,
+      thoughtsTokenCount: 300,
+      totalTokenCount: 8500,
+    });
+
+    expect(response.usage).toEqual({
+      promptTokens: 3904,
+      completionTokens: 500,
+      cacheReadTokens: 4096,
+    });
+    expect(sum(response.usage)).toBe(8500);
+  });
+
+  it("a model that returns no thinking count keeps the candidates alone", async () => {
+    const response = await answer({
+      promptTokenCount: 321,
+      candidatesTokenCount: 20,
+      totalTokenCount: 341,
+    });
+
+    expect(response.usage).toEqual({ promptTokens: 321, completionTokens: 20 });
+    expect(sum(response.usage)).toBe(341);
+  });
+});
+
+describe("GoogleProvider — the native turn", () => {
+  beforeEach(() => {
+    mocks.generateContent.mockReset();
+  });
+
+  it("returns the candidate's content, untouched, as its own turn", async () => {
+    const content = {
+      role: "model",
+      parts: [
+        { text: "witness reasoning", thought: true },
+        { text: "witness text" },
+        {
+          functionCall: { name: "lookup", args: { q: "x" } },
+          thoughtSignature: "witness-signature",
+        },
+      ],
+    };
+    mocks.generateContent.mockResolvedValueOnce({
+      response: {
+        candidates: [{ content, finishReason: "STOP" }],
+        usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 },
+      },
+    });
+    const provider = new GoogleProvider("test-key");
+
+    const response = await provider.call(makeRequest([{ kind: "text", text: "hi" }]));
+
+    expect(response.assistantTurn.provider).toBe("google");
+    expect(response.assistantTurn.content).toBe(content);
+    expect(response.toolCalls).toEqual([{ name: "lookup", args: { q: "x" } }]);
+  });
+});

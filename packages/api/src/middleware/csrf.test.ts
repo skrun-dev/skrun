@@ -63,7 +63,7 @@ describe("CSRF guard on cookie-authenticated mutations (#123)", () => {
     return { id: user.id, cookie: `${sessionCookieName()}=${sessionId}` };
   }
 
-  /** Mints a real `sk_live_*` through the API, in a shape the guard lets past. */
+  /** Mints a real API key through the API, in a shape the guard lets past. */
   async function mintKey(cookie: string): Promise<string> {
     const res = await app.request("/api/keys", {
       method: "POST",
@@ -183,6 +183,49 @@ describe("CSRF guard on cookie-authenticated mutations (#123)", () => {
     // The push itself fails on the bundle, which is not what is measured: what is
     // measured is that the refusal did not come from the guard.
     expect(await guardRefused(octet)).toBe(false);
+  });
+
+  // --- The one non-form type a browser sends without a preflight ------------
+
+  // The case above has one exception: Chromium's hyperlink auditing (`<a ping>`,
+  // sent by Chrome and Edge) is a credentialed POST with `Content-Type:
+  // text/ping` and the fixed body `PING`, with no preflight. hono's `csrf()`
+  // checked only the three form types until 4.13.16 (GHSA-46wx-v44x-9hh2), so a
+  // page on a sibling host could reach every cookie-authenticated POST that
+  // accepts the body `PING` and takes its parameters from the URL. Measured over
+  // every POST route, three did something: sign-out; a push, which stored `PING`
+  // as a version, under a number the page chose, that became the latest (the
+  // agent created if absent); and, where the operator sets an agents directory,
+  // the import of one of its agents.
+  it("a text/ping POST from a sibling host is refused, and the session survives it", async () => {
+    // A session's namespace is its account's username.
+    const namespace = "ping-victim";
+    const { cookie } = await signIn(namespace);
+    // Sign-out goes last: let through first, it would end the session, and the
+    // push after it would answer 401 whatever the guard did — the agent check
+    // below would then prove nothing.
+    for (const path of [
+      `/api/agents/${namespace}/demo/push?version=9.9.9`,
+      "/api/agents/scan/demo/push",
+      "/auth/logout",
+    ]) {
+      const res = await app.request(path, {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          "Content-Type": "text/ping",
+          Origin: "https://sibling.example",
+          "Sec-Fetch-Site": "same-site",
+        },
+        body: "PING",
+      });
+      expect(res.status, path).toBe(403);
+      expect(await res.text(), path).toBe("Forbidden");
+    }
+
+    expect(await db.getAgent(namespace, "demo")).toBeNull();
+    const me = await app.request("/api/me", { headers: { Cookie: cookie } });
+    expect(me.status).toBe(200);
   });
 
   // --- VT-18 — the guard does not arm without a cookie -----------------------

@@ -1,0 +1,28 @@
+-- Migration 020: the date a run's content was cleared
+-- Version: 020
+-- Created: 2026-10-08
+--
+-- When an account is deleted, the runs it started — and the runs others made
+-- of its agents — survive, emptied: their input, output, error and file list
+-- are cleared, and they are detached from the account. A run still going at
+-- that moment finishes afterwards, and its completion would write its output
+-- back into the emptied row.
+--
+--   * content_cleared_at — set when the account the run belonged to is
+--     deleted, in the same transaction that empties the row. A completion that
+--     arrives afterwards writes no content: the update that records it tests
+--     this column in the same statement, so it never reads the mark apart from
+--     the write. Its status, usage and timings are still recorded.
+--
+-- Operator-only bookkeeping, never part of the run API response. Nullable, no
+-- default, no index: a run that predates this migration was never cleared, and
+-- no query selects runs by this column.
+--
+-- Mirrored in sqlite.ts: the column in the SCHEMA const (fresh installs) and in
+-- migrate() after the foreign-key rebuild (existing databases). And in the
+-- Memory adapter. This .sql file is the Postgres path.
+--
+-- Idempotent (ADD COLUMN IF NOT EXISTS) — passes the migrations-runner lint
+-- (no top-level BEGIN/COMMIT; the runner wraps the file in its own
+-- transaction).
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS content_cleared_at timestamptz;

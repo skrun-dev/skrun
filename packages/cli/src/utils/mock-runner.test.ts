@@ -20,10 +20,8 @@ const baseConfig: AgentConfig = {
   ],
   environment: {
     networking: { allowed_hosts: [] },
-    filesystem: "read-only",
     secrets: [],
     timeout: "300s",
-    sandbox: "strict",
   },
   context_mode: "skill",
   state: { type: "kv", ttl: "30d" },
@@ -74,5 +72,59 @@ describe("mockRun", () => {
     expect(result.output.b).toBe(true);
     expect(result.output.o).toEqual({});
     expect(result.output.a).toEqual([]);
+  });
+});
+
+describe("mockRun — a required input missing as the API judges it, and no type checked", () => {
+  /** The base agent, its inputs replaced by these. */
+  function withInputs(inputs: unknown[]): AgentConfig {
+    return { ...baseConfig, inputs: inputs as AgentConfig["inputs"] };
+  }
+  const doc = { name: "doc", type: "file", media: "document", max_count: 1, required: true };
+
+  it.each([
+    ["toString", "the empty object", {}],
+    ["constructor", "the empty object", {}],
+    ["toString", "an object of other fields", { other: "x" }],
+  ])("throws for a required input named %s that %s does not carry as a field of its own", (name, _label, input) => {
+    const config = withInputs([{ name, type: "string", required: true }]);
+    expect(() => mockRun(config, input)).toThrow(ValidationError);
+    expect(() => mockRun(config, input)).toThrow(`Missing required input: ${name}`);
+  });
+
+  it("runs a required input named toString carried as a field of its own", () => {
+    const config = withInputs([{ name: "toString", type: "string", required: true }]);
+    expect(mockRun(config, { toString: "x" }).status).toBe("completed");
+  });
+
+  it.each([
+    ["a required file input sent as null", [doc], { doc: null }, "doc"],
+    ["a required file input sent as an empty list", [doc], { doc: [] }, "doc"],
+    [
+      "a required string input sent as null",
+      [{ name: "query", type: "string", required: true }],
+      { query: null },
+      "query",
+    ],
+  ])("throws for %s, in the API's words", (_label, inputs, input, name) => {
+    const config = withInputs(inputs);
+    expect(() => mockRun(config, input)).toThrow(ValidationError);
+    expect(() => mockRun(config, input)).toThrow(`Missing required input: ${name}`);
+  });
+
+  it.each([
+    [
+      "a required string input sent as 5",
+      [{ name: "query", type: "string", required: true }],
+      { query: 5 },
+    ],
+    ["a required file input sent as anything present", [doc], { doc: 5 }],
+    [
+      "an optional string input sent as null",
+      [{ name: "query", type: "string", required: false }],
+      { query: null },
+    ],
+  ])("runs %s: no type is checked", (_label, inputs, input) => {
+    expect(mockRun(withInputs(inputs), input).status).toBe("completed");
   });
 });

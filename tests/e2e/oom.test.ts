@@ -50,11 +50,9 @@ function makeRequest(): RunRequest {
       mcp_servers: [],
       environment: {
         networking: { allowed_hosts: [] },
-        filesystem: "read-write",
         secrets: [],
         timeout: "30s",
         max_cost: 1.0,
-        sandbox: "strict",
       },
       state: { type: "none" },
       context_mode: "skill",

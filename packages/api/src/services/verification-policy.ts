@@ -11,7 +11,11 @@
  *   owner              — the agent owner is the trust authority for their own
  *                        agents: they (or an admin) may verify, and a private
  *                        agent runs without a verification gate (owner
- *                        authority + sandbox isolation + reactive abuse).
+ *                        authority + reactive abuse, and — on the flyio
+ *                        runtime only — a sandbox machine per run; on the
+ *                        local runtime, scripts run as child processes of
+ *                        this server, on its host, with an advisory egress
+ *                        list).
  *   disabled           — no run is gated on verification; the flag is inert
  *                        metadata (owner or admin may still set it).
  *
@@ -26,6 +30,7 @@
 
 import type { Agent } from "../db/schema.js";
 import type { UserContext } from "../types.js";
+import { isInstanceAdmin } from "./key-scope.js";
 
 export const VERIFICATION_POLICIES = ["admin", "owner", "disabled"] as const;
 export type VerificationPolicy = (typeof VERIFICATION_POLICIES)[number];
@@ -60,18 +65,20 @@ export function isRunGatedByVerification(policy: VerificationPolicy, verified: b
 }
 
 /**
- * Whether `user` may set the `verified` flag on `agent`'s versions. An instance
- * admin always may. Under `owner`/`disabled` the agent owner may attest their
- * own agents; under `admin` only the admin may. Ownership is resource-based
- * (`agent.owner_id === user.id`) — not a namespace string match — so it
- * generalises to org namespaces later.
+ * Whether `user` may set the `verified` flag on `agent`'s versions. The
+ * instance administrator — the admin role on a master credential
+ * (`isInstanceAdmin`) — always may. Under `owner`/`disabled` the agent owner
+ * may attest their own agents; under `admin` only the instance administrator
+ * may. An administrator's reduced or delegated key is held to the policy like
+ * any other key. Ownership is resource-based (`agent.owner_id === user.id`) —
+ * not a namespace string match — so it generalises to org namespaces later.
  */
 export function canSetVerified(
   policy: VerificationPolicy,
-  user: Pick<UserContext, "id" | "role">,
+  user: Pick<UserContext, "id" | "role" | "key">,
   agent: Pick<Agent, "owner_id">,
 ): boolean {
-  if (user.role === "admin") {
+  if (isInstanceAdmin(user)) {
     return true;
   }
   if (policy === "admin") {
@@ -82,10 +89,11 @@ export function canSetVerified(
 
 /**
  * The attestation kind recorded on the verify log, for forensic abuse tracing.
- * Tie-break: when the actor is both an admin and the owner, **`admin` wins**.
- * A non-admin can only reach the log as the owner (gated by `canSetVerified`),
+ * Tie-break: when the actor is both the instance administrator and the owner,
+ * **`admin` wins**. Anyone else can only reach the log as the owner (gated by
+ * `canSetVerified`) — an administrator's reduced or delegated key included —,
  * hence `owner_self`.
  */
-export function verificationKind(user: Pick<UserContext, "role">): "admin" | "owner_self" {
-  return user.role === "admin" ? "admin" : "owner_self";
+export function verificationKind(user: Pick<UserContext, "role" | "key">): "admin" | "owner_self" {
+  return isInstanceAdmin(user) ? "admin" : "owner_self";
 }

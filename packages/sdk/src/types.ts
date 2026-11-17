@@ -5,7 +5,12 @@ export interface SkrunClientOptions {
   baseUrl: string;
   /** Bearer token for authentication */
   token: string;
-  /** Default timeout in milliseconds (default: 60000) */
+  /**
+   * Default timeout in milliseconds (default: 60000). For `run()` and
+   * `stream()`, the longest silence allowed — the wait for the answer, then the
+   * gap between two chunks of the event stream; for every other call, the whole
+   * request.
+   */
   timeout?: number;
 }
 
@@ -43,14 +48,17 @@ export interface SdkUploadedFileInfo {
   expires_at: string;
 }
 
-/** Partial environment override — all fields optional, shallow-merged on agent.yaml defaults. */
+/**
+ * Partial environment override — all fields optional, shallow-merged on
+ * agent.yaml defaults. Three fields of agent.yaml's environment are not part of
+ * it. `sandbox` and `filesystem` were retired: they never had an effect, and
+ * the server refuses an override that carries either (400 `RETIRED_FIELD`).
+ * `secrets` is not yet supported: no secret is injected into a run.
+ */
 export interface EnvironmentOverride {
   networking?: { allowed_hosts?: string[] };
-  filesystem?: "none" | "read-only" | "read-write";
-  secrets?: string[];
   timeout?: string;
   max_cost?: number;
-  sandbox?: "strict" | "permissive";
 }
 
 export interface RunOptions {
@@ -63,12 +71,22 @@ export interface RunOptions {
    * Only needed when you send `llmKeys` to an agent you do not own: such an
    * agent may declare its own `model.base_url`, and the server refuses to send
    * your key to an endpoint you did not choose (403
-   * `CALLER_BASE_URL_NOT_CONSENTED`). Declare the origin your key belongs to and
-   * the run proceeds; the refusal names the agent's origin so you can decide.
+   * `CALLER_BASE_URL_NOT_CONSENTED`). Only your key for the provider of the
+   * agent's primary model is sent there — a fallback model is always called at
+   * its own provider's endpoint — so a key for a fallback on another provider
+   * needs no entry here. Every entry you do give, with `llmKeys` or without,
+   * must be where that provider's key goes for the agent: its origin for the
+   * provider of its primary model when it declares a `model.base_url`, and none
+   * for any other provider, or on an agent that declares none — anything else
+   * is refused the same way. Declare the origin your key belongs to and the
+   * run proceeds; the refusal names the agent's origin so you can decide.
    * Compared by origin — the path need not match.
    */
   llmBaseUrls?: Record<string, string>;
-  /** Request timeout in milliseconds (overrides client default) */
+  /**
+   * Timeout in milliseconds, overriding the client's. For `run()` and
+   * `stream()`, the longest silence allowed; for `runAsync()`, the whole request.
+   */
   timeout?: number;
   /** Pin a specific agent version (strict semver, e.g. "1.2.0"). Omit to target latest. */
   version?: string;
@@ -84,6 +102,28 @@ export interface SdkFileInfo {
   /** Unified-namespace file_id (`fil_<32 hex>`) for `GET /api/files/:id/content`. */
   file_id?: string;
 }
+
+/**
+ * Why one of a run's output files is not among its `files`, in the order a file
+ * is judged: its name is not a plain relative path (`name_refused`), it is past
+ * the size limit (`too_large`), the count limit is already reached
+ * (`over_count`); on the cloud runtime only, it could not be read from the
+ * run's machine (`pull_failed`), or the upload of the run's files ran out of
+ * time before it was stored (`upload_budget`). One reason per file.
+ */
+export type SdkFileExclusionReason =
+  | "name_refused"
+  | "too_large"
+  | "over_count"
+  | "pull_failed"
+  | "upload_budget";
+
+/**
+ * How many of a run's output files were left out, by reason — counts only,
+ * never a file name. A reason that left no file out is omitted: `{}` when every
+ * file was kept.
+ */
+export type SdkFilesExcluded = Partial<Record<SdkFileExclusionReason, number>>;
 
 // --- API response types (snake_case to match JSON) ---
 
@@ -115,6 +155,11 @@ export interface SdkRunResult {
   };
   /** Files produced by the agent during execution. */
   files?: SdkFileInfo[];
+  /**
+   * How many of the run's output files are not in `files`, by reason; `{}` when
+   * none was left out, and on a failed run. Always present.
+   */
+  files_excluded: SdkFilesExcluded;
   warnings?: string[];
   cost: {
     /** Total cost (USD) for this run, computed from per-token rates. */
@@ -197,6 +242,57 @@ export interface ListOptions {
   limit?: number;
 }
 
+/**
+ * What the caller's account consumes now, against the quotas its plan gives
+ * it on the server (`GET /api/usage`, read with a full-access credential).
+ */
+export interface UsageResponse {
+  /**
+   * The plan whose quotas apply: `free` for an account without one, for a plan
+   * the server's settings do not name, and for the dev token.
+   */
+  plan: string;
+  /**
+   * `null` when the server sets no quota. `concurrent_runs` and `compute` are
+   * each `null` when the server leaves their bound unset; `fast_runs` only
+   * while no pre-warm pool runs.
+   */
+  quotas: {
+    /** The account's runs in progress. */
+    concurrent_runs: { limit: number; in_use: number } | null;
+    /** The account's compute time in the current window. */
+    compute: {
+      limit_seconds: number;
+      /** Whole seconds, rounded down. Can exceed the limit: a run is checked only when admitted. */
+      used_seconds: number;
+      /** The current window, fixed and aligned on UTC (ISO 8601): start included, end excluded. */
+      window: { start: string; end: string };
+    } | null;
+    /**
+     * The account's runs of the rolling hour that keep the right to a ready
+     * machine of the server's pre-warm pool — a run for which no pooled
+     * machine was taken gives it back once its machine is ready. `null` while
+     * no such pool runs. A run past them is never refused: it starts on a new
+     * machine, about a minute slower.
+     */
+    fast_runs: {
+      /** Per rolling hour; `null` when the server sets no such bound; `0` for a plan that includes none. */
+      limit: number | null;
+      /** Left now, never below 0; `null` when the server sets no such bound. */
+      remaining: number | null;
+      /**
+       * When the next right comes back (ISO 8601): the creation of the oldest
+       * run of the hour that keeps the right, plus one hour — or, for an
+       * account that holds more of them than its `limit` (its plan or the
+       * bound lowered since), the creation of the run whose leaving brings it
+       * back under the `limit`, plus one hour. `null` when no run of the hour
+       * keeps it, when the bound is unset, and for a plan that includes none.
+       */
+      resets_at: string | null;
+    } | null;
+  } | null;
+}
+
 // --- SSE event types (re-defined for standalone package, no workspace deps) ---
 
 interface BaseRunEvent {
@@ -265,7 +361,13 @@ export interface RunCompleteEvent extends BaseRunEvent {
     saved?: number;
   };
   duration_ms: number;
-  files?: SdkFileInfo[];
+  /** The run's output files, each with its download `url` — empty when there are none. */
+  files: SdkFileInfo[];
+  /**
+   * How many of the run's output files are not in `files`, by reason; `{}` when
+   * none was left out. Mirror of `SdkRunResult.files_excluded`.
+   */
+  files_excluded: SdkFilesExcluded;
 }
 
 /**
@@ -281,6 +383,26 @@ export interface OutputValidationWarningEvent extends BaseRunEvent {
 }
 
 /**
+ * Periodic keep-alive emitted every ~30 s while the harness is blocked on a
+ * slow wait, so that an idle stream is not closed by a proxy. Carries nothing
+ * but what the harness is waiting on. Mirrors `runtime.RunHeartbeatEvent`.
+ *
+ * Known `stage` values:
+ *  - `"acquiring_runner"` — the cloud runtime waking or creating the run's
+ *    machine, until `runner_spawned`
+ *  - `"waiting_llm"` — awaiting an LLM provider response
+ *  - `"waiting_tool"` — awaiting a tool's result (script or MCP)
+ *  - `"uploading_outputs"` — the cloud runtime uploading the run's output files
+ *
+ * A consumer should tolerate a `stage` value it does not know, as it
+ * tolerates an event type it does not know.
+ */
+export interface RunHeartbeatEvent extends BaseRunEvent {
+  type: "run_heartbeat";
+  stage: "acquiring_runner" | "waiting_llm" | "waiting_tool" | "uploading_outputs";
+}
+
+/**
  * Terminus event for an unrecoverable run failure.
  *
  * Known `error.code` values:
@@ -288,6 +410,13 @@ export interface OutputValidationWarningEvent extends BaseRunEvent {
  *    declared `outputs` schema and the auto-repair retry also failed.
  *  - `COST_EXCEEDED` — the run's aggregate estimated cost exceeded the agent's
  *    declared `environment.max_cost`; the run is aborted before completing.
+ *  - `SERVER_STOPPED` — the run did not finish because the server stopped
+ *    while it was in progress; running it again makes sense, though its tools
+ *    may already have run.
+ *  - `TOO_MANY_TOOL_CALLS` — one answer of the model asked for more than 128 tool calls; none ran.
+ *  - `MODEL_RESPONSE_TOO_LARGE` — a response of the agent's `model.base_url` was over 4 MiB.
+ *  - `MODEL_OUTPUT_BUDGET_EXCEEDED` — the model's answers in the run weighed over 4 MiB in all.
+ *  - `OUTPUT_TOO_LARGE` — the JSON object of the final answer was over 1 MiB; it was not parsed.
  *  - any provider/runtime-specific code.
  */
 export interface RunErrorEvent extends BaseRunEvent {
@@ -296,7 +425,8 @@ export interface RunErrorEvent extends BaseRunEvent {
 }
 
 /**
- * Per-phase cold-start timing for a cloud runner spawn, in milliseconds.
+ * Per-phase cold-start timing for a cloud runner spawn — durations in
+ * milliseconds — and the pre-warm pool's indicators, a count among them.
  * Mirrors `runtime.SpawnPhases`. Only `create_api_ms` is always present; the
  * derived and in-VM fields are optional (an older runner image may not report
  * them, so consumers must treat them as possibly-absent).
@@ -309,10 +439,22 @@ export interface SpawnPhases {
    */
   create_api_ms: number;
   /**
-   * Set when the run was served by a pre-created machine. Absent means no pool is
-   * configured; `false` means one is configured and this run missed it.
+   * `true` when the run was served by a pre-created machine. Never `false`: every
+   * other run omits it — no pool configured, a pool that missed, or a run with no
+   * right to one under the account's fast runs.
    */
   pool_hit?: boolean;
+  /**
+   * How many pooled machines were taken for the run and then discarded on a
+   * failed handoff, before it had its machine — a pooled machine counts as
+   * taken once the run's handoff begins: its URLs signed for it, then its
+   * credential and allowed hosts handed over, then its `/init`. One that
+   * would not wake or answer its health check is not counted. `1` or absent:
+   * a run hands its agent to one pooled machine at most, and one whose handoff
+   * failed then starts on a machine of its own — so it never comes with
+   * `pool_hit`. Never `0`: absent when there is none.
+   */
+  pool_handoffs_failed?: number;
   pool_resume_ms?: number;
   pool_claim_ms?: number;
   /**
@@ -330,6 +472,11 @@ export interface SpawnPhases {
   module_load_ms?: number;
   init_bundle_ms?: number;
   init_extract_ms?: number;
+  /**
+   * Installing the dependencies the agent's scripts declare, inside the runner.
+   * Absent when the runner predates that install.
+   */
+  init_deps_ms?: number;
   init_mcp_ms?: number;
 }
 
@@ -337,7 +484,8 @@ export interface SpawnPhases {
  * Informational event carrying the cloud runner's per-phase cold-start
  * breakdown, emitted once after the runner is ready (fills the gap between
  * `run_start` and the first work event). Mirrors `runtime.RunnerSpawnedEvent`.
- * Durations only — no machine id / private IP.
+ * Its phases only — durations and the pool's indicators —, never the machine
+ * id or private IP.
  */
 export interface RunnerSpawnedEvent extends BaseRunEvent {
   type: "runner_spawned";
@@ -351,6 +499,7 @@ export type RunEvent =
   | ToolCallErrorEvent
   | LlmCompleteEvent
   | OutputValidationWarningEvent
+  | RunHeartbeatEvent
   | RunnerSpawnedEvent
   | RunCompleteEvent
   | RunErrorEvent;

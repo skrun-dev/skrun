@@ -4,7 +4,7 @@
 -- Applies to: Supabase (Postgres ≥ 11). SQLite handled separately by SqliteDb.migrate() in sqlite.ts.
 -- Fresh installs get these via patched 001_initial_schema.sql (TODO post-merge).
 --
--- Persists the cache hit/miss data emitted by POST /run (#68 prompt-caching).
+-- Persists the prompt-cache hit/miss data emitted by POST /run.
 -- usage_cache_savings_usd is a write-time snapshot computed from cost.ts rates,
 -- aligned with the existing usage_estimated_cost numeric(10,6) pattern. Sub-cent
 -- precision preserved at the row level so SUM aggregates remain accurate on

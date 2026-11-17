@@ -7,11 +7,11 @@
 # Postgres / MinIO / Redis in favor of the SQLite + LocalStorage defaults
 # the API already supports.
 #
-# Quickstart:
-#   cp ../.env.example .env
-#   # fill at least ANTHROPIC_API_KEY (or another LLM key)
-#   docker compose -f infra/docker-compose.yml up -d
-#   curl http://localhost/health
+# Quick start: docs/self-hosting-docker.md#quick-start
+#
+# Settings: infra/.env, next to this file, read whatever folder Compose runs
+# from. It is handed whole to the api service, except the names this file
+# fixes in that service's `environment:`, which win over it.
 #
 # Hardening (matches the cloud-runtime sandbox controls):
 #   - `read_only: true` rootfs (tmpfs over the writeable directories)
@@ -36,16 +36,30 @@ services:
     # ⚠️ Here the variable holds the TAG ALONE (`edge`, `latest`, `v0.9.0`) — it is
     # interpolated after the colon below. The api-server reads a variable of the SAME
     # NAME as a FULL image reference (`ghcr.io/skrun-dev/skrun-runtime:edge`) when
-    # SKRUN_RUNTIME=flyio. Copying that form into this stack's .env produces
+    # SKRUN_RUNTIME=flyio. Copying that form into infra/.env produces
     # `ghcr.io/skrun-dev/skrun-runtime:ghcr.io/...` and `docker compose up` fails on
-    # an invalid reference. The compose stack defaults to SKRUN_RUNTIME=local, where
-    # the api-server never reads the variable at all.
+    # an invalid reference. This stack fixes SKRUN_RUNTIME=local and hands the api
+    # an empty RUNTIME_IMAGE_TAG (below): the api-server never reads it here.
     #
     # The cloud's slim `runner` target is a separate, cloud-only artifact
     # (served from a co-located registry) — self-host is unaffected. See the runner
     # image tag policy in docs/self-hosting.md.
     image: ghcr.io/skrun-dev/skrun-runtime:${RUNTIME_IMAGE_TAG:-latest}
     container_name: skrun-api
+    # `docker compose stop` (or `down`) sends SIGTERM, then kills after this
+    # long. The api uses it to end its runs in flight: their rows written
+    # within a few seconds, then up to 20 s for the runs to settle. Docker's
+    # default, 10 s, would cut that wait short. Set here once:
+    # docker-compose.minimal.yml layers on this file and inherits it.
+    stop_grace_period: 30s
+    # What the operator decides lives in infra/.env, handed whole to the api — for
+    # example the LLM keys, CORS_ORIGIN, the webhook signing key, GitHub sign-in,
+    # or SKRUN_DASHBOARD=off for an API-only server. Optional, so the minimal
+    # overlay still renders with no file at all. The keys of `environment:` below
+    # win over it: they are what this stack decides itself.
+    env_file:
+      - path: .env
+        required: false
     environment:
       SKRUN_CONTAINER_MODE: api-server
       NODE_ENV: production
@@ -55,19 +69,19 @@ services:
       # overwrites X-Forwarded-For with the address it saw. Trusting the header
       # is therefore always correct here — deliberately not made configurable.
       SKRUN_TRUST_PROXY: "1"
-      # LLM keys — operator brings their own .env.
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
-      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-      # Webhook signing (REQUIRED for async-mode webhooks).
-      WEBHOOK_SIGNING_KEY: ${WEBHOOK_SIGNING_KEY:-}
-      # CORS allowed origins — REQUIRED in production. Set to your domain.
-      CORS_ORIGIN: ${CORS_ORIGIN:-}
-      # Operator dashboard — served at /dashboard by default. Uncomment for a
-      # headless, API-only server.
-      # SKRUN_DASHBOARD: "off"
+      # For the same reason, no other client-address header is named: one that
+      # Caddy does not overwrite would let each caller choose its own rate-limit
+      # key. Empty reads as unset.
+      SKRUN_TRUST_PROXY_HEADER: ""
+      # Runs execute inside this container. The cloud runtime needs machines and
+      # a full image reference this stack does not provide.
+      SKRUN_RUNTIME: local
+      # Here RUNTIME_IMAGE_TAG only picks the image's tag (above); the api reads a
+      # variable of that name, as a full reference, in the cloud runtime only.
+      RUNTIME_IMAGE_TAG: ""
+      # The template enables an agents directory for the bare-metal install; the
+      # container has none. Empty reads as unset: no directory to import agents from.
+      SKRUN_AGENTS_DIR: ""
       # Postgres
       DATABASE_URL: postgres://skrun:${POSTGRES_PASSWORD}@postgres:5432/skrun
       # S3 / MinIO
@@ -135,7 +149,7 @@ services:
         [ -n "$$S3_SECRET_ACCESS_KEY" ] || missing="$$missing S3_SECRET_ACCESS_KEY"
         if [ -n "$$missing" ]; then
           echo "FATAL: the Skrun stack has no default credentials. Missing:$$missing" >&2
-          echo "Set them in .env (see .env.example). Generate with: openssl rand -hex 16" >&2
+          echo "Set them in infra/.env (see .env.example). Generate with: openssl rand -hex 16" >&2
           echo "The minimal overlay (docker-compose.minimal.yml) needs none of them." >&2
           exit 1
         fi

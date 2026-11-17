@@ -1,0 +1,45 @@
+name: tool-result-cut
+version: 1.0.0
+
+# E2E test fixture. Its only tool returns about 1.5 MiB of plain text — more
+# than a tool's result is cut to — so the run shows the cut in its tool_result
+# event. Used by tests/e2e/live/32-tool-result-cut.ts. Not a demo. Not meant to
+# be discovered by users.
+
+model:
+  provider: google
+  name: gemini-3.8-flash
+
+tool_choice: big_result
+
+tools:
+  - name: big_result
+    description: Test fixture tool. Returns about 1.5 MiB of plain text, which reaches the model cut.
+    input_schema:
+      type: object
+      properties: {}
+      additionalProperties: false
+
+inputs:
+  - name: dummy
+    type: string
+    required: false
+    default: ""
+    description: Unused. Present because the runtime expects at least one input field.
+
+outputs:
+  - name: result
+    type: string
+    description: Free-form message from the LLM after the tool answered.
+
+environment:
+  networking:
+    allowed_hosts: []
+  secrets: []
+  timeout: 120s
+  max_cost: 1.0
+
+state:
+  type: none
+
+context_mode: skill

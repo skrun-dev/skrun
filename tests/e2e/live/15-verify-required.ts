@@ -17,7 +17,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REGISTRY, results, skrun, TOKEN } from "./_ctx.js";
+import { pushFixture, REGISTRY, results, skrun, TOKEN } from "./_ctx.js";
 
 const NS = "dev";
 const AGENT = "verify-required-live";
@@ -58,7 +58,7 @@ async function deleteAgent(): Promise<void> {
  * `skrun build` + `skrun push` to publish a version. Reused for each
  * version we need in the phase.
  */
-function buildAndPush(version: string): string {
+async function buildAndPush(version: string): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), `skrun-live-15-${version}-`));
   writeFileSync(
     join(dir, "SKILL.md"),
@@ -82,7 +82,7 @@ Minimal agent for phase 15 live tests. Echo "ok" if you read this.
 version: ${version}
 model:
   provider: google
-  name: gemini-2.5-flash
+  name: gemini-3.8-flash
 inputs:
   - name: task
     type: string
@@ -93,11 +93,7 @@ outputs:
 `,
   );
   skrun(["build"], dir);
-  try {
-    skrun(["push"], dir);
-  } catch {
-    // 409 if the version was already pushed in a prior run — proceed.
-  }
+  await pushFixture(dir);
   return dir;
 }
 
@@ -111,7 +107,7 @@ export async function run(): Promise<void> {
     // ── IT-1: push → run 403 → verify → run not-403 ─────────────────────
     const v1 = V1;
     console.log(`Testing IT-1: push ${v1} → run 403 → verify → run not-403...`);
-    dirs.push(buildAndPush(v1));
+    dirs.push(await buildAndPush(v1));
     {
       const blocked = await runAgent({ version: v1 });
       const blockedBody = (await blocked.json()) as { error?: { code?: string } };
@@ -159,7 +155,7 @@ export async function run(): Promise<void> {
     // ── IT-2: pinned callers protected when newer version is pushed ─────
     const v2 = V2;
     console.log(`Testing IT-2: push ${v2} over verified ${v1} → pinned callers safe...`);
-    dirs.push(buildAndPush(v2));
+    dirs.push(await buildAndPush(v2));
     {
       // v1 was verified above; check it's STILL verified (not reset by v2 push).
       const meta = await fetch(`${REGISTRY}/api/agents/${NS}/${AGENT}/versions`, {
@@ -196,7 +192,7 @@ export async function run(): Promise<void> {
     // ── IT-3: PATCH endpoint round-trip (log shape covered in unit test) ─
     const v3 = V3;
     console.log(`Testing IT-3: PATCH ${v3} → 200 round-trip...`);
-    dirs.push(buildAndPush(v3));
+    dirs.push(await buildAndPush(v3));
     {
       const res = await verifyVersion(v3, true);
       const body = (await res.json()) as Record<string, unknown>;

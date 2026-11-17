@@ -1,4 +1,10 @@
-import type { CreateMachineRequest, MachineGuest } from "./fly-api.js";
+import {
+  type CreateMachineRequest,
+  type MachineGuest,
+  POOL_LABEL_KEY,
+  RUN_LABEL_KEY,
+} from "./fly-api.js";
+import { RUNNER_LIFETIME_ENV } from "./machine-lifetime.js";
 
 // Default VM resource spec for runner machines. 1024MB is the smallest
 // memory tier that boots our multi-runtime image reliably — Fly's
@@ -15,16 +21,17 @@ const DEFAULT_RUNNER_GUEST: MachineGuest = {
 // sandbox MUST have ZERO credentials (no LLM keys, no DB URL, no Skrun API
 // token, no webhook secret) — the LLM loop runs in the harness, never in
 // the sandbox. Only infrastructure parameters needed by the runner to do
-// its job: download bundle, upload outputs, enforce egress, listen on a
-// port, and time out.
+// its job: enforce egress, listen on a port, and time out. No URL of a run:
+// the bundle's and the outputs' URLs travel in the body of /init, signed once
+// the machine answers, never in its environment.
 const RUNNER_ENV_ALLOWLIST = new Set([
   "SKRUN_CONTAINER_MODE",
-  "BUNDLE_URL",
-  "OUTPUTS_PUT_URL",
   "SKRUN_ALLOWED_HOSTS",
   "SKRUN_DNS_RESOLVE_INTERVAL",
   "RUNNER_PORT",
-  "MAX_RUN_TIMEOUT_MS",
+  // The machine's lifetime, in whole seconds (RUNNER_LIFETIME_ENV): what ends a
+  // machine nobody destroyed. A duration, not a credential.
+  "RUNNER_LIFETIME_S",
   // Per-run RPC bearer token — the ONE credential the sandbox legitimately
   // receives, so it can authenticate the inbound api→runner RPC. Exempt from
   // the forbidden-substring guard below (see FORBIDDEN_EXCEPTIONS).
@@ -87,12 +94,15 @@ const FORBIDDEN_EXCEPTIONS = new Set(["RUNNER_RPC_TOKEN", "RUNNER_CLAIM_TOKEN"])
 export interface BuildMachineConfigInput {
   runId: string;
   image: string;
-  bundleUrl: string;
-  outputsPutUrl: string;
   allowedHosts: string[];
   region?: string;
   runnerPort?: number;
-  maxRunTimeoutMs?: number;
+  /**
+   * How long the machine may live, in whole seconds — written into its
+   * environment as `RUNNER_LIFETIME_S` (see `machine-lifetime.ts`). Absent, the
+   * machine carries none.
+   */
+  lifetimeSeconds?: number;
   dnsResolveIntervalSeconds?: number;
   /**
    * VM resource spec. Defaults to {@link DEFAULT_RUNNER_GUEST} (shared
@@ -110,7 +120,7 @@ export interface BuildMachineConfigInput {
   /**
    * Harness-controlled infrastructure hosts the runner must reach even though
    * they are not in the agent's `allowed_hosts`: the object-storage endpoint
-   * (bundle download + outputs upload) and the install-time package registries.
+   * (the bundle download at /init) and the install-time package registries.
    * The runner entrypoint resolves + ACCEPTs them on both families (no
    * private-IP filter — they are trusted, and a self-host MinIO endpoint may be
    * private). Empty/unset → no infra rules.
@@ -129,7 +139,11 @@ export interface BuildMachineConfigInput {
 /**
  * Build the Fly.io Machines `CreateMachineRequest` for a runner-mode
  * sandbox. Machine name is `skrun-run-${runId}` — unique per run so
- * concurrent runs cannot collide in the Fly.io app namespace.
+ * concurrent runs cannot collide in the Fly.io app namespace. The machine is
+ * labelled with its run (`config.metadata`, {@link RUN_LABEL_KEY}): the platform
+ * filters its listing on a label, never on a name, so the label is how a
+ * creation whose outcome is unknown is found again. Outside the environment:
+ * the sandbox has no use for it.
  *
  * Throws if the assembled env would contain a forbidden key (defense in
  * depth against future regressions widening the allowlist by mistake).
@@ -137,12 +151,12 @@ export interface BuildMachineConfigInput {
 export function buildMachineConfig(input: BuildMachineConfigInput): CreateMachineRequest {
   const env: Record<string, string> = {
     SKRUN_CONTAINER_MODE: "runner",
-    BUNDLE_URL: input.bundleUrl,
-    OUTPUTS_PUT_URL: input.outputsPutUrl,
     SKRUN_ALLOWED_HOSTS: input.allowedHosts.join(","),
     RUNNER_PORT: String(input.runnerPort ?? 9000),
-    MAX_RUN_TIMEOUT_MS: String(input.maxRunTimeoutMs ?? 300_000),
   };
+  if (input.lifetimeSeconds !== undefined) {
+    env[RUNNER_LIFETIME_ENV] = String(input.lifetimeSeconds);
+  }
   if (input.dnsResolveIntervalSeconds !== undefined) {
     env.SKRUN_DNS_RESOLVE_INTERVAL = String(input.dnsResolveIntervalSeconds);
   }
@@ -165,6 +179,7 @@ export function buildMachineConfig(input: BuildMachineConfigInput): CreateMachin
       image: input.image,
       env,
       guest: input.guest ?? DEFAULT_RUNNER_GUEST,
+      metadata: { [RUN_LABEL_KEY]: input.runId },
       // NET_ADMIN is required at the cap level for the entrypoint's iptables
       // setup; the capsh handoff drops to zero caps + uid 1000 right after
       // the egress allowlist is installed (see entrypoint.sh / runner-start.sh).
@@ -172,6 +187,11 @@ export function buildMachineConfig(input: BuildMachineConfigInput): CreateMachin
       // config is needed here — but if Fly.io ever tightens defaults, this is
       // where to surface the requirement explicitly.
       restart: { policy: "no" },
+      // Once its process exits — the run's end, its lifetime reached, a crash —
+      // the platform destroys the machine: never restarted (above), it would
+      // otherwise stay stopped and bill its disk until something destroyed it.
+      // A machine that never started is not covered: it has no process to exit.
+      auto_destroy: true,
     },
   };
 }
@@ -200,7 +220,7 @@ export function machineNameForPool(poolId: string): string {
 }
 
 export interface BuildPoolMachineConfigInput {
-  /** Unique id for this pooled machine — only used to build its name. */
+  /** Unique id for this pooled machine — used to build its name and its label. */
   poolId: string;
   image: string;
   /**
@@ -211,7 +231,6 @@ export interface BuildPoolMachineConfigInput {
   claimToken: string;
   region?: string;
   runnerPort?: number;
-  maxRunTimeoutMs?: number;
   dnsResolveIntervalSeconds?: number;
   guest?: MachineGuest;
   /** Harness-controlled infra hosts — run-independent, so they are resolved at fill. */
@@ -228,7 +247,10 @@ export interface BuildPoolMachineConfigInput {
  * agent `allowed_hosts` and no per-run RPC token**. Those four are the only
  * run-specific values; everything else is harness-level and can be applied now.
  * That is what keeps the pool compatible with the single-use sandbox rule — a
- * stock of never-used machines is not a stock of recycled ones.
+ * stock of never-used machines is not a stock of recycled ones. Its label
+ * ({@link POOL_LABEL_KEY}) names the pool's own id, not a run's value: the
+ * machine stays blank, and a creation the pool cannot be sure of is found again
+ * by it like a run's.
  *
  * Throws when `claimToken` is missing. That is not defensive noise: the runner's
  * authorisation falls back to the historical open-when-unset rule when it holds
@@ -246,10 +268,13 @@ export function buildPoolMachineConfig(input: BuildPoolMachineConfigInput): Crea
     );
   }
 
+  // No lifetime: a machine that waits weeks for a run must not end on the way.
+  // It learns one at its assignment — in the body of /claim, which the runner
+  // hands to the machine's guardian. The reconciliation judges a pooled machine
+  // on the platform's state and age alone.
   const env: Record<string, string> = {
     SKRUN_CONTAINER_MODE: "runner",
     RUNNER_PORT: String(input.runnerPort ?? 9000),
-    MAX_RUN_TIMEOUT_MS: String(input.maxRunTimeoutMs ?? 300_000),
     RUNNER_CLAIM_TOKEN: input.claimToken,
   };
   if (input.dnsResolveIntervalSeconds !== undefined) {
@@ -271,10 +296,16 @@ export function buildPoolMachineConfig(input: BuildPoolMachineConfigInput): Crea
       image: input.image,
       env,
       guest: input.guest ?? DEFAULT_RUNNER_GUEST,
+      metadata: { [POOL_LABEL_KEY]: input.poolId },
       // Same as a per-run machine: never restarted under us. The claim latch that
       // makes a machine single-use lives in the runner's memory, so a restart
       // would reset it — `restart: no` is what keeps that guarantee durable.
       restart: { policy: "no" },
+      // Destroyed by the platform once its process exits, like a per-run
+      // machine. The pool's own gestures are not exits: a pause, its resume, and
+      // the cold boot the platform makes of a paused machine it stopped all leave
+      // the machine alive.
+      auto_destroy: true,
     },
   };
 }

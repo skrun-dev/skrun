@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
-import { extname, join, resolve, sep } from "node:path";
+import { join, resolve, sep } from "node:path";
+import { attachmentDisposition, createLogger, runOutputKey } from "@skrun-dev/runtime";
 import { SkrunError } from "@skrun-dev/schema";
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
@@ -7,55 +8,142 @@ import {
   deleteInputFile,
   getInputFile,
   getInputRetentionSeconds,
+  liveInputFilesOf,
   registerInputFile,
 } from "../cache/input-cache.js";
 import { getOutputDir, getOutputRunId } from "../cache/output-cache.js";
 import type { DbAdapter } from "../db/adapter.js";
+import { contentTypeFor } from "../files/content-types.js";
 import { resolveFileId } from "../files/file-id-resolver.js";
 import { writeInputFile } from "../files/input-store.js";
+import { isSafeOutputName } from "../files/output-purge.js";
 import { getUser } from "../middleware/auth.js";
-import { isDelegatedKey } from "../services/key-scope.js";
+import { ACCOUNT_LIMIT_MESSAGE } from "../quotas/admission.js";
+import { type QuotaConfig, thresholdsFor } from "../quotas/thresholds.js";
+import type { RuntimeMode } from "../runtime/adapter-selection.js";
+import {
+  isDelegatedKey,
+  isMasterCredential,
+  mayReadRunFiles,
+  mayUseUpload,
+} from "../services/key-scope.js";
+import type { StorageAdapter } from "../storage/adapter.js";
+import type { UserContext } from "../types.js";
 
-const CONTENT_TYPES: Record<string, string> = {
-  ".pdf": "application/pdf",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".svg": "image/svg+xml",
-  ".csv": "text/csv",
-  ".json": "application/json",
-  ".html": "text/html",
-  ".txt": "text/plain",
-  ".md": "text/markdown",
-  ".xml": "application/xml",
-  ".zip": "application/zip",
-  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-};
+const logger = createLogger("files");
+
+/**
+ * The longest a fresh link to a cloud run's output lives, in seconds — the
+ * lifetime of the links a completed run carries. A link never outlives the
+ * run's deadline: past it, the object is due for deletion.
+ */
+export const RUN_FILE_LINK_MAX_TTL_S = 15 * 60;
+
+export interface FilesRoutesOptions {
+  /**
+   * Where runs execute, and so where their output files are: in object
+   * storage for a cloud run (`flyio`), in this process's temp directory for a
+   * local one.
+   */
+  runtimeMode: RuntimeMode;
+  /** The store a cloud run's outputs were uploaded to. Required on `flyio`. */
+  storage?: Pick<StorageAdapter, "getPresignedDownloadUrl">;
+  /** The quota settings, read once by the app: they bound an account's live uploads. */
+  quotaConfig: QuotaConfig;
+}
 
 function isAllowedUploadMime(mime: string): boolean {
   return mime.startsWith("image/") || mime === "application/pdf" || mime.startsWith("audio/");
 }
 
+/** What bounds the uploads of one caller, read when its upload arrives. */
+interface UploadBound {
+  /** The plan whose number applies, as a refusal's line names it. */
+  plan: string;
+  /** The live uploads the account may hold, this one's included. */
+  limit: number;
+  /** The caller holds a master credential: a refusal tells it the account's numbers. */
+  master: boolean;
+}
+
 /**
- * Assert the caller owns the file behind a `file_id`. Returns null when
- * ownership is confirmed, or a Hono Response (403 / 404) to short-circuit.
+ * The live uploads `user`'s account may hold, read for its plan — a plan no
+ * setting names gets `free`'s, with one `quota_plan_unknown` line. `null`
+ * when no setting bounds uploads: nothing is read then, not even the plan.
+ */
+function uploadBound(quotaConfig: QuotaConfig, user: UserContext): UploadBound | null {
+  if (quotaConfig.perPlan.inputFiles === null) return null;
+  const log = logger.child({ user_id: user.id });
+  const at = thresholdsFor(quotaConfig, user.plan, Date.now(), log);
+  if (at.inputFiles === null) return null;
+  return { plan: at.plan, limit: at.inputFiles, master: isMasterCredential(user) };
+}
+
+/**
+ * The refusal of an upload whose account already holds `bound.limit` live
+ * uploads or more in this process — `429 INPUT_FILES_LIMIT_REACHED`, told to
+ * wait until it holds fewer: when its oldest upload expires, or, for an account
+ * holding more than its limit (its plan lowered), when enough of them have —
+ * its `quota_refused` line written; or null when the account has room. The
+ * account's numbers go to a master credential only; any other key is told
+ * that a limit is reached, with the same wait.
+ */
+function refuseOverLiveUploads(c: Context, bound: UploadBound, user: UserContext): Response | null {
+  const nowMs = Date.now();
+  const live = liveInputFilesOf(user.id, bound.limit, nowMs);
+  if (live.belowLimitAtMs === null) return null;
+  logger.info(
+    { event: "quota_refused", user_id: user.id, bound: "input_files", plan: bound.plan },
+    "An upload was refused: its account holds as many live uploads as its plan allows",
+  );
+  c.header("Retry-After", String(Math.max(1, Math.ceil((live.belowLimitAtMs - nowMs) / 1000))));
+  const held = `${live.count} live upload${live.count === 1 ? "" : "s"} on this account`;
+  const freesAt = new Date(live.belowLimitAtMs).toISOString();
+  // How many must expire, or be deleted, before a place frees: one, unless the
+  // account holds more than its limit.
+  const toGo = live.count - bound.limit + 1;
+  const told =
+    toGo === 1
+      ? `${held}; your plan's limit is ${bound.limit}. The oldest expires at ${freesAt}; an upload deleted (DELETE /api/files/:id) frees its place sooner.`
+      : `${held}; your plan's limit is ${bound.limit}. A place frees at ${freesAt}, once the oldest ${toGo} have expired; ${toGo} uploads deleted (DELETE /api/files/:id) free one sooner.`;
+  return c.json(
+    {
+      error: {
+        code: "INPUT_FILES_LIMIT_REACHED",
+        message: bound.master ? told : ACCOUNT_LIMIT_MESSAGE,
+      },
+    },
+    429,
+  );
+}
+
+/**
+ * Assert the caller may use the file behind a `file_id`. Returns null when it
+ * may, or a Hono Response (403) to short-circuit.
  *
- * - Input files: `owner_id` is stored directly on InputFileMetadata at upload time.
- * - Output files: ownership derives from the producing run's `user_id`. Output
- *   file_ids without a backing run row (legacy / expired cache) are denied.
+ * A full-access credential uses every file of its account; any other key —
+ * delegated or reduced — only its own: every key of an account carries the
+ * account's id, so the account alone cannot tell two clients of one agent apart.
+ *
+ * - Input files: `mayUseUpload` — the account (`owner_id`) and the key that made
+ *   the upload (`uploaded_by_key_id`), both stored at upload time.
+ * - Output files: `mayReadRunFiles` on the producing run — its account and the
+ *   key that launched it. Output file_ids without a backing run row (legacy /
+ *   expired cache) are denied.
+ *
+ * No refusal of the delegated key here: a client reads the outputs of its own
+ * run by this route.
  */
 async function assertFileOwnership(
   c: Context,
   db: DbAdapter,
   fileId: string,
 ): Promise<Response | null> {
-  const userId = getUser(c).id;
+  const user = getUser(c);
 
   const input = getInputFile(fileId);
   if (input) {
-    if (input.owner_id !== userId) {
+    if (!mayUseUpload(user, input)) {
       return c.json(
         {
           error: {
@@ -69,13 +157,13 @@ async function assertFileOwnership(
     return null;
   }
 
-  // Output side — look up the producing run and compare its user_id.
+  // Output side — look up the producing run: its account, and its key.
   const runId = getOutputRunId(fileId);
   if (runId) {
     const run = await db.getRun(runId);
     // run.user_id is nullable (SET NULL after parent delete). Treat null as
     // "no longer owned" → refuse rather than expose orphans across tenants.
-    if (!run || run.user_id !== userId) {
+    if (!run || !mayReadRunFiles(user, run)) {
       return c.json(
         {
           error: {
@@ -94,10 +182,28 @@ async function assertFileOwnership(
   return null;
 }
 
-export function createFilesRoutes(db: DbAdapter, authMiddleware: MiddlewareHandler): Hono {
+export function createFilesRoutes(
+  db: DbAdapter,
+  authMiddleware: MiddlewareHandler,
+  opts: FilesRoutesOptions,
+): Hono {
   const router = new Hono();
+  const linkStorage = opts.storage;
+  if (opts.runtimeMode === "flyio" && !linkStorage) {
+    throw new Error(
+      'createFilesRoutes: the runtime mode "flyio" needs the store its runs upload outputs to.',
+    );
+  }
 
   router.post("/files", authMiddleware, async (c) => {
+    const user = getUser(c);
+    // An account at its plan's live uploads is refused before its body is read.
+    const bound = uploadBound(opts.quotaConfig, user);
+    if (bound) {
+      const refused = refuseOverLiveUploads(c, bound, user);
+      if (refused) return refused;
+    }
+
     let body: Record<string, string | File>;
     try {
       body = await c.req.parseBody();
@@ -142,6 +248,14 @@ export function createFilesRoutes(db: DbAdapter, authMiddleware: MiddlewareHandl
     const arrayBuffer = await file.arrayBuffer();
     const bytes = Buffer.from(arrayBuffer);
 
+    // Again, now that the body is read: another upload of the account may have
+    // taken the last place meanwhile. Nothing is awaited from here to the
+    // registration, so two uploads in flight at once cannot both take it.
+    if (bound) {
+      const refused = refuseOverLiveUploads(c, bound, user);
+      if (refused) return refused;
+    }
+
     let writeResult: ReturnType<typeof writeInputFile>;
     try {
       writeResult = writeInputFile(bytes);
@@ -159,7 +273,8 @@ export function createFilesRoutes(db: DbAdapter, authMiddleware: MiddlewareHandl
       media_type: mediaType,
       purpose: "input",
       expires_at: expiresAt,
-      owner_id: getUser(c).id,
+      owner_id: user.id,
+      uploaded_by_key_id: user.key?.id ?? null,
     });
 
     return c.json(
@@ -228,11 +343,14 @@ export function createFilesRoutes(db: DbAdapter, authMiddleware: MiddlewareHandl
       );
     }
 
+    // A download, never a page: served inline on the API's origin, an output
+    // typed text/html or image/svg+xml would run as that origin.
     const content = readFileSync(resolved.path);
     return new Response(content, {
       status: 200,
       headers: {
         "Content-Type": resolved.metadata.media_type,
+        "Content-Disposition": attachmentDisposition(resolved.name),
         "Content-Length": String(content.length),
       },
     });
@@ -288,12 +406,14 @@ export function createFilesRoutes(db: DbAdapter, authMiddleware: MiddlewareHandl
       );
     }
 
-    // Verify the caller owns the run before serving any byte.
+    // Verify the caller may read the run's files before serving any byte: a
+    // full-access credential, any run of its account; any other key, only the
+    // runs it launched itself.
     const run = await db.getRun(run_id);
     // Opaque 404: a non-owner gets the same "not found" as a non-existent run,
     // so they cannot tell "exists but not yours" from "does not exist" (aligns
     // run-file reads with the registry's 404-opaque reads).
-    if (!run || run.user_id !== getUser(c).id) {
+    if (!run || !mayReadRunFiles(getUser(c), run)) {
       return c.json(
         { error: { code: "RUN_NOT_FOUND", message: `Run ${run_id} not found or expired` } },
         404,
@@ -323,17 +443,108 @@ export function createFilesRoutes(db: DbAdapter, authMiddleware: MiddlewareHandl
     }
 
     const content = readFileSync(filePath);
-    const ext = extname(filename).toLowerCase();
-    const contentType = CONTENT_TYPES[ext] ?? "application/octet-stream";
 
     return new Response(content, {
       status: 200,
       headers: {
-        "Content-Type": contentType,
-        "Content-Disposition": `attachment; filename="${filename}"`,
+        "Content-Type": contentTypeFor(filename),
+        "Content-Disposition": attachmentDisposition(filename),
         "Content-Length": String(content.length),
       },
     });
+  });
+
+  /**
+   * A fresh download link for one of a run's output files: `{ url, expires_at }`.
+   *
+   * The checks are the run-scoped route's: a delegated key is refused (403), and
+   * a run the caller may not read — another account's, or, for a key without
+   * full access, one it did not launch — answers the same opaque 404 as a
+   * missing one.
+   *
+   * The name is the router's decoding of the path segment — once, nothing more —
+   * and must be, exactly, one of the names the run's row lists: no normalising,
+   * no second decoding, no case folding. It must also be a name the output purge
+   * would act on (`isSafeOutputName`, the one definition). Only then is a key
+   * built, `runOutputKey(run, name)`: the very key the upload wrote. A name is
+   * never normalised: `a/../b` and `b` are two names, and comparing a normalised
+   * one would presign a key no upload wrote. (A key with a `..` segment reaches
+   * the store as it is, and R2 and MinIO refuse it rather than resolve it — not
+   * a property to build on: the name rule turns such a name away first, here
+   * and at the upload.) Anything else is `404 FILE_NOT_FOUND`, and nothing is
+   * presigned.
+   *
+   * Cloud (`flyio`): a URL presigned with an attachment disposition, valid for
+   * at most `RUN_FILE_LINK_MAX_TTL_S` and never past the run's deadline; once
+   * the deadline has passed, or the purge has marked the run, `410 FILE_EXPIRED`.
+   * Local: the run-scoped route of this API — same origin, it needs the caller's
+   * credentials, and it has no expiry of its own (`expires_at: null`) — while
+   * the run's outputs are kept; once they are gone, `410 FILE_EXPIRED`.
+   *
+   * A link is a bearer credential on the cloud runtime: never cached.
+   */
+  router.get("/runs/:run_id/files/:filename/link", authMiddleware, async (c) => {
+    const { run_id, filename } = c.req.param();
+    c.header("Cache-Control", "no-store");
+
+    if (isDelegatedKey(getUser(c))) {
+      return c.json(
+        {
+          error: {
+            code: "KEY_SCOPE_FORBIDDEN",
+            message: "This endpoint is not available to a resource-scoped API key.",
+          },
+        },
+        403,
+      );
+    }
+
+    const run = await db.getRun(run_id);
+    if (!run || !mayReadRunFiles(getUser(c), run)) {
+      return c.json(
+        { error: { code: "RUN_NOT_FOUND", message: `Run ${run_id} not found or expired` } },
+        404,
+      );
+    }
+
+    const listed = (run.files ?? []).some((file) => file.name === filename);
+    if (!listed || !isSafeOutputName(filename)) {
+      return c.json({ error: { code: "FILE_NOT_FOUND", message: "File not found" } }, 404);
+    }
+
+    const expired = () =>
+      c.json(
+        {
+          error: {
+            code: "FILE_EXPIRED",
+            message: `The output files of run ${run_id} are no longer kept`,
+          },
+        },
+        410,
+      );
+
+    if (opts.runtimeMode === "flyio" && linkStorage) {
+      const now = Date.now();
+      const deadline = run.purge_after === null ? Number.NaN : Date.parse(run.purge_after);
+      const remainingS = Math.floor((deadline - now) / 1000);
+      if (run.outputs_purged_at !== null || !(remainingS >= 1)) return expired();
+      const expiresIn = Math.min(RUN_FILE_LINK_MAX_TTL_S, remainingS);
+      const url = await linkStorage.getPresignedDownloadUrl(
+        runOutputKey(run_id, filename),
+        expiresIn,
+        { contentDisposition: attachmentDisposition(filename) },
+      );
+      return c.json({ url, expires_at: new Date(now + expiresIn * 1000).toISOString() }, 200);
+    }
+
+    if (!getOutputDir(run_id)) return expired();
+    return c.json(
+      {
+        url: `/api/runs/${encodeURIComponent(run_id)}/files/${encodeURIComponent(filename)}`,
+        expires_at: null,
+      },
+      200,
+    );
   });
 
   return router;

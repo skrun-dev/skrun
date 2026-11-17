@@ -1,10 +1,15 @@
+import { createServer, type IncomingMessage } from "node:http";
+import type { AddressInfo } from "node:net";
+import { packAgentTar } from "@skrun-dev/schema";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { generateApiKey } from "../auth/api-key.js";
 import { MemoryDb } from "../db/memory.js";
 import { createApp } from "../index.js";
 import { MemoryStorage } from "../storage/memory.js";
+import { validBundle } from "./agent-bundle.shared.js";
 
 const KEY_ENV = "SKRUN_SECRETS_ENCRYPTION_KEY";
+const LOCAL_HOSTS_ENV = "SKRUN_ALLOW_LOCAL_MODEL_HOSTS";
 
 describe("agent LLM key routes (#102)", () => {
   const prevKey = process.env[KEY_ENV];
@@ -50,11 +55,12 @@ describe("agent LLM key routes (#102)", () => {
   }
 
   async function pushAgent(ownerKey: string, ns: string, name: string): Promise<string> {
-    await app.request(`/api/agents/${ns}/${name}/push?version=1.0.0`, {
+    const pushed = await app.request(`/api/agents/${ns}/${name}/push?version=1.0.0`, {
       method: "POST",
       headers: { Authorization: `Bearer ${ownerKey}`, "Content-Type": "application/octet-stream" },
-      body: Buffer.from("fake-bundle"),
+      body: new Uint8Array(await validBundle(name)),
     });
+    if (pushed.status !== 200) throw new Error(`push answered ${pushed.status}`);
     const agent = await db.getAgent(ns, name);
     if (!agent) throw new Error("agent missing after push");
     return agent.id;
@@ -138,11 +144,12 @@ describe("agent LLM key routes (#102)", () => {
       key_prefix: keyPrefix,
       name: "a",
     });
-    await app2.request("/api/agents/carol/bot/push?version=1.0.0", {
+    const pushed = await app2.request("/api/agents/carol/bot/push?version=1.0.0", {
       method: "POST",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/octet-stream" },
-      body: Buffer.from("fake-bundle"),
+      body: new Uint8Array(await validBundle("bot")),
     });
+    expect(pushed.status).toBe(200);
     const res = await app2.request("/api/agents/carol/bot/llm-keys/anthropic", {
       method: "PUT",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
@@ -154,16 +161,125 @@ describe("agent LLM key routes (#102)", () => {
     );
   });
 
-  it("rejects a non-instantiable provider (meta) with 400 INVALID_LLM_PROVIDER", async () => {
+  it("attaches a key for meta (200), a provider agent.yaml knows", async () => {
     const alice = await makeUser("alice");
     await pushAgent(alice.key, "alice", "bot");
     const res = await req("PUT", alice.key, "alice/bot/llm-keys/meta", {
       key: "sk-meta-abcdef1234567890",
     });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ provider: "meta", last4: "7890" });
+  });
+
+  it("rejects a provider agent.yaml does not know with 400 INVALID_LLM_PROVIDER, naming every one it does", async () => {
+    const alice = await makeUser("alice");
+    await pushAgent(alice.key, "alice", "bot");
+    const res = await req("PUT", alice.key, "alice/bot/llm-keys/acme", {
+      key: "sk-acme-abcdef1234567890",
+    });
     expect(res.status).toBe(400);
-    expect(((await res.json()) as { error: { code: string } }).error.code).toBe(
-      "INVALID_LLM_PROVIDER",
-    );
+    expect(await res.json()).toEqual({
+      error: {
+        code: "INVALID_LLM_PROVIDER",
+        message:
+          "Unsupported LLM provider 'acme'. Supported: anthropic, google, groq, meta, mistral, openai, xai.",
+      },
+    });
+  });
+
+  it("a creator key attached for meta serves a run of a meta agent at its base_url, with no caller key", async () => {
+    const CREATOR_KEY = "sk-meta-creator-0123456789abcdef";
+    const seen: { method?: string; url?: string; authorization?: string }[] = [];
+    // An OpenAI-compatible endpoint on this machine: it records each request
+    // and answers one chat completion.
+    const server = createServer((request: IncomingMessage, response) => {
+      request.resume();
+      request.on("end", () => {
+        seen.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.authorization,
+        });
+        response.setHeader("Content-Type", "application/json");
+        response.end(
+          JSON.stringify({
+            id: "chatcmpl-local",
+            object: "chat.completion",
+            created: 0,
+            model: "llama-local",
+            choices: [
+              {
+                index: 0,
+                finish_reason: "stop",
+                message: { role: "assistant", content: '{"answer":"ok"}' },
+              },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+        );
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const { port } = server.address() as AddressInfo;
+    // A base_url on a private address is refused unless the operator allows it.
+    const prevLocalHosts = process.env[LOCAL_HOSTS_ENV];
+    process.env[LOCAL_HOSTS_ENV] = "true";
+    try {
+      const localApp = createApp(new MemoryStorage(), db, {
+        verificationPolicy: "owner",
+        runtimeMode: "local",
+      });
+      const alice = await makeUser("alice");
+      const agentYaml = [
+        "name: meta-bot",
+        "version: 1.0.0",
+        "model:",
+        "  provider: meta",
+        "  name: llama-local",
+        `  base_url: http://127.0.0.1:${port}/v1`,
+        "inputs:",
+        "  - name: q",
+        "    type: string",
+        "outputs:",
+        "  - name: answer",
+        "    type: string",
+      ].join("\n");
+      const bundle = await packAgentTar([
+        { name: "agent.yaml", content: Buffer.from(agentYaml) },
+        { name: "SKILL.md", content: Buffer.from("# meta-bot\n") },
+      ]);
+      const push = await localApp.request("/api/agents/alice/meta-bot/push?version=1.0.0", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${alice.key}`,
+          "Content-Type": "application/octet-stream",
+        },
+        body: new Uint8Array(bundle),
+      });
+      expect(push.status).toBe(200);
+
+      const attach = await localApp.request("/api/agents/alice/meta-bot/llm-keys/meta", {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${alice.key}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ key: CREATOR_KEY }),
+      });
+      expect(attach.status).toBe(200);
+
+      const run = await localApp.request("/api/agents/alice/meta-bot/run", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${alice.key}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ input: { q: "hi" } }),
+      });
+      expect(run.status).toBe(200);
+      expect(await run.json()).toMatchObject({ status: "completed", output: { answer: "ok" } });
+      expect(seen).toEqual([
+        { method: "POST", url: "/v1/chat/completions", authorization: `Bearer ${CREATOR_KEY}` },
+      ]);
+    } finally {
+      if (prevLocalHosts === undefined) delete process.env[LOCAL_HOSTS_ENV];
+      else process.env[LOCAL_HOSTS_ENV] = prevLocalHosts;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 
   it("VT-20: sets creator_only without a key → policy set + a non-blocking warning, reflected on GET", async () => {

@@ -16,17 +16,24 @@
 #
 # Required UNDER A CONDITION — nothing asks for these on a bare local run, and
 # they refuse the boot as loudly as the ones above on a deployment that meets
-# the condition. Refusals live in `packages/api/src/index.ts` and
+# the condition. Refusals live in `packages/api/src/index.ts`,
+# `packages/api/src/operator-site.ts` and
 # `packages/api/src/runtime/adapter-selection.ts`:
-#   CORS_ORIGIN         when NODE_ENV=production. ⚠️ The shipped docker-compose.yml
-#                       sets NODE_ENV=production and leaves CORS_ORIGIN empty, so
-#                       once the stack's own preflight is satisfied (database
-#                       password and storage keys), this is the first refusal the
-#                       api process itself raises.
+#   CORS_ORIGIN         when NODE_ENV=production. The shipped docker-compose.yml
+#                       sets NODE_ENV=production and takes CORS_ORIGIN from
+#                       infra/.env, where its documented quick start writes it: a
+#                       stack whose infra/.env lacks it, or leaves it empty, is
+#                       refused here once the stack's own preflight (database
+#                       password and storage keys) is satisfied.
 #   SKRUN_PUBLIC_URL    when SKRUN_SESSION_COOKIE_DOMAIN is set — the domain is
 #                       validated against that canonical host, under four more
 #                       rules on the pair (a literal IP, a single label, a
 #                       non-suffix, a public suffix are each refused).
+#   SKRUN_SESSION_COOKIE_DOMAIN
+#                       when SKRUN_LOGIN_RETURN_PATH is set — the path is on the
+#                       site that domain names; without the domain a finished
+#                       browser login stays on this server (/dashboard) and the
+#                       path would be ignored, so the boot is refused instead.
 #   FLY_API_TOKEN,      when SKRUN_RUNTIME=flyio — the whole block is checked at
 #   SKRUN_RUNNERS_APP,  once and the refusal names every one that is missing.
 #   RUNTIME_IMAGE_TAG   (S3_BUCKET / S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY are
@@ -35,10 +42,10 @@
 # A MALFORMED value is a boot refusal too, wherever a setting is parsed at
 # startup rather than at first use — among them SKRUN_VERIFICATION_POLICY (an
 # unknown policy), SKRUN_SECRETS_ENCRYPTION_KEY (a key that does not decode),
-# SKRUN_PUSH_MAX_BODY_MB (a non-positive number), SKRUN_RUNTIME (an unknown
-# engine), DATABASE_URL (a scheme that is not postgres://). That list is the
-# SHAPE of the rule, not an inventory of it: read the two files above rather
-# than treating these lines as exhaustive.
+# SKRUN_PUSH_MAX_BODY_MB (anything but a plain positive decimal number of MB),
+# SKRUN_RUNTIME (an unknown engine), DATABASE_URL (a scheme that is not
+# postgres://). That list is the SHAPE of the rule, not an inventory of it:
+# read the files above rather than treating these lines as exhaustive.
 #
 # SKRUN_DEV_AUTH has its own lock: enabled without OAuth outside a development
 # or test NODE_ENV, the server refuses to start rather than hand admin to any

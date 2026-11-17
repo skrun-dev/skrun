@@ -1,0 +1,372 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`what a server with nothing of the operator's own site configured serves > the callback, with a cookie domain > a failure 1`] = `
+{
+  "location": "https://example.com/?login=failed",
+  "status": 302,
+}
+`;
+
+exports[`what a server with nothing of the operator's own site configured serves > the callback, with a cookie domain > a refusal by the signup allowlist 1`] = `
+{
+  "location": "https://example.com/?login=denied",
+  "status": 302,
+}
+`;
+
+exports[`what a server with nothing of the operator's own site configured serves > the callback, with a cookie domain > a success 1`] = `
+{
+  "location": "https://example.com/",
+  "status": 302,
+}
+`;
+
+exports[`what a server with nothing of the operator's own site configured serves > the callback, without a cookie domain > a refusal by the signup allowlist 1`] = `
+{
+  "body": "<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Not authorized</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Inter',system-ui,sans-serif;background:#fff;color:#111827;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;-webkit-font-smoothing:antialiased}
+@media(prefers-color-scheme:dark){body{background:#030712;color:#f3f4f6}}
+.card{max-width:440px;text-align:center;padding:40px}h1{font-size:20px;font-weight:600;margin:0 0 12px}p{color:#6b7280;font-size:14px;line-height:1.6;margin:0}</style></head>
+<body><div class="card"><h1>Not authorized</h1>
+<p>This GitHub account is not authorized to access this instance. If you think this is a mistake, contact the instance operator.</p></div></body></html>",
+  "status": 403,
+}
+`;
+
+exports[`what a server with nothing of the operator's own site configured serves > the callback, without a cookie domain > a state that does not match 1`] = `
+{
+  "body": "{"error":{"code":"INVALID_OAUTH_CALLBACK","message":"Invalid or missing OAuth state"}}",
+  "status": 400,
+}
+`;
+
+exports[`what a server with nothing of the operator's own site configured serves > the callback, without a cookie domain > a success 1`] = `
+{
+  "location": "/dashboard",
+  "status": 302,
+}
+`;
+
+exports[`what a server with nothing of the operator's own site configured serves > the callback, without a cookie domain > a token exchange that fails 1`] = `
+{
+  "body": "{"error":{"code":"OAUTH_FAILED","message":"OAuth authentication failed"}}",
+  "status": 500,
+}
+`;
+
+exports[`what a server with nothing of the operator's own site configured serves > the device consent page, for a code the user typed 1`] = `
+"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Authorize Skrun CLI</title>
+<style>*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Inter',system-ui,sans-serif;background:#fff;color:#111827;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;-webkit-font-smoothing:antialiased}
+@media(prefers-color-scheme:dark){body{background:#030712;color:#f3f4f6}.card{border-color:#1f2937}input{background:#0c0f15;color:#f3f4f6;border-color:#1f2937}code{background:#1f2937;color:#d1d5db}.warn{background:#3f2d0a;color:#fde68a}}
+.card{border:1px solid #e5e7eb;border-radius:12px;padding:40px;max-width:420px;width:100%;text-align:center}
+h1{font-size:20px;font-weight:600;margin:0 0 4px}.sub{color:#6b7280;font-size:14px;margin:0 0 24px}
+label{display:block;text-align:left;font-size:12px;color:#6b7280;margin:0 0 6px}
+input[name=user_code]{width:100%;padding:10px 12px;font-size:18px;letter-spacing:2px;text-align:center;font-family:ui-monospace,monospace;border:1px solid #e5e7eb;border-radius:8px;text-transform:uppercase}
+button{margin-top:16px;width:100%;padding:11px;border:none;border-radius:8px;background:#111827;color:#fff;font-size:14px;font-weight:600;cursor:pointer}button:hover{background:#1f2937}
+.warn{margin-top:20px;padding:10px 12px;border-radius:8px;background:#fef3c7;color:#92400e;font-size:12px;line-height:1.5;text-align:left}
+code{background:#f3f4f6;padding:1px 5px;border-radius:4px;font-family:ui-monospace,monospace;font-size:12px}</style></head>
+<body><div class="card"><h1>Authorize Skrun CLI</h1>
+<p class="sub">A Skrun CLI is requesting access to your account.</p>
+<form method="POST" action="/device">
+<label for="user_code">One-time code</label>
+<input id="user_code" name="user_code" value="ABCD-EFGH" autocomplete="off" autocapitalize="characters" spellcheck="false" required>
+<input type="hidden" name="csrf" value="[anti-forgery token]">
+<button type="submit">Continue with GitHub</button></form>
+<p class="warn">⚠️ Only continue if you just ran <code>skrun login</code> yourself. Never enter a code someone sent you.</p>
+</div></body></html>"
+`;
+
+exports[`what a server with nothing of the operator's own site configured serves > the session read, for a signed-in account 1`] = `"{"id":"[account id]","username":"page-reader","namespace":"page-reader","email":null,"avatar_url":null,"plan":"free","role":"user","verification_policy":"admin"}"`;
+
+exports[`what a server with nothing of the operator's own site configured serves > the sign-in page > with GitHub sign-in configured 1`] = `
+"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — Skrun</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Inter', system-ui, sans-serif;
+      background: #fff;
+      color: #111827;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #030712; color: #f3f4f6; }
+      .card { background: rgba(3,7,18,0.4); border-color: #1f2937; }
+      .btn-github { background: #f3f4f6; color: #111827; }
+      .btn-github:hover { background: #fff; }
+      .note { color: #6b7280; }
+      code { background: #1f2937; color: #d1d5db; }
+      .divider { border-color: #1f2937; }
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 48px 40px;
+      max-width: 400px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    .logo { width: 48px; height: 48px; margin: 0 auto 16px; }
+    h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; margin-bottom: 4px; }
+    .subtitle { color: #6b7280; font-size: 13px; margin-bottom: 32px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 10px 28px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      border: none;
+      transition: background-color 0.15s, box-shadow 0.15s;
+    }
+    .btn-github {
+      background: #111827;
+      color: #fff;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.1), 0 1px 2px rgba(0,0,0,0.12);
+    }
+    .btn-github:hover { background: #1f2937; }
+    .btn-github svg { width: 18px; height: 18px; }
+    .divider { border-top: 1px solid #e5e7eb; margin: 24px 0; }
+    .note { color: #9ca3af; font-size: 12px; line-height: 1.5; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-family: ui-monospace, monospace; }
+    .footer { margin-top: 24px; font-size: 11px; color: #9ca3af; }
+    .footer a { color: #0ea5e9; text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <svg class="logo" role="img" aria-label="Skrun" viewBox="0 0 852.21191 456.36682" xmlns="http://www.w3.org/2000/svg">
+      <defs><clipPath id="clip0"><rect x="236" y="243" width="521" height="279" /></clipPath></defs>
+      <g transform="translate(-113.89405,-311.81659)">
+        <g clip-path="url(#clip0)" transform="matrix(1.6357234,0,0,1.6357234,-272.13667,-85.6642)">
+          <path d="m 583,288 h 63.529 L 757,383 646.529,478 H 583 l 110.471,-95 z" fill="#00aeff" fill-rule="evenodd" />
+          <path d="M 0,0 H 63.5291 L 174,95 63.5291,190 H 0 L 110.471,95 Z" fill="#00aeff" fill-rule="evenodd" transform="matrix(-1,0,0,1,410,288)" />
+          <path d="M 427,243 652,382.5 427,522 Z" fill="#00aeff" fill-rule="evenodd" />
+          <path d="M 634.472,372 652,382.841 427,522 v -79.655 z" fill="#0070da" fill-rule="evenodd" />
+          <path d="M 693.471,383 H 757 v 0 L 646.529,478 H 583 Z" fill="#017be3" fill-rule="evenodd" />
+          <path d="M 174,0 H 110.471 V 2.09279e-4 L 0,95 H 63.5292 L 174,2.09279e-4 Z" fill="#017be3" fill-rule="evenodd" transform="matrix(-1,0,0,1,410,383)" />
+        </g>
+      </g>
+    </svg>
+    <h1>Skrun</h1>
+    <p class="subtitle">Deploy any Agent Skill as an API</p>
+    <a href="/auth/github" class="btn btn-github">
+            <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+            Sign in with GitHub
+          </a>
+    <div class="footer">
+      <a href="/docs" target="_blank">API Docs</a>
+    </div>
+  </div>
+</body>
+</html>"
+`;
+
+exports[`what a server with nothing of the operator's own site configured serves > the sign-in page > with neither 1`] = `
+"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — Skrun</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Inter', system-ui, sans-serif;
+      background: #fff;
+      color: #111827;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #030712; color: #f3f4f6; }
+      .card { background: rgba(3,7,18,0.4); border-color: #1f2937; }
+      .btn-github { background: #f3f4f6; color: #111827; }
+      .btn-github:hover { background: #fff; }
+      .note { color: #6b7280; }
+      code { background: #1f2937; color: #d1d5db; }
+      .divider { border-color: #1f2937; }
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 48px 40px;
+      max-width: 400px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    .logo { width: 48px; height: 48px; margin: 0 auto 16px; }
+    h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; margin-bottom: 4px; }
+    .subtitle { color: #6b7280; font-size: 13px; margin-bottom: 32px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 10px 28px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      border: none;
+      transition: background-color 0.15s, box-shadow 0.15s;
+    }
+    .btn-github {
+      background: #111827;
+      color: #fff;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.1), 0 1px 2px rgba(0,0,0,0.12);
+    }
+    .btn-github:hover { background: #1f2937; }
+    .btn-github svg { width: 18px; height: 18px; }
+    .divider { border-top: 1px solid #e5e7eb; margin: 24px 0; }
+    .note { color: #9ca3af; font-size: 12px; line-height: 1.5; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-family: ui-monospace, monospace; }
+    .footer { margin-top: 24px; font-size: 11px; color: #9ca3af; }
+    .footer a { color: #0ea5e9; text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <svg class="logo" role="img" aria-label="Skrun" viewBox="0 0 852.21191 456.36682" xmlns="http://www.w3.org/2000/svg">
+      <defs><clipPath id="clip0"><rect x="236" y="243" width="521" height="279" /></clipPath></defs>
+      <g transform="translate(-113.89405,-311.81659)">
+        <g clip-path="url(#clip0)" transform="matrix(1.6357234,0,0,1.6357234,-272.13667,-85.6642)">
+          <path d="m 583,288 h 63.529 L 757,383 646.529,478 H 583 l 110.471,-95 z" fill="#00aeff" fill-rule="evenodd" />
+          <path d="M 0,0 H 63.5291 L 174,95 63.5291,190 H 0 L 110.471,95 Z" fill="#00aeff" fill-rule="evenodd" transform="matrix(-1,0,0,1,410,288)" />
+          <path d="M 427,243 652,382.5 427,522 Z" fill="#00aeff" fill-rule="evenodd" />
+          <path d="M 634.472,372 652,382.841 427,522 v -79.655 z" fill="#0070da" fill-rule="evenodd" />
+          <path d="M 693.471,383 H 757 v 0 L 646.529,478 H 583 Z" fill="#017be3" fill-rule="evenodd" />
+          <path d="M 174,0 H 110.471 V 2.09279e-4 L 0,95 H 63.5292 L 174,2.09279e-4 Z" fill="#017be3" fill-rule="evenodd" transform="matrix(-1,0,0,1,410,383)" />
+        </g>
+      </g>
+    </svg>
+    <h1>Skrun</h1>
+    <p class="subtitle">Deploy any Agent Skill as an API</p>
+    <p class="note">This instance requires authentication.<br>Configure GitHub OAuth, or use an API key (<code>skrun_sk_*</code>).</p>
+    <div class="footer">
+      <a href="/docs" target="_blank">API Docs</a>
+    </div>
+  </div>
+</body>
+</html>"
+`;
+
+exports[`what a server with nothing of the operator's own site configured serves > the sign-in page > with only the development token 1`] = `
+"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — Skrun</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Inter', system-ui, sans-serif;
+      background: #fff;
+      color: #111827;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #030712; color: #f3f4f6; }
+      .card { background: rgba(3,7,18,0.4); border-color: #1f2937; }
+      .btn-github { background: #f3f4f6; color: #111827; }
+      .btn-github:hover { background: #fff; }
+      .note { color: #6b7280; }
+      code { background: #1f2937; color: #d1d5db; }
+      .divider { border-color: #1f2937; }
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 48px 40px;
+      max-width: 400px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    .logo { width: 48px; height: 48px; margin: 0 auto 16px; }
+    h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; margin-bottom: 4px; }
+    .subtitle { color: #6b7280; font-size: 13px; margin-bottom: 32px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 10px 28px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      border: none;
+      transition: background-color 0.15s, box-shadow 0.15s;
+    }
+    .btn-github {
+      background: #111827;
+      color: #fff;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.1), 0 1px 2px rgba(0,0,0,0.12);
+    }
+    .btn-github:hover { background: #1f2937; }
+    .btn-github svg { width: 18px; height: 18px; }
+    .divider { border-top: 1px solid #e5e7eb; margin: 24px 0; }
+    .note { color: #9ca3af; font-size: 12px; line-height: 1.5; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-family: ui-monospace, monospace; }
+    .footer { margin-top: 24px; font-size: 11px; color: #9ca3af; }
+    .footer a { color: #0ea5e9; text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <svg class="logo" role="img" aria-label="Skrun" viewBox="0 0 852.21191 456.36682" xmlns="http://www.w3.org/2000/svg">
+      <defs><clipPath id="clip0"><rect x="236" y="243" width="521" height="279" /></clipPath></defs>
+      <g transform="translate(-113.89405,-311.81659)">
+        <g clip-path="url(#clip0)" transform="matrix(1.6357234,0,0,1.6357234,-272.13667,-85.6642)">
+          <path d="m 583,288 h 63.529 L 757,383 646.529,478 H 583 l 110.471,-95 z" fill="#00aeff" fill-rule="evenodd" />
+          <path d="M 0,0 H 63.5291 L 174,95 63.5291,190 H 0 L 110.471,95 Z" fill="#00aeff" fill-rule="evenodd" transform="matrix(-1,0,0,1,410,288)" />
+          <path d="M 427,243 652,382.5 427,522 Z" fill="#00aeff" fill-rule="evenodd" />
+          <path d="M 634.472,372 652,382.841 427,522 v -79.655 z" fill="#0070da" fill-rule="evenodd" />
+          <path d="M 693.471,383 H 757 v 0 L 646.529,478 H 583 Z" fill="#017be3" fill-rule="evenodd" />
+          <path d="M 174,0 H 110.471 V 2.09279e-4 L 0,95 H 63.5292 L 174,2.09279e-4 Z" fill="#017be3" fill-rule="evenodd" transform="matrix(-1,0,0,1,410,383)" />
+        </g>
+      </g>
+    </svg>
+    <h1>Skrun</h1>
+    <p class="subtitle">Deploy any Agent Skill as an API</p>
+    <p class="note">OAuth is not configured on this instance.<br>Use <code>Bearer dev-token</code> for local development.</p>
+    <div class="footer">
+      <a href="/docs" target="_blank">API Docs</a>
+    </div>
+  </div>
+</body>
+</html>"
+`;

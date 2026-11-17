@@ -9,7 +9,10 @@
 #   2. the entrypoint (uid 0) writes the world-readable boot marker,
 #   3. the OUTPUT egress policy is applied (the timing edit left it intact),
 #   4. the runner (uid 1000, post-capsh) reads /proc/uptime + the marker and
-#      serves /healthz.
+#      serves /healthz,
+#   5. the runner's boot line names the image (`image=<value>`): exactly the
+#      value this script passed to the build, or — on a prebuilt image, whose
+#      builder chose it — any non-empty value.
 #
 # The /init phase timings (bundle/extract/mcp) need a real agent bundle + object
 # store and are exercised by the Level-5 cloud verify, not here.
@@ -26,6 +29,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 IMG_CTX="$REPO_ROOT/infra/runtime-image"
 TAG="${SMOKE_IMAGE:-skrun-runtime:smoke}"
+IMAGE_VERSION="" # set below when this script builds the image
 PORT=9099
 NAME="skrun-runner-smoke-$$"
 
@@ -57,8 +61,12 @@ if [[ -z "${SMOKE_IMAGE:-}" ]]; then
   # v1.0.0 tag build died. Schema now comes from the tarball beside it.
   mv "$IMG_CTX"/skrun-dev-schema-*.tgz "$IMG_CTX/skrun-dev-schema.tgz"
   mv "$IMG_CTX"/skrun-dev-runtime-*.tgz "$IMG_CTX/skrun-dev-runtime.tgz"
-  echo "SMOKE: building the runner target (runs the runner tsc)..."
-  docker build --target runner -t "$TAG" "$IMG_CTX" >/dev/null
+  # The name the boot line must print back. Set last in the target, so a new
+  # value per commit rebuilds none of the install layers.
+  IMAGE_VERSION="smoke-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo nogit)"
+  echo "SMOKE: building the runner target (runs the runner tsc), image=$IMAGE_VERSION..."
+  docker build --target runner --build-arg SKRUN_IMAGE_VERSION="$IMAGE_VERSION" \
+    -t "$TAG" "$IMG_CTX" >/dev/null
 else
   echo "SMOKE: using prebuilt image $TAG (skipping build)."
 fi
@@ -100,10 +108,25 @@ echo "$marker" | grep -q 'egress_ms' || {
 }
 echo "SMOKE: boot marker OK ($marker)"
 
+echo "SMOKE: asserting the runner names its image on the boot line..."
+boot_line="$(docker logs "$NAME" 2>&1 | tr -d '\r' | grep -m1 -F '[skrun-runner] boot: node ' || true)"
+if [[ -n "${IMAGE_VERSION:-}" ]]; then
+  [[ "$boot_line" == *" image=${IMAGE_VERSION}" ]] || {
+    echo "SMOKE FAIL: the boot line does not name the image built here, image=${IMAGE_VERSION} (got: '$boot_line')"
+    exit 1
+  }
+else
+  [[ "$boot_line" =~ \ image=[^[:space:]]+$ ]] || {
+    echo "SMOKE FAIL: the boot line does not name the image (no 'image=<value>'; got: '$boot_line')"
+    exit 1
+  }
+fi
+echo "SMOKE: boot line OK ($boot_line)"
+
 echo "SMOKE: asserting the runner target is SLIM (no api-server bundle / dashboard / build-essential)..."
 docker exec "$NAME" sh -c 'test ! -e /opt/skrun-api' || { echo "SMOKE FAIL: /opt/skrun-api present in the runner target"; exit 1; }
 docker exec "$NAME" sh -c 'test ! -e /opt/skrun-web' || { echo "SMOKE FAIL: /opt/skrun-web present in the runner target"; exit 1; }
 docker exec "$NAME" sh -c '! command -v gcc >/dev/null 2>&1' || { echo "SMOKE FAIL: gcc/build-essential present in the runner target"; exit 1; }
 echo "SMOKE: runner is slim — api-server bundle + dashboard + build-essential all absent"
 
-echo "SMOKE PASS: runner builds, boots, keeps the egress policy, writes+reads the boot marker, serves /healthz, and is slim."
+echo "SMOKE PASS: runner builds, boots, keeps the egress policy, writes+reads the boot marker, names its image, serves /healthz, and is slim."

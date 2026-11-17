@@ -16,7 +16,7 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { REGISTRY, ROOT, results, skrun, TOKEN, verifyLatestVersion } from "./_ctx.js";
+import { pushFixture, REGISTRY, ROOT, results, skrun, TOKEN, verifyLatestVersion } from "./_ctx.js";
 
 /** Best-effort delete of dev/<slug>@<version>. 204/404 OK; anything else logs warn. Per #77. */
 async function cleanupVersion(agentSlug: string, version: string): Promise<void> {
@@ -103,7 +103,7 @@ export async function run(): Promise<void> {
     await testMultimodalDirect(
       "#56-vt25",
       "Anthropic vision (sample-image.jpg)",
-      { provider: "anthropic", name: "claude-3-5-sonnet-latest" },
+      { provider: "anthropic", name: "claude-sonnet-5-5" },
       [
         { kind: "text", text: "What animal is in this image? Answer in one word." },
         {
@@ -147,7 +147,7 @@ export async function run(): Promise<void> {
     await testMultimodalDirect(
       "#56-vt27",
       "Gemini PDF (sample.pdf)",
-      { provider: "google", name: "gemini-2.5-flash" },
+      { provider: "google", name: "gemini-3.8-flash" },
       [
         {
           kind: "text",
@@ -172,7 +172,7 @@ export async function run(): Promise<void> {
     await testMultimodalDirect(
       "#56-vt28",
       "Gemini audio (sample.wav)",
-      { provider: "google", name: "gemini-2.5-flash" },
+      { provider: "google", name: "gemini-3.8-flash" },
       [
         {
           kind: "text",
@@ -211,7 +211,8 @@ export async function run(): Promise<void> {
 
     try {
       skrun(["build"], dir);
-      skrun(["push"], dir);
+      // Deleted above, so a 409 fails the case rather than run a stale bundle.
+      await pushFixture(dir, { acceptExisting: false });
       // Verify the just-pushed version so POST /run reaches past the
       // per-version verified gate (#83). dev-token = admin.
       await verifyLatestVersion("dev", "receipts-to-expenses");

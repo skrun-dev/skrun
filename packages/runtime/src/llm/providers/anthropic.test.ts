@@ -1,6 +1,8 @@
+import { MODEL_CAPABILITIES } from "@skrun-dev/schema";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LLMCapabilityError } from "../errors.js";
 import { InMemoryProviderFileCache } from "../file-cache.js";
+import { MODEL_MAX_OUTPUT_TOKENS } from "../model-tables.js";
 import type { SkrunPart } from "../parts.js";
 import type { LLMCallRequest } from "./types.js";
 
@@ -27,7 +29,7 @@ vi.mock("@anthropic-ai/sdk", () => ({
 }));
 
 // Import AFTER vi.mock so the mocked constructor is used
-const { AnthropicProvider } = await import("./anthropic.js");
+const { AnthropicProvider, estimatePrefixTokens } = await import("./anthropic.js");
 
 const FAKE_RESPONSE = {
   content: [{ type: "text", text: "ok" }],
@@ -316,14 +318,14 @@ describe("AnthropicProvider — cache_control injection (#68)", () => {
     };
   }
 
-  // Sonnet 4.6 has threshold 2048 → need > 8192 chars of JSON.stringify output
+  // Sonnet 4.6 has threshold 1024 → need > 4096 chars of JSON.stringify output
   // for prefix to exceed threshold.
   const SONNET_46 = "claude-sonnet-4-6";
 
-  // Above-threshold system prompt (~12_000 chars JSON-stringified → ~3000 tokens > 2048)
+  // Above-threshold system prompt (~12_000 chars JSON-stringified → ~3000 tokens > 1024)
   const BIG_SYSTEM = "Detailed system instructions: ".concat("y".repeat(12_000));
 
-  // Above-threshold tool (single tool, ~10_000 chars JSON-stringified → ~2500 tokens > 2048)
+  // Above-threshold tool (single tool, ~10_000 chars JSON-stringified → ~2500 tokens > 1024)
   const BIG_TOOL_A = bigTool("read_file", 10_000);
 
   // Below-threshold tool (~200 chars → ~50 tokens)
@@ -371,9 +373,8 @@ describe("AnthropicProvider — cache_control injection (#68)", () => {
     const sent = mocks.messagesCreate.mock.calls[0][0];
     // System stays as plain string (not converted to array).
     expect(sent.system).toBe(SMALL_SYSTEM);
-    // No tool has cache_control. Confirms peer-review B2 fix: paying 1.25×
-    // write surcharge below threshold has zero hit potential — strictly worse
-    // than no injection.
+    // No tool has cache_control: below the model's threshold a prefix cannot
+    // be cached — Anthropic processes the request without caching.
     expect(sent.tools).toHaveLength(1);
     expect(sent.tools[0].cache_control).toBeUndefined();
   });
@@ -414,13 +415,13 @@ describe("AnthropicProvider — cache_control injection (#68)", () => {
     expect(sent.tools[0].cache_control).toBeUndefined();
   });
 
-  it("VT-3: respects per-model threshold (Opus 4.7 = 4096; same big system below threshold)", async () => {
-    // BIG_SYSTEM is ~12_000 chars / 4 ≈ 3000 tokens. Above Sonnet 4.6 (2048)
-    // but BELOW Opus 4.7 (4096) — same input, different model = different
+  it("VT-3: respects per-model threshold (Opus 4.6 = 4096; same big system below threshold)", async () => {
+    // BIG_SYSTEM is ~12_000 chars / 4 ≈ 3000 tokens. Above Sonnet 4.6 (1024)
+    // but BELOW Opus 4.6 (4096) — same input, different model = different
     // injection decision. Locks in the per-model threshold lookup.
     const provider = new AnthropicProvider("test-key");
     await provider.call({
-      model: "claude-opus-4-7",
+      model: "claude-opus-4-6",
       systemPrompt: BIG_SYSTEM,
       userContent: [{ kind: "text", text: "hi" }],
       userMessage: "hi",
@@ -433,17 +434,17 @@ describe("AnthropicProvider — cache_control injection (#68)", () => {
     expect(sent.tools[0].cache_control).toBeUndefined();
   });
 
-  it("VT-3: snapshot ID resolves to base via prefix-match (claude-opus-4-7-20260416)", async () => {
+  it("VT-3: snapshot ID resolves to base via prefix-match (claude-haiku-4-5-20251001)", async () => {
     const provider = new AnthropicProvider("test-key");
     await provider.call({
-      model: "claude-opus-4-7-20260416",
+      model: "claude-haiku-4-5-20251001",
       systemPrompt: BIG_SYSTEM,
       userContent: [{ kind: "text", text: "hi" }],
       userMessage: "hi",
     });
 
     const sent = mocks.messagesCreate.mock.calls[0][0];
-    // Snapshot resolves to claude-opus-4-7 (threshold 4096) — same outcome as
+    // Snapshot resolves to claude-haiku-4-5 (threshold 4096) — same outcome as
     // the parent test: ~3000 tokens < 4096 → no injection.
     expect(sent.system).toBe(BIG_SYSTEM);
   });
@@ -625,5 +626,505 @@ describe("AnthropicProvider — cache usage extraction (#68)", () => {
     // Confirms our adapter doesn't fake a cache hit when Anthropic reports 0.
     expect(r2.usage.cacheReadTokens).toBeUndefined();
     expect(r2.usage.cacheWriteTokens).toBe(5_000);
+  });
+});
+
+describe("AnthropicProvider — the native turn", () => {
+  beforeEach(() => {
+    mocks.messagesCreate.mockReset();
+  });
+
+  it("returns the response's content blocks, untouched, as its own turn", async () => {
+    const content = [
+      { type: "thinking", thinking: "witness reasoning", signature: "witness-signature" },
+      { type: "redacted_thinking", data: "witness-redacted" },
+      { type: "text", text: "witness text" },
+      { type: "tool_use", id: "toolu_witness", name: "lookup", input: { q: "x" } },
+    ];
+    mocks.messagesCreate.mockResolvedValueOnce({
+      content,
+      usage: { input_tokens: 10, output_tokens: 5 },
+    });
+    const provider = new AnthropicProvider("test-key");
+
+    const response = await provider.call(makeRequest([{ kind: "text", text: "hi" }]));
+
+    expect(response.assistantTurn.provider).toBe("anthropic");
+    expect(response.assistantTurn.content).toBe(content);
+    expect(response.content).toBe("witness text");
+    expect(response.toolCalls).toEqual([{ name: "lookup", args: { q: "x" }, id: "toolu_witness" }]);
+  });
+});
+
+describe("AnthropicProvider — the output bound", () => {
+  // A row of the table below the bound, for the duration of the case.
+  const WITNESS = "claude-witness-short";
+
+  beforeEach(() => {
+    mocks.messagesCreate.mockReset();
+    mocks.messagesCreate.mockResolvedValue(FAKE_RESPONSE);
+    MODEL_MAX_OUTPUT_TOKENS[WITNESS] = 8_192;
+  });
+
+  afterEach(() => {
+    delete MODEL_MAX_OUTPUT_TOKENS[WITNESS];
+    vi.clearAllMocks();
+  });
+
+  it("max_tokens is the model's output limit, bounded at 16 384, and 16 384 for a model the table does not know", async () => {
+    const provider = new AnthropicProvider("test-key");
+    for (const model of ["claude-opus-4-7-20260416", WITNESS, "claude-unlisted-9"]) {
+      await provider.call({ ...makeRequest([{ kind: "text", text: "hi" }]), model });
+    }
+
+    // 128 000 for the first, by its base model's row.
+    expect(MODEL_MAX_OUTPUT_TOKENS["claude-opus-4-7"]).toBe(128_000);
+    expect(mocks.messagesCreate.mock.calls.map((call) => call[0].max_tokens)).toEqual([
+      16_384, 8_192, 16_384,
+    ]);
+  });
+});
+
+describe("AnthropicProvider — a forced tool choice the model refuses, through the router", () => {
+  // A row of the capability matrix marked as refusing a forced choice, for the
+  // duration of each case.
+  const WITNESS = "claude-witness-unforced";
+  const TOOL = { name: "lookup", description: "Look a value up", parameters: { type: "object" } };
+
+  beforeEach(() => {
+    mocks.messagesCreate.mockReset();
+    mocks.messagesCreate.mockResolvedValue(FAKE_RESPONSE);
+    MODEL_CAPABILITIES.anthropic[WITNESS] = {
+      image: true,
+      document: true,
+      audio: false,
+      caching: true,
+      temperature: true,
+      forcedToolChoice: false,
+    };
+  });
+
+  afterEach(() => {
+    delete MODEL_CAPABILITIES.anthropic[WITNESS];
+    vi.clearAllMocks();
+  });
+
+  /** One call through a router whose log lines are kept: the request Anthropic got, and the gap lines. */
+  async function callThrough(name: string, toolChoice: LLMCallRequest["toolChoice"]) {
+    const { LLMRouter } = await import("../router.js");
+    const logged: Array<Record<string, unknown>> = [];
+    const keep = (obj: Record<string, unknown>) => {
+      logged.push(obj);
+    };
+    const logger = { warn: keep, info: keep, error: keep, debug: keep } as never;
+    const router = new LLMRouter(logger);
+    router.registerProvider("anthropic", new AnthropicProvider("test-key"));
+    await router.call(
+      { provider: "anthropic", name },
+      "sys",
+      "hi",
+      [TOOL],
+      undefined,
+      undefined,
+      undefined,
+      toolChoice,
+    );
+    return {
+      sent: mocks.messagesCreate.mock.calls.at(-1)?.[0],
+      gaps: logged.filter((l) => l.event === "provider_gap"),
+    };
+  }
+
+  it("required on a model that refuses it goes as auto, with a provider_gap line; on another model it stays any", async () => {
+    const refused = await callThrough(WITNESS, { mode: "required" });
+    expect(refused.sent.tool_choice).toBeUndefined();
+    expect(refused.gaps).toEqual([
+      expect.objectContaining({
+        provider: "anthropic",
+        model: WITNESS,
+        gap: "forced_tool_choice_not_supported",
+        fallback: "auto",
+      }),
+    ]);
+
+    const kept = await callThrough("claude-sonnet-4-6", { mode: "required" });
+    expect(kept.sent.tool_choice).toEqual({ type: "any" });
+    expect(kept.gaps).toEqual([]);
+  });
+
+  it.each([
+    ["a specific tool", { mode: "specific", tool: "lookup" } as const],
+    ["a subset, which Anthropic would send as any", { mode: "subset", tools: ["lookup"] } as const],
+  ])("%s on a model that refuses a forced choice goes as auto too", async (_case, toolChoice) => {
+    const { sent, gaps } = await callThrough(WITNESS, toolChoice);
+    expect(sent.tool_choice).toBeUndefined();
+    expect(gaps).toEqual([expect.objectContaining({ gap: "forced_tool_choice_not_supported" })]);
+  });
+
+  it("claude-sonnet-5-5, which refuses a forced choice, gets required as auto with a provider_gap line; claude-sonnet-4-6 keeps any", async () => {
+    const refused = await callThrough("claude-sonnet-5-5", { mode: "required" });
+    expect(refused.sent.tool_choice).toBeUndefined();
+    expect(refused.gaps).toEqual([
+      expect.objectContaining({
+        provider: "anthropic",
+        model: "claude-sonnet-5-5",
+        gap: "forced_tool_choice_not_supported",
+      }),
+    ]);
+
+    const kept = await callThrough("claude-sonnet-4-6", { mode: "required" });
+    expect(kept.sent.tool_choice).toEqual({ type: "any" });
+    expect(kept.gaps).toEqual([]);
+  });
+
+  it("none and auto are no forced choice: unchanged on that model", async () => {
+    expect((await callThrough(WITNESS, { mode: "none" })).sent.tool_choice).toEqual({
+      type: "none",
+    });
+    const auto = await callThrough(WITNESS, { mode: "auto" });
+    expect(auto.sent.tool_choice).toBeUndefined();
+    expect(auto.gaps).toEqual([]);
+  });
+});
+
+describe("AnthropicProvider — the conversation cache point", () => {
+  const SONNET_46 = "claude-sonnet-4-6";
+  // Each above the model's threshold on its own (estimate: JSON length / 4).
+  const BIG_SYSTEM = "Detailed system instructions: ".concat("y".repeat(12_000));
+  const BIG_TOOL = {
+    name: "lookup",
+    description: "Look a value up",
+    parameters: {
+      type: "object",
+      properties: { q: { type: "string", description: "x".repeat(10_000) } },
+    },
+  };
+  const SMALL_TOOL = { name: "ping", description: "ping", parameters: { type: "object" } };
+  const EPHEMERAL = { type: "ephemeral" };
+
+  interface SentBlock {
+    type: string;
+    cache_control?: unknown;
+  }
+  interface Sent {
+    system: string | SentBlock[];
+    tools?: SentBlock[];
+    messages: Array<{ role: string; content: SentBlock[] }>;
+  }
+
+  /** Every cache point in a request, by where it sits. */
+  function cachePoints(sent: Sent): string[] {
+    const points: string[] = [];
+    for (const [i, t] of (sent.tools ?? []).entries()) {
+      if (t.cache_control) points.push(`tools[${i}]`);
+    }
+    if (Array.isArray(sent.system)) {
+      for (const [i, b] of sent.system.entries()) {
+        if (b.cache_control) points.push(`system[${i}]`);
+      }
+    }
+    for (const [i, m] of sent.messages.entries()) {
+      for (const [j, b] of m.content.entries()) {
+        if (b.cache_control) points.push(`messages[${i}][${j}]`);
+      }
+    }
+    return points;
+  }
+
+  let requests: Sent[];
+
+  beforeEach(() => {
+    mocks.messagesCreate.mockReset();
+    requests = [];
+  });
+
+  function answering(...turns: unknown[][]) {
+    mocks.messagesCreate.mockImplementation(async (params: Sent) => {
+      requests.push(structuredClone(params));
+      const content = turns.shift() ?? [{ type: "text", text: "done" }];
+      return { content, usage: { input_tokens: 10, output_tokens: 5 } };
+    });
+  }
+
+  it("at the third turn of a tool loop, three cache points: the tools, the system prompt and the last message — the conversation's stored turns untouched", async () => {
+    const { LLMRouter } = await import("../router.js");
+    const turn1 = [
+      { type: "thinking", thinking: "first", signature: "sig-1" },
+      { type: "tool_use", id: "toolu_1", name: "lookup", input: { q: "a" } },
+    ];
+    const turn2 = [{ type: "tool_use", id: "toolu_2", name: "lookup", input: { q: "b" } }];
+    answering(turn1, turn2, [{ type: "text", text: "done" }]);
+    const router = new LLMRouter();
+    router.registerProvider("anthropic", new AnthropicProvider("test-key"));
+
+    const result = await router.call(
+      { provider: "anthropic", name: SONNET_46 },
+      BIG_SYSTEM,
+      "hi",
+      [BIG_TOOL],
+      async (call) => ({ name: call.name, result: `value ${call.id}`, id: call.id }),
+    );
+
+    expect(requests).toHaveLength(3);
+    expect(cachePoints(requests[2])).toEqual(["tools[0]", "system[0]", "messages[4][0]"]);
+    expect(requests[2].messages[4].content[0]).toEqual({
+      type: "tool_result",
+      tool_use_id: "toolu_2",
+      content: "value toolu_2",
+      cache_control: EPHEMERAL,
+    });
+    for (const request of requests) expect(cachePoints(request).length).toBeLessThanOrEqual(4);
+    expect(JSON.stringify(result.history)).not.toContain("cache_control");
+  });
+
+  it("a call with neither tools nor a conversation keeps two points at most, as before: nothing would read the message back", async () => {
+    answering();
+    const provider = new AnthropicProvider("test-key");
+
+    await provider.call({
+      model: SONNET_46,
+      systemPrompt: BIG_SYSTEM,
+      userContent: [{ kind: "text", text: "hi ".repeat(5_000) }],
+      userMessage: "",
+    });
+
+    expect(cachePoints(requests[0])).toEqual(["system[0]"]);
+  });
+
+  it("tools declared on a first turn: the input is cached for the turns that follow", async () => {
+    answering();
+    const provider = new AnthropicProvider("test-key");
+
+    await provider.call({
+      model: SONNET_46,
+      systemPrompt: BIG_SYSTEM,
+      userContent: [{ kind: "text", text: "hi" }],
+      userMessage: "",
+      tools: [SMALL_TOOL],
+    });
+
+    expect(cachePoints(requests[0])).toEqual(["system[0]", "messages[0][0]"]);
+  });
+
+  it("a conversation whose prefix stays under the model's threshold gets no point", async () => {
+    answering();
+    const provider = new AnthropicProvider("test-key");
+
+    await provider.call({
+      model: SONNET_46,
+      systemPrompt: "Be helpful.",
+      userContent: [{ kind: "text", text: "hi" }],
+      userMessage: "",
+      tools: [SMALL_TOOL],
+      history: [
+        {
+          kind: "assistant",
+          turn: {
+            provider: "anthropic",
+            content: [{ type: "tool_use", id: "toolu_1", name: "ping", input: {} }],
+          },
+        },
+        { kind: "tool_results", results: [{ name: "ping", result: "pong", id: "toolu_1" }] },
+      ],
+    });
+
+    expect(cachePoints(requests[0])).toEqual([]);
+  });
+
+  it("the point goes on a copy: a stored turn sent last keeps exactly the blocks it had", async () => {
+    answering();
+    const stored = [{ type: "text", text: "a stored answer" }];
+    const before = JSON.stringify(stored);
+    const provider = new AnthropicProvider("test-key");
+
+    await provider.call({
+      model: SONNET_46,
+      systemPrompt: BIG_SYSTEM,
+      userContent: [{ kind: "text", text: "hi" }],
+      userMessage: "",
+      history: [{ kind: "assistant", turn: { provider: "anthropic", content: stored } }],
+    });
+
+    expect(cachePoints(requests[0])).toEqual(["system[0]", "messages[1][0]"]);
+    expect(JSON.stringify(stored)).toBe(before);
+  });
+
+  it("a last block that is a thinking block takes no point: the API refuses one there", async () => {
+    answering();
+    const provider = new AnthropicProvider("test-key");
+
+    await provider.call({
+      model: SONNET_46,
+      systemPrompt: BIG_SYSTEM,
+      userContent: [{ kind: "text", text: "hi" }],
+      userMessage: "",
+      history: [
+        {
+          kind: "assistant",
+          turn: {
+            provider: "anthropic",
+            content: [{ type: "thinking", thinking: "still thinking", signature: "sig" }],
+          },
+        },
+      ],
+    });
+
+    expect(cachePoints(requests[0])).toEqual(["system[0]"]);
+  });
+
+  it("a document of several megabytes sent inline is never serialized for the estimate, and still counts toward the threshold", async () => {
+    answering();
+    const provider = new AnthropicProvider("test-key");
+    const bytes = new Uint8Array(4 * 1024 * 1024).fill(0x25);
+    const stringify = vi.spyOn(JSON, "stringify");
+    let longest = 0;
+    try {
+      await provider.call({
+        model: SONNET_46,
+        systemPrompt: "Be helpful.",
+        userContent: [
+          { kind: "text", text: "Summarize the document." },
+          { kind: "document", media_type: "application/pdf", bytes },
+        ],
+        userMessage: "",
+        tools: [SMALL_TOOL],
+      });
+      for (const result of stringify.mock.results) {
+        if (typeof result.value === "string") longest = Math.max(longest, result.value.length);
+      }
+    } finally {
+      stringify.mockRestore();
+    }
+
+    // The document went inline, as base64 (over 5.5 million characters)...
+    const sentDocument = requests[0].messages[0].content[1] as SentBlock & {
+      source: { type: string; data: string };
+    };
+    expect(sentDocument.source.type).toBe("base64");
+    expect(sentDocument.source.data.length).toBeGreaterThan(5_500_000);
+    // ...no JSON string built during the call carried it...
+    expect(longest).toBeLessThan(64 * 1024);
+    // ...and it still counted: the small system prompt and tool alone are under
+    // the threshold, and the conversation point is placed, on the document.
+    expect(cachePoints(requests[0])).toEqual(["messages[0][1]"]);
+  });
+});
+
+describe("AnthropicProvider — the prefix estimate", () => {
+  /** The base64 of `n` bytes that vary, so no slice of one repeats another. */
+  function base64Of(n: number): string {
+    return Buffer.from(Uint8Array.from({ length: n }, (_, i) => (i * 7919) % 251)).toString(
+      "base64",
+    );
+  }
+  const IMAGE = base64Of(30_000);
+  const DOCUMENT = base64Of(100_001);
+
+  const PREFIXES: Array<[string, unknown]> = [
+    [
+      "a text prefix, with characters JSON escapes",
+      [
+        [
+          {
+            name: "lookup",
+            description: 'Look "a" value up\\\n\ttwice',
+            input_schema: { type: "object" },
+          },
+        ],
+        'a system prompt with a quote " and a backslash \\',
+        [{ role: "user", content: [{ type: "text", text: "hi\nthere \u0001" }] }],
+      ],
+    ],
+    [
+      "an inline image and an inline document",
+      [
+        undefined,
+        "system",
+        [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Compare them." },
+              { type: "image", source: { type: "base64", media_type: "image/png", data: IMAGE } },
+              {
+                type: "document",
+                source: { type: "base64", media_type: "application/pdf", data: DOCUMENT },
+              },
+            ],
+          },
+        ],
+      ],
+    ],
+    [
+      "a file sent by reference, and a document whose source is text",
+      [
+        undefined,
+        [{ type: "text", text: "system", cache_control: { type: "ephemeral" } }],
+        [
+          {
+            role: "user",
+            content: [
+              { type: "document", source: { type: "file", file_id: "file_witness" } },
+              {
+                type: "document",
+                source: { type: "text", media_type: "text/plain", data: 'plain "text"\n' },
+              },
+            ],
+          },
+        ],
+      ],
+    ],
+    [
+      "tool calls whose arguments look like an inline source, with characters JSON escapes",
+      [
+        undefined,
+        "system",
+        [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_1",
+                name: "store",
+                input: { type: "base64", data: 'line one\nline "two"\t\\' },
+              },
+              {
+                type: "tool_use",
+                id: "toolu_2",
+                name: "store",
+                input: {
+                  source: { type: "base64", media_type: "text/plain", data: 'a\tb\n"c"\\' },
+                },
+              },
+            ],
+          },
+        ],
+      ],
+    ],
+  ];
+
+  it.each(
+    PREFIXES,
+  )("%s: the length of the prefix serialized as JSON, divided by 4 — what it always was", (_label, prefix) => {
+    expect(estimatePrefixTokens(prefix)).toBe(Math.ceil(JSON.stringify(prefix).length / 4));
+  });
+
+  it("an inline file's base64 never reaches a JSON string", () => {
+    const stringify = vi.spyOn(JSON, "stringify");
+    const outputs: string[] = [];
+    try {
+      estimatePrefixTokens(PREFIXES[1][1]);
+      for (const result of stringify.mock.results) {
+        if (typeof result.value === "string") outputs.push(result.value);
+      }
+    } finally {
+      stringify.mockRestore();
+    }
+
+    for (const output of outputs) {
+      expect(output.includes(IMAGE.slice(1_000, 1_064))).toBe(false);
+      expect(output.includes(DOCUMENT.slice(1_000, 1_064))).toBe(false);
+    }
   });
 });

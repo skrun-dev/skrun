@@ -59,7 +59,8 @@ function clientKey(c: Context, trustProxy: boolean, trustedHeader?: string): str
  * env-selected `make` factory — see `ratelimit/select.ts`. `name` is the
  * mount's counter namespace: two mounts with the same window but different
  * names never share a counter on the shared store. Emits the same 429 +
- * `X-RateLimit-*` contract as the original in-memory limiter.
+ * `X-RateLimit-*` contract as the original in-memory limiter, and a refusal's
+ * `Retry-After`: the seconds until `X-RateLimit-Reset`, never negative.
  */
 export function rateLimiter(opts: {
   name: string;
@@ -81,6 +82,11 @@ export function rateLimiter(opts: {
     c.header("X-RateLimit-Reset", String(result.resetSeconds));
 
     if (!result.success) {
+      // The seconds until the window resets, as X-RateLimit-Reset counts them: never negative.
+      c.header(
+        "Retry-After",
+        String(Math.max(0, result.resetSeconds - Math.floor(Date.now() / 1000))),
+      );
       return c.json(
         {
           error: {

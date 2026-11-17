@@ -1,17 +1,16 @@
 // Per-ecosystem script-dependency installers.
 //
-// Phase 4 split:
-//   - 4.1: error type + allowlist constants only (commit `28acdeb`).
-//   - 4.2 (this commit): Python pip flow (requirements.txt + pyproject without lockfile).
-//   - 4.3: Python uv + poetry flows (real reproducible install via lockfiles).
-//   - 4.4: Node npm / pnpm / yarn flows.
+// One installer per ecosystem an agent's scripts can declare. Python: `pip`
+// for a requirements.txt, or for a pyproject.toml without a lockfile; `uv` or
+// `poetry` for a pyproject.toml locked by them, a reproducible install. Node:
+// `npm`, `pnpm` or `yarn`, chosen by the lockfile — `npm` without one.
 //
 // All installers spawn the underlying tool with hardcoded registry env vars
 // to confine network access to public package registries. The allowlist is
 // not user-configurable in v1 — it is the security perimeter of the install
 // stage.
 
-import { execFile } from "node:child_process";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ManifestInfo } from "@skrun-dev/schema";
@@ -23,11 +22,13 @@ const log = createLogger("runtime:deps");
 /**
  * Public package registries permitted during script-dependency install.
  *
- * Enforced by setting `PIP_INDEX_URL`, `npm_config_registry`, and
- * `YARN_NPM_REGISTRY_SERVER` in the spawn environment. Note: this is
- * best-effort confinement at the env-var level, not OS-level network
- * isolation — true sandboxing arrives with the future cloud container image
- * (iptables-derived rules from `allowed_hosts`).
+ * Passed to the installers as `PIP_INDEX_URL`, `npm_config_registry` and
+ * `YARN_NPM_REGISTRY_SERVER` in the spawn environment: where they fetch
+ * packages from, not a network boundary. On the local runtime nothing at the
+ * OS level confines an installer (nor a package's install script). In a cloud
+ * sandbox runner, the flyio adapter passes this list as infrastructure hosts:
+ * the sandbox's firewall keeps them reachable for the whole run, to every
+ * process, beside what the agent's `allowed_hosts` lets through.
  *
  * NOT user-configurable in v1 by design — operator-level overrides (private
  * registries / corporate proxies) are a future enhancement.
@@ -58,6 +59,16 @@ export interface CommandResult {
   exitCode: number | null;
 }
 
+export interface CommandOptions {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  /**
+   * Stops the command when aborted: the runner kills it together with every
+   * process it started, then resolves with what it printed until then.
+   */
+  signal?: AbortSignal;
+}
+
 /**
  * Runs an external command, capturing stdout/stderr and exit code without
  * throwing on non-zero exit. Spawn-failure (ENOENT, etc.) returns
@@ -67,62 +78,175 @@ export interface CommandResult {
 export type CommandRunner = (
   command: string,
   args: string[],
-  options: { cwd?: string; env?: NodeJS.ProcessEnv },
+  options: CommandOptions,
 ) => Promise<CommandResult>;
 
-/** Production runner — wraps `node:child_process.execFile`. */
+/**
+ * Kill a command and everything it started. An installer runs the install
+ * scripts of the packages it installs, and those start processes of their own:
+ * killing the installer alone would leave them running.
+ *
+ * On Windows the command runs under `cmd.exe` (see `shell` below), and
+ * `taskkill /T` takes the tree that shell started. Elsewhere the command leads
+ * its own process group (`detached` below), and the whole group is killed. A
+ * process that leaves the group on purpose escapes it.
+ */
+function killProcessTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid === undefined) return; // never started
+  if (process.platform === "win32") {
+    execFile("taskkill", ["/pid", String(pid), "/T", "/F"], () => {
+      // Best effort: a tree that already ended has nothing to kill.
+    });
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    // The group has already ended.
+  }
+}
+
+/**
+ * How much of each output stream a command may print — enough for noisy pip /
+ * npm output, far below memory pressure. Past it, the command is stopped and
+ * fails, as `maxBuffer` made it fail when this runner used `execFile`.
+ */
+const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Production runner. Built on `spawn` rather than `execFile`, which never
+ * passes `detached` on, so that its command can lead its own process group.
+ */
 export const execFileRunner: CommandRunner = (command, args, options) => {
   return new Promise((resolve) => {
-    execFile(
-      command,
-      args,
-      {
-        cwd: options.cwd,
-        env: options.env,
-        // Windows-safe spawn: `npm`/`pnpm`/`yarn` are `.cmd` shell
-        // scripts. `execFile` cannot run them directly — both because it
-        // doesn't consult PATHEXT (ENOENT on bare `npm`) and because Node's
-        // CVE-2024-27980 fix blocks direct `.cmd` spawn with EINVAL. Setting
-        // `shell: true` on Windows lets cmd.exe resolve the name via PATHEXT
-        // and invoke the `.cmd` wrapper. This is Node's officially recommended
-        // approach for `.bat`/`.cmd` invocation.
-        //
-        // DEP0190 note: passing `args` separately when `shell: true` triggers
-        // a deprecation warning (args concatenated without escaping = shell
-        // injection risk for untrusted args). Safe here because all args are
-        // generated by Skrun (path templates with [a-zA-Z0-9/_.-] only —
-        // hash + pid + hex random), never user-influenced. We accept the
-        // warning to keep the simple {command, args} API surface.
-        shell: process.platform === "win32",
-        // Buffers up to 10 MB of combined stdout/stderr — enough for noisy
-        // pip / npm output, far below memory pressure.
-        maxBuffer: 10 * 1024 * 1024,
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          // ENOENT / spawn failure: exitCode is undefined on the error object.
-          // For real non-zero exits, error.code is the numeric exit code.
-          const code = (error as NodeJS.ErrnoException).code;
-          if (code === "ENOENT") {
-            resolve({ stdout: stdout.toString(), stderr: stderr.toString(), exitCode: null });
-            return;
-          }
-          // Otherwise, the process ran and exited non-zero. Node sets
-          // `error.code` to the numeric exit code (sometimes a string).
-          const numericCode =
-            typeof code === "number" ? code : Number.parseInt(String(code ?? "1"), 10);
-          resolve({
-            stdout: stdout.toString(),
-            stderr: stderr.toString(),
-            exitCode: Number.isFinite(numericCode) ? numericCode : 1,
-          });
-        } else {
-          resolve({ stdout: stdout.toString(), stderr: stderr.toString(), exitCode: 0 });
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env,
+      // Its own process group, outside Windows, so that a stopped command is
+      // killed with every process it started (killProcessTree above). On
+      // Windows, `detached` would open a console window instead, and
+      // `taskkill /T` finds the tree without it.
+      detached: process.platform !== "win32",
+      // Windows-safe spawn: `npm`/`pnpm`/`yarn` are `.cmd` shell
+      // scripts. Node cannot run them directly — both because it
+      // doesn't consult PATHEXT (ENOENT on bare `npm`) and because Node's
+      // CVE-2024-27980 fix blocks direct `.cmd` spawn with EINVAL. Setting
+      // `shell: true` on Windows lets cmd.exe resolve the name via PATHEXT
+      // and invoke the `.cmd` wrapper. This is Node's officially recommended
+      // approach for `.bat`/`.cmd` invocation.
+      //
+      // DEP0190 note: passing `args` separately when `shell: true` triggers
+      // a deprecation warning (args concatenated without escaping = shell
+      // injection risk for untrusted args). Safe here because all args are
+      // generated by Skrun (path templates with [a-zA-Z0-9/_.-] only —
+      // hash + pid + hex random), never user-influenced. We accept the
+      // warning to keep the simple {command, args} API surface.
+      shell: process.platform === "win32",
+    });
+
+    const printed = { stdout: [] as Buffer[], stderr: [] as Buffer[] };
+    let overflowed = false;
+    for (const name of ["stdout", "stderr"] as const) {
+      let bytes = 0;
+      child[name]?.on("data", (chunk: Buffer) => {
+        if (overflowed) return;
+        bytes += chunk.length;
+        if (bytes > MAX_OUTPUT_BYTES) {
+          overflowed = true;
+          killProcessTree(child);
+          return;
         }
-      },
-    );
+        printed[name].push(chunk);
+      });
+    }
+
+    let settled = false;
+    function finish(exitCode: number | null): void {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener("abort", stop);
+      resolve({
+        stdout: Buffer.concat(printed.stdout).toString(),
+        stderr: Buffer.concat(printed.stderr).toString(),
+        exitCode,
+      });
+    }
+    function stop(): void {
+      killProcessTree(child);
+    }
+
+    // A command that could not be started (ENOENT) has no exit code; any other
+    // start failure counts as a failed run.
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      finish(error.code === "ENOENT" ? null : 1);
+    });
+    // Ended by a signal — stopped, or past its output limit — it has no exit
+    // code: it counts as failed.
+    child.on("close", (code) => {
+      finish(overflowed ? 1 : (code ?? 1));
+    });
+
+    if (options.signal?.aborted) stop();
+    else options.signal?.addEventListener("abort", stop, { once: true });
   });
 };
+
+/** How long a stopped command is given to hand back what it printed. */
+const STOPPED_OUTPUT_WAIT_MS = 2_000;
+
+/**
+ * A runner whose commands share one deadline, `limitMs` from now: each command
+ * gets the time left. One still running when the time is spent is stopped —
+ * through its signal, so the runner kills it with what it started — and the
+ * install fails with a `ScriptDepsInstallError` that names the limit; a command
+ * that would start after it does not start. What the stopped command printed
+ * is kept when the runner hands it back within `STOPPED_OUTPUT_WAIT_MS`.
+ *
+ * Internal: neither of the package's entry points exports it. The resolver
+ * gives every install `SCRIPT_DEPS_INSTALL_TIMEOUT_MS`; its tests call this
+ * function directly, on a limit of milliseconds.
+ */
+export function withInstallDeadline(
+  runner: CommandRunner,
+  ecosystem: "node" | "python",
+  limitMs: number,
+): CommandRunner {
+  const deadline = Date.now() + limitMs;
+  return async (command, args, options) => {
+    const commandLine = [command, ...args].join(" ");
+    const timedOut = (printed: CommandResult | null) =>
+      new ScriptDepsInstallError({
+        ecosystem,
+        command: commandLine,
+        exitCode: null,
+        stderr: printed ? printed.stderr || printed.stdout : "",
+        timeoutMs: limitMs,
+      });
+    const left = deadline - Date.now();
+    if (left <= 0) throw timedOut(null);
+
+    const controller = new AbortController();
+    const running = runner(command, args, { ...options, signal: controller.signal });
+    const finished = await settledWithin(running, left);
+    if (finished !== null) return finished;
+    controller.abort();
+    throw timedOut(await settledWithin(running, STOPPED_OUTPUT_WAIT_MS).catch(() => null));
+  };
+}
+
+/** `promise`'s value if it settles within `ms`, else null; its rejection passes through. */
+async function settledWithin<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  try {
+    return await Promise.race([promise, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /**
  * Cross-platform Python alias.
@@ -156,11 +280,18 @@ function venvBinaryPath(depsPath: string, name: string): string {
  * Installers need a wide OS env (PATH, HOME, proxies, CA bundles), so we
  * DENYLIST secret-shaped names rather than allowlist. The `_KEY_ID$` /
  * `ACCESS_KEY` arms catch S3 access-key IDs that a suffix-only `_KEY` check misses.
+ * `BUNDLE_URL` and `OUTPUTS_PUT_URL` are the presigned URLs an earlier harness
+ * put in a sandbox runner's environment — this one sends them in the body of
+ * `/init` only, but a runner of this image may still meet one that does: their
+ * names say nothing of a secret, their query carries the signature that opens
+ * the run's objects.
  */
 const INSTALL_SECRET_DENYLIST = new Set([
   "SKRUN_SECRETS_ENCRYPTION_KEY",
   "WEBHOOK_SIGNING_KEY",
   "DATABASE_URL",
+  "BUNDLE_URL",
+  "OUTPUTS_PUT_URL",
 ]);
 const INSTALL_SECRET_PATTERN =
   /(SECRET|TOKEN|PASSWORD|PASSPHRASE|CREDENTIAL|ENCRYPTION|ACCESS_KEY|_KEY$|_KEY_ID$)/i;
@@ -343,6 +474,10 @@ function nodeInstallEnv(forYarn: boolean): NodeJS.ProcessEnv {
     npm_config_registry: NPM_REGISTRY_URL,
     // yarn (classic v1 + Berry) reads YARN_NPM_REGISTRY_SERVER for npm-protocol fetches.
     ...(forYarn && { YARN_NPM_REGISTRY_SERVER: YARN_REGISTRY_URL }),
+    // No check for a newer npm: nothing in a sandbox can act on that notice, the check is one
+    // more request per install, and npm prints the notice only when its check wins a race
+    // against its own exit, so a failed install's output would vary from one run to the next.
+    npm_config_update_notifier: "false",
   };
 }
 

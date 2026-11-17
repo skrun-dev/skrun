@@ -4,15 +4,15 @@
 
 **Do not open a public issue.**
 
-Email: **contact@skrun.sh**
+Report it privately through GitHub: **[Report a vulnerability](https://github.com/skrun-dev/skrun/security/advisories/new)**.
+If you cannot use GitHub, email **contact@skrun.sh**.
 
-You will receive an acknowledgment within **48 hours**. We will provide a timeline for a fix within **5 business days**.
+Reports are handled on a best-effort basis: we aim to acknowledge a report within **5 business days**,
+keep you informed while we work on a fix, and agree on a disclosure date with you.
 
 ## Supported Versions
 
-| Version | Supported |
-|---------|-----------|
-| 0.x     | Yes       |
+Security fixes are released for the latest published version only.
 
 ## Scope
 

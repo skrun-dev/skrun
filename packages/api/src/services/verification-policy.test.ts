@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
+import type { KeyContext, UserContext } from "../types.js";
 import {
   canSetVerified,
   isRunGatedByVerification,
   readVerificationPolicy,
+  VERIFICATION_POLICIES,
   type VerificationPolicy,
   verificationKind,
 } from "./verification-policy.js";
@@ -49,13 +51,14 @@ describe("isRunGatedByVerification (VT-2)", () => {
 });
 
 describe("canSetVerified (VT-3)", () => {
-  const owner = { id: "u-owner", role: "user" as const };
-  const stranger = { id: "u-stranger", role: "user" as const };
-  const admin = { id: "u-admin", role: "admin" as const };
+  type Who = Pick<UserContext, "id" | "role" | "key">;
+  const owner: Who = { id: "u-owner", role: "user", key: null };
+  const stranger: Who = { id: "u-stranger", role: "user", key: null };
+  const admin: Who = { id: "u-admin", role: "admin", key: null };
   const agent = { owner_id: "u-owner" };
 
   // [policy, user, expected]
-  const cases: Array<[VerificationPolicy, typeof owner, boolean]> = [
+  const cases: Array<[VerificationPolicy, Who, boolean]> = [
     // admin policy: admin-only
     ["admin", admin, true],
     ["admin", owner, false],
@@ -75,14 +78,54 @@ describe("canSetVerified (VT-3)", () => {
       expect(canSetVerified(policy, user, agent)).toBe(expected);
     });
   }
+
+  // The administrator's authority is carried by a master credential, never by
+  // the role alone: a key the administrator reduced or delegated is held to the
+  // policy like the same key of any other account.
+  const reduced: KeyContext = {
+    id: "k-reduced",
+    scope_kind: "account",
+    operations: ["agent:verify"],
+    agent_ids: [],
+  };
+  const delegated: KeyContext = {
+    id: "k-delegated",
+    scope_kind: "agents",
+    operations: ["agent:run", "agent:push", "agent:verify"],
+    agent_ids: ["a-1"],
+  };
+  for (const key of [reduced, delegated]) {
+    it(`an administrator's ${key.scope_kind === "agents" ? "delegated" : "reduced"} key cannot attest another account's agent under any policy`, () => {
+      for (const policy of VERIFICATION_POLICIES) {
+        expect(canSetVerified(policy, { ...admin, key }, agent)).toBe(false);
+      }
+    });
+  }
+  it("an administrator's account-wide key with every operation still attests under the admin policy", () => {
+    const full: KeyContext = {
+      ...reduced,
+      operations: ["agent:run", "agent:push", "agent:verify"],
+    };
+    expect(canSetVerified("admin", { ...admin, key: full }, agent)).toBe(true);
+  });
 });
 
 describe("verificationKind (tie-break: admin wins)", () => {
   it("returns admin for an instance admin (even if they own the agent)", () => {
-    expect(verificationKind({ role: "admin" })).toBe("admin");
+    expect(verificationKind({ role: "admin", key: null })).toBe("admin");
   });
 
   it("returns owner_self for a non-admin (necessarily the owner)", () => {
-    expect(verificationKind({ role: "user" })).toBe("owner_self");
+    expect(verificationKind({ role: "user", key: null })).toBe("owner_self");
+  });
+
+  it("returns owner_self for an administrator attesting through a reduced key", () => {
+    const reduced: KeyContext = {
+      id: "k",
+      scope_kind: "account",
+      operations: ["agent:verify"],
+      agent_ids: [],
+    };
+    expect(verificationKind({ role: "admin", key: reduced })).toBe("owner_self");
   });
 });

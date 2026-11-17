@@ -9,7 +9,7 @@ The vocabulary you'll see throughout Skrun — in the CLI, the dashboard, the AP
 
 ## Agent
 
-An **Agent** is a deployable AI unit — the thing you build, push, and run on Skrun. It wraps a [skill](#skill) with all the runtime configuration it needs to be callable: which LLM to use (with optional fallback), which tools and MCP servers to expose, typed inputs and outputs, execution environment (networking, timeout, sandbox), and tests.
+An **Agent** is a deployable AI unit — the thing you build, push, and run on Skrun. It wraps a [skill](#skill) with all the runtime configuration it needs to be callable: which LLM to use (with optional fallback), which tools and MCP servers to expose, typed inputs and outputs, execution environment (networking, timeout, cost cap), and tests.
 
 An agent lives in a directory with three core files: `SKILL.md` (the instructions the LLM reads), [`agent.yaml`](./agent-yaml.md) (the runtime config), and optionally a `scripts/` directory with local tools. You build it into a [bundle](#bundle) with `skrun build` and push it to a registry with `skrun push`. Once pushed, it becomes callable via `POST /api/agents/<namespace>/<name>/run`.
 
@@ -35,6 +35,8 @@ Bundles are immutable once pushed. Each [version](#version) is a distinct bundle
 
 `skrun build` excludes dev-only directories from the tar: `node_modules/`, `venv/`, `.venv/`, `__pycache__/`, `.pytest_cache/`, `.git/`, `dist/`, `.env`. Only the manifest travels in the bundle; deps are resolved at runtime (see [Script dependencies](#script-dependencies)).
 
+**Size.** A server bounds a bundle twice at push: what it weighs compressed (`SKRUN_PUSH_MAX_BODY_MB`) and what it unpacks to — its tar stream, tar headers included, so many small files count for more than their bytes (`BUNDLE_MAX_DECOMPRESSED_MB`); 50 MB each by default. `skrun build` prints both sizes and warns past either default; the server you push to decides (see [`skrun build`](cli.md#skrun-build)). Its `agent.yaml` may weigh at most 128 KB, on every server: it holds the agent's configuration, and long content belongs in `SKILL.md`, `AGENTS.md` or other files (see [agent.yaml](agent-yaml.md)).
+
 **Where you see it**: `skrun build` output (`my-agent-1.0.0.agent` file), the registry's bundle storage, `GET /api/agents/<ns>/<name>/pull`.
 
 ---
@@ -46,7 +48,7 @@ A **Namespace** identifies who published an agent in the registry. It is the **o
 **Two halves of the identity:**
 
 - **Slug** — the artefact identifier, owned by the author. Declared in `agent.yaml`'s `name` field (slug only, no slash). The author picks it; it travels with the bundle. Same convention as `npm`'s package `name`, Docker image's `name`, or a Cargo crate's `name`.
-- **Namespace** — the registry scope, assigned at push time from your auth context. Never written in `agent.yaml`. In local dev with `dev-token` it is always `dev`. In OAuth mode (cloud or self-host) it's your GitHub username.
+- **Namespace** — the registry scope, assigned at push time from your auth context. Never written in `agent.yaml`. In local dev with `dev-token` it is always `dev`. In OAuth mode (cloud or self-host) it's your GitHub login in lowercase by default (`<login>--2`, `--3`… if it is taken), fixed when your account is created and never changed afterwards.
 
 This split keeps the bundle portable: the same `.agent` file pushed under two namespaces produces two distinct registry entries (`alice/seo-audit` and `bob/seo-audit`) without re-editing the yaml.
 
@@ -58,7 +60,7 @@ This split keeps the bundle portable: the same `.agent` file pushed under two na
 
 ## Version
 
-A **Version** is an immutable semver-tagged snapshot of an agent's [bundle](#bundle). Every `skrun push` creates a new version. Pushing the same version twice returns `409 CONFLICT` — bump the version in `agent.yaml` to re-push.
+A **Version** is an immutable semver-tagged snapshot of an agent's [bundle](#bundle). Every `skrun push` creates a new version. Pushing the same version twice returns `409 VERSION_EXISTS` — bump the version in `agent.yaml` to re-push.
 
 Each version carries its own `config_snapshot` (the parsed `agent.yaml` at push time) and an optional **note** — a short plain-text message (max 500 chars) attached via `skrun push -m "Added retry logic"`. Notes work like git commit messages: they describe what changed. They're visible in the dashboard next to each version and returned by `GET /api/agents/<ns>/<name>/versions`.
 
@@ -80,17 +82,17 @@ Runs are persisted in the database — they don't disappear after the HTTP respo
 
 ### Run artifacts (files)
 
-An agent can produce **file artifacts** alongside its JSON output — a rendered PDF, a generated audio file, a built `kb.zip`, etc. Two ways: (a) call the built-in `write_artifact` tool, or (b) write directly into the path exposed via the `SKRUN_OUTPUT_DIR` environment variable from a tool script. The runtime scans that directory at the end of the run and surfaces every file under `run_complete.files[]` and on the persisted run row.
+An agent can produce **file artifacts** alongside its JSON output — a rendered PDF, a generated audio file, a built `kb.zip`, etc. Two ways: (a) call the built-in `write_artifact` tool, or (b) write directly into the path exposed via the `SKRUN_OUTPUT_DIR` environment variable from a tool script. The runtime scans that directory at the end of the run and surfaces the files within the run's limits — by default 20 files of at most 10 MiB each, see [Output files](api.md#output-files) — under `run_complete.files[]` and on the persisted run row; `run_complete.files_excluded` tells the caller how many it left out, and why, without naming them.
 
-Each file in the response carries `{name, size, file_id, url}`. The `file_id` is the canonical reference into the unified files namespace and can be fetched via `GET /api/files/<id>/content` with normal auth. The dashboard renders the produced files as a **Files block** with download buttons under the agent's Output, both in the playground (live) and on the run-detail page (after persistence). Files are scoped to the run's owner — only the calling user (or an admin) can download them.
+Each file in the response carries `{name, size, url}` — plus, on the `local` runtime, a `file_id`: the canonical reference into the unified files namespace, fetched via `GET /api/files/<id>/content` with normal auth. The dashboard renders the produced files as a **Files block** with download buttons under the agent's Output, both in the playground (live) and on the run-detail page (after persistence). Files are scoped to the run's owner: through the API, no one else can download them, an admin included — and within the account, a key without full access (see [API-key scopes](#api-key-scopes)) downloads only the files of the runs it launched. On the cloud runtime, `url` is a presigned link that works for whoever holds it until it expires (about 15 minutes); the owner can ask for a fresh one while the run's files are kept ([`GET /api/runs/:run_id/files/:filename/link`](api.md#get-apirunsrun_idfilesfilenamelink--a-fresh-download-link)).
 
 ---
 
 ## Environment
 
-The **Environment** describes *how* and *where* an agent runs — separate from *what* the agent does. It's a section of `agent.yaml` covering networking (`allowed_hosts`), filesystem access (`none` / `read-only` / `read-write`), required secrets, execution timeout, max cost cap, and sandbox mode.
+The **Environment** describes *how* and *where* an agent runs — separate from *what* the agent does. It's a section of `agent.yaml` covering networking (`allowed_hosts`), execution timeout, and max cost cap.
 
-This separation means the same agent logic can run in different environments (dev vs prod) without changing the agent itself. Callers can also override specific environment fields per-run via the POST /run body — e.g., raising the timeout for a particular call.
+This separation means the same agent logic can run in different environments (dev vs prod) without changing the agent itself. The agent's owner — or an administrator —, on a full-access credential, can also override specific environment fields per run via the POST /run body — e.g., raising the timeout for a particular call.
 
 **Where you see it**: `agent.yaml` `environment:` section, [`agent-yaml.md`](./agent-yaml.md#environment-optional), POST /run body `environment` override, dashboard agent-detail metadata.
 
@@ -98,37 +100,44 @@ This separation means the same agent logic can run in different environments (de
 
 ## State
 
-**State** is a key-value store scoped to an agent, persisted across runs. An agent can emit `_state` in its output to write; subsequent runs for the same agent receive the state as context. This is what makes a stateful agent — it accumulates context over time (e.g., SEO audit comparing scores week over week, onboarding agent remembering questions already asked).
+**State** is a key-value notebook an agent keeps across runs. An agent can emit `_state` — a JSON object, nested at most 100 levels deep — in its output to write; the next run that reads the same notebook receives it as context. Only a run that succeeds writes it: a run that fails — over its `max_cost`, its output or its `_state` refused, its output files not saved — leaves the notebook as it was, and after an output repair the state kept is the one the repaired answer carries, or the first answer's if it carries none. This is what makes a stateful agent — it accumulates context over time (e.g., SEO audit comparing scores week over week, onboarding agent remembering questions already asked).
 
-> ⚠️ **One agent, one state — shared by every caller.** A single row per agent, keyed on the agent name; no partition by caller. If more than one party can run the agent, they all read and write the same state, and what one run stores is replayed into the next caller's prompt. Namespacing inside the state does not help — the whole object is injected on every run. Where callers must not see each other's data: `type: none`, or a separate agent per caller.
+State is off unless the agent asks for it: `state: { type: kv }` turns it on (`ttl` defaults to `30d`, `scope` to `per_caller`). Without a `state:` block, or with `type: none`, the agent keeps nothing and its prompt asks for no `_state`. The storage backend follows the DbAdapter: in-memory (tests), SQLite (local dev), any standard Postgres ≥ 14 (production).
 
-State is enabled via `agent.yaml` `state: { type: kv, ttl: 30d }`. Set `type: none` to disable. The storage backend follows the DbAdapter: in-memory (tests), SQLite (local dev), any standard Postgres ≥ 14 (production).
+**One notebook per caller, by default** (`scope: per_caller`). Each caller of an agent reads and writes only its own notebook. The caller is derived from the credential the run is made with, never from the request — no header or body field can pick another caller's notebook:
 
-> ⚠️ **`ttl` is declared but not enforced yet.** The field is parsed and validated, but nothing expires state on that schedule — KV state persists until the agent is deleted (the row cascades with it). Do not rely on `ttl` to age out sensitive data: use `type: none` for an agent that should hold none, or clear keys explicitly from the agent itself.
+- the account's own credentials — a dashboard session, `dev-token`, an account-wide key with every operation (the kind `skrun login` makes) — share **the account's** notebook;
+- any other key — a run-only key, a key restricted to some agents — has **a notebook of its own**.
 
-**Where you see it**: `agent.yaml` `state:` section, agent output `_state` field, `GET /api/agents/<ns>/<name>/state` (dashboard).
+`scope: shared` gives the agent one notebook that every caller reads and writes: what one caller stores is replayed into the next caller's prompt, and namespacing inside the state does not help — the whole object is injected on every run. Use it only when every caller may see what every other caller left. `scope` needs a Skrun server ≥ 2.0.0: an earlier server ignores it and shares one notebook per agent.
+
+**Deleted with what it belongs to.** Every notebook of an agent is deleted with the agent — an agent deleted and published again under the same name starts empty; a new version of the same agent keeps its notebooks. A caller's notebook is also deleted with the key it was written under (revoking a client's key deletes that client's notebooks; a replacement key starts empty). Deleting an account (`DELETE /api/account`, or an administrator's `DELETE /api/admin/accounts/:id`) deletes the notebooks written under that account and under its keys, and those of its agents — on every backend; a user row deleted from the database by hand does the same on Postgres and SQLite. A `shared` notebook belongs to no caller: it goes with the agent. No API route reads or clears a notebook.
+
+**Kept for `ttl` after its last write.** A notebook lives `ttl` (default `30d`, from `1d` to `365d`) after the last run that wrote it; a run that only reads it does not extend it. Past that deadline it reads as absent, and the server deletes it — a sweep runs at startup, then every hour, on every instance; a server that was stopped at the deadline deletes it when it starts again. Validation (`skrun build`, `skrun push`…) refuses a `ttl` outside that range; a version published with one anyway — before 2.0.0, or straight through the API, whose push checks the schema and the settings it refuses by name but not this range — runs with the nearest bound. For an agent that should hold no data at all, use `type: none`.
+
+**Where you see it**: `agent.yaml` `state:` section, agent output `_state` field.
 
 ---
 
 ## Verification
 
-**Verification** is a **per-version** flag, governed by the operator **verification policy**, that controls whether a version of an agent can be invoked via `POST /run`. Under the default policy an unverified version returns `403 AGENT_NOT_VERIFIED` from the runtime — no LLM call, no MCP connection, no DB write happens for an unapproved version. The verified flag lets an operator vet what runs in their Skrun before any caller can use it.
+**Verification** is a **per-version** flag, governed by the operator **verification policy**, that controls whether a version of an agent can be invoked via `POST /run`. Under the default policy an unverified version returns `403 AGENT_NOT_VERIFIED` from the runtime — no LLM call, no MCP connection, no script, no DB write happens for an unapproved version. The verified flag lets an operator vet what runs in their Skrun before any caller can use it. It never filters *what* a run does: a version that may run, runs whole, scripts included.
 
-Verification is per version, not per agent. Pushing a new version is a pure INSERT — it never touches the verified state of any existing version. A caller pinning `version: "1.0.0"` keeps running even if the author pushes a not-yet-verified v1.1.0 (the new version is what's blocked, not the old one). Without a version pin, `POST /run` resolves to the most recently pushed version; if that one is unverified, the call gets 403 — pin an older verified version to keep running.
+Verification is per version, not per agent. Pushing a new version is a pure INSERT — it never touches the verified state of any existing version. Under the default policy, a caller pinning `version: "1.0.0"` keeps running even if the author pushes a not-yet-verified v1.1.0 (the new version is what's blocked, not the old one). Without a version pin, `POST /run` resolves to the most recently pushed version; if that one is unverified, the call gets 403 — pin an older verified version to keep running.
 
 **Who may flip the flag — and whether it gates runs at all — is the operator's choice**, via `SKRUN_VERIFICATION_POLICY` (default `admin`):
 
-- **`admin`** — only an instance admin may attest a version, and an unverified version cannot run (the legacy behavior). Promotion to admin is a manual SQL update on the `users` table (no API for elevation by design).
-- **`owner`** — the agent **owner** is the trust authority for their own agents: they (or an admin) may attest, and a private agent runs without the verification gate (the owner's responsibility plus sandbox isolation cover safety). Suited to multi-tenant hosting where one operator can't vet everyone's agents.
-- **`disabled`** — verification never gates a run; the flag is inert metadata.
+- **`admin`** — only an instance admin may attest a version, and an unverified version cannot run (the legacy behavior). Promotion to admin is a manual SQL update on the `users` table (no API for elevation by design) — see [Admin role](./self-hosting.md#admin-role) in the self-hosting guide.
+- **`owner`** — the agent **owner** is the trust authority for their own agents: they (or an admin) may attest, and a private agent runs without the verification gate, scripts included (the owner's responsibility covers safety, plus, on the cloud runtime, the run's own sandbox machine — on the `local` runtime, scripts run as child processes of the API server). Suited to multi-tenant hosting where one operator can't vet everyone's agents.
+- **`disabled`** — verification never gates a run; every version runs, scripts included, and the flag is inert metadata.
 
-The local `dev-token` (when `SKRUN_DEV_AUTH` is enabled — `pnpm dev:registry` does this) is mapped to admin automatically so single-user self-host flows just work. New pushes always start at `verified=false`. Every verify and unverify call writes a structured pino log entry (`event: "agent_version_verify"`) carrying the actor identity, target version, action, and `kind` (`admin` or `owner_self`) — the forensic trail for any future audit-log UI.
+The local `dev-token` (when `SKRUN_DEV_AUTH` is enabled — `pnpm dev:registry` does this) is mapped to admin automatically so single-user self-host flows just work. New pushes always start at `verified=false`. Every verify and unverify call writes a structured pino log entry (`event: "agent_version_verify"`) carrying the actor identity, target version, action, and `kind` (`admin` or `owner_self`) — the forensic trail for any future audit-log UI (see [Verification policy](./self-hosting.md#verification-policy) in the self-hosting guide).
 
 **Where you see it**:
-- API: `PATCH /api/agents/<ns>/<name>/versions/<version>/verify`, `POST /run` returns 403 with `code: "AGENT_NOT_VERIFIED"` for unverified versions.
+- API: `PATCH /api/agents/<ns>/<name>/versions/<version>/verify`; under the `admin` policy, `POST /run` returns 403 with `code: "AGENT_NOT_VERIFIED"` for unverified versions.
 - CLI: `skrun verify <ns>/<name>@<version>` and `skrun unverify <ns>/<name>@<version>` (authority set by `SKRUN_VERIFICATION_POLICY`).
 - SDK: `client.verifyVersion(agent, version, verified)` and a typed `SkrunNotVerifiedError` consumers can catch.
-- Dashboard: per-row Status badges + Verify/Unverify buttons in the versions table on agent-detail; playground Run button disabled with an amber banner when the selected version is unverified.
+- Dashboard: per-row Status badges + Verify/Unverify buttons in the versions table on agent-detail; under the `admin` policy, the playground Run button is disabled with an amber banner when the selected version is unverified — under `owner` and `disabled` the server runs that version, and the button lets it.
 
 ---
 
@@ -137,15 +146,15 @@ The local `dev-token` (when `SKRUN_DEV_AUTH` is enabled — `pnpm dev:registry` 
 **Visibility** controls *who can call* an agent — a separate axis from verification (which controls *whether a version is approved to run at all*). Every agent has a `visibility` of `private` (the default) or `public`:
 
 - **`private`** — only the agent's owner (or an instance admin) can `POST /run`. Anyone else gets a `404` byte-identical to a genuinely-missing agent, so a private agent's very existence stays hidden.
-- **`public`** — any authenticated caller can `POST /run`. **Public is a marketplace capability; the set-path is disabled for now** — agents are **private-only** until the marketplace ships. The `visibility` column and the run-authorization branch are retained, so the capability reactivates without a migration.
+- **`public`** — any authenticated caller can `POST /run`. **Its set-path is disabled for now** — agents are **private-only**. The `visibility` column and the run-authorization branch are retained, so the capability reactivates without a migration.
 
-Authentication is always required — there is no anonymous run. The access credential (an `sk_live_…` key or a session) answers *who are you*; visibility answers *may you call this agent*. Both are distinct from the LLM key (`X-LLM-API-Key`), which only decides who pays for the inference.
+Authentication is always required — there is no anonymous run. The access credential (a `skrun_sk_…` key or a session) answers *who are you*; visibility answers *may you call this agent*. Both are distinct from the LLM key (`X-LLM-API-Key`), which only decides who pays for the inference.
 
 Visibility affects run-authorization **only**. A `public` agent is *runnable* by anyone authenticated, but its source bundle, metadata, and version list stay owner-only — you can execute a public agent, not download or inspect it. Public *discovery* (listing/search) is a separate, later capability.
 
 Because the agent's declared environment (e.g. `allowed_hosts`) is part of its safety contract, the per-run `environment` override is restricted to the owner/admin: a non-owner running a public agent who supplies an override gets `403 ENV_OVERRIDE_FORBIDDEN`. Runtime parameters belong in `input`, not in an environment override.
 
-- API: `PATCH /api/agents/<ns>/<name>/visibility` with `{ "visibility": "private" }` (namespace owner or admin). `"public"` is rejected with `400 PUBLIC_VISIBILITY_DISABLED` until the marketplace.
+- API: `PATCH /api/agents/<ns>/<name>/visibility` with `{ "visibility": "private" }` (namespace owner or admin). `"public"` is rejected with `400 PUBLIC_VISIBILITY_DISABLED` for now.
 - CLI: `skrun visibility <ns>/<name> private`.
 - SDK: `client.setVisibility(agent, "private")`.
 - Dashboard: a visibility badge on agent-detail (the public toggle is hidden while the set-path is disabled).
@@ -161,6 +170,8 @@ Running an agent needs an LLM API key. Skrun resolves one **per provider**, in o
 3. **Server key** — an instance-level `<PROVIDER>_API_KEY` env var. Self-host only; the hosted cloud sets none.
 
 If no tier has a key for the provider a model needs, the run errors. The model order (primary then fallback) is the agent author's choice — key availability never reorders it; each model independently resolves its provider's key through the chain above.
+
+**Your fallback may run on your key.** A key you attach for your fallback's provider also serves the runs whose caller brought a key for your primary model only: when their key fails — on purpose or not — and no tool has run yet, your fallback runs on yours. To prevent it, attach no key for that provider.
 
 A creator key is **write-only**: it is encrypted with `SKRUN_SECRETS_ENCRYPTION_KEY` before storage and never returned — reads expose only the provider and the last four characters.
 
@@ -179,7 +190,7 @@ Manage creator keys + the policy (namespace owner/admin, account-wide credential
 
 ## API-key scopes
 
-An `sk_live_…` key has **two scope axes**, both enforced. A session login and (in self-host) `dev-token` carry no key and are unrestricted "master" credentials.
+A `skrun_sk_…` key has **two scope axes**, both enforced. A session login and (in self-host) `dev-token` carry no key and are unrestricted "master" credentials.
 
 - **Operation** — what the key may *do*: `agent:run`, `agent:push`, `agent:verify`. A new key defaults to all three (a "full" key); a **run-only** key carries just `agent:run`.
 - **Resource** (`scope_kind`) — *which agents* the key may touch: `account` (the default — your whole account) or `agents` (restricted to specific agents you own).
@@ -192,6 +203,12 @@ skrun keys create --name client-acme --agent dev/my-agent --run-only
 ```
 
 That key can `POST /run` **only** `dev/my-agent` and nothing else: not your other agents (`403 KEY_SCOPE_FORBIDDEN`), not the source via `GET /pull`, not the version list, not your run history or stats, and it cannot mint or revoke keys. A resource-scoped key may read only the **metadata** of its in-scope agents (enough to know the inputs). Account-management actions (key CRUD, visibility, delete) require an account-wide *full* key — so a delegated or run-only key can never escalate to a broader one.
+
+**Reading takes full access.** Run history, run detail, usage stats, the account's usage against its quotas (`GET /api/usage`) and an agent's source are for a **full-access credential** — a session, `dev-token`, or an account-wide key with all three operations. Any other key is refused with `403 KEY_SCOPE_FORBIDDEN`: a delegated key, and an account-wide key with fewer operations too — a run-only key minted without `--agent`. That one still lists an agent's versions, each without its `config_snapshot` (the parsed configuration: model, tools, MCP servers). Files follow the caller, as state does: a full-access credential reads every upload and every run output of the account; any other key reads, deletes or passes as a run input only the files it uploaded, and downloads only the outputs of the runs it launched. Your runs are those of every key of your account, clients' included: only a full-access credential reads them all.
+
+**An admin's reach takes full access too.** What an instance admin may do beyond their own account — read, list and run any account's agents, override another agent's environment, verify any version — takes a full-access credential. An admin's run-only or delegated key answers as the same key of any other account would: another account's agent is the opaque `404`.
+
+**To a third party, hand a delegated key** — one restricted to the agents they need (`--agent`) — never an account-wide key with every operation. That key is your own credential: on a stateful agent it reads and writes **your** state notebook (see [State](#state)), and it already gives the whole account. A delegated key keeps a notebook of its own on each per-caller agent it runs, deleted when you revoke the key.
 
 Scopes are created from the dashboard (Settings → Create Key → **Access** + **Scope**) or `skrun keys create`; `skrun keys list` / `skrun keys revoke <id>` round out the group. Every run records the calling key (`runs.api_key_id`) so usage can be metered per key — i.e. per client.
 
@@ -209,15 +226,15 @@ Skrun supports 3 MCP transports: **stdio** (local, typically via `npx` for npm-p
 
 ## Script dependencies
 
-When your `scripts/` import third-party libraries, declare them in a standard manifest at the bundle root: `package.json` (Node), `requirements.txt` (Python), or `pyproject.toml` (Python, PEP 621). The runtime detects the manifest, installs the dependencies on the **first** call, and caches them at `~/.skrun/deps/<sha256>/` so every subsequent call hits the cache and skips the install entirely.
+When your `scripts/` import third-party libraries, declare them in a standard manifest at the bundle root: `package.json` (Node), `requirements.txt` (Python), or `pyproject.toml` (Python, PEP 621). The runtime detects the manifest and installs the dependencies where your scripts run. On a server that runs them itself (the `local` runtime), the install happens on the **first** call and is cached at `~/.skrun/deps/<sha256>/`, so every subsequent call hits the cache and skips the install entirely. In the cloud sandbox, each run installs them as it starts, and keeps nothing for the next.
 
-The hash is computed from the manifest's CONTENT only — same manifest text on two different machines produces the same hash. This means container build layers and shared NFS mounts can cache resolved deps across pushes of the same agent without re-downloading.
+The hash is computed from the manifest's CONTENT only — same manifest text on two different machines produces the same hash, which lets a server's operator share one install across servers: see [Script dependency cache](./self-hosting.md#script-dependency-cache) in the self-hosting guide.
 
-Lockfiles are auto-detected and trigger reproducible installs: `pnpm-lock.yaml` / `yarn.lock` / `package-lock.json` for Node; `uv.lock` / `poetry.lock` for Python. Without a lockfile, the install resolves to the latest version satisfying each declared range and emits a "non-reproducible build" warning. **Add a lockfile to your bundle for stable, repeatable installs.**
+Lockfiles are auto-detected and trigger reproducible installs: `pnpm-lock.yaml` / `yarn.lock` / `package-lock.json` for Node (the cloud sandbox has `npm` only: lock with `package-lock.json` there); `uv.lock` / `poetry.lock` for Python. Without a lockfile, the install resolves to the latest version satisfying each declared range and emits a "non-reproducible build" warning. **Add a lockfile to your bundle for stable, repeatable installs.**
 
-The runtime separates two networks: install-time (limited to public registries `registry.npmjs.org`, `pypi.org`, etc.) and runtime (governed by your `environment.networking.allowed_hosts`). Your scripts only see the runtime network — they cannot reach pypi.org once installed.
+The installers are pointed at fixed public registries (`registry.npmjs.org`, `pypi.org`, …) — where they fetch packages from, not a separate network. On the `local` runtime, installers and scripts run as child processes of the server, and your `environment.networking.allowed_hosts` is only advisory for scripts. In the cloud sandbox, one firewall covers every process of the run: it enforces `allowed_hosts`, and keeps the package registries reachable for the whole run — to your scripts as to the installers.
 
-**Where you see it**: bundle root (the manifest itself), `~/.skrun/deps/` on the runtime host, [`skrun cache list`](cli.md#skrun-cache-list) for inspection, [`skrun cache clear`](cli.md#skrun-cache-clear) to free disk. Full reference: [agent-yaml.md → Script dependencies](agent-yaml.md#script-dependencies).
+**Where you see it**: bundle root (the manifest itself), `~/.skrun/deps/` on a server running the `local` runtime, `init_deps_ms` in a cloud run's `runner_spawned` event, [`skrun cache list`](cli.md#skrun-cache-list) for inspection, [`skrun cache clear`](cli.md#skrun-cache-clear) to free disk. Full reference: [agent-yaml.md → Script dependencies](agent-yaml.md#script-dependencies).
 
 ---
 
@@ -238,18 +255,18 @@ The orthogonal `parallel_tools: bool` controls whether the model may emit multip
 
 ## Cost & caching
 
-LLM providers bill input tokens at a higher rate than cached tokens — typically 90% off on Anthropic, OpenAI GPT-5.x, and Gemini 2.5+; 50% off on Groq's openai/gpt-oss-* family. When the runtime wires the provider's caching primitive correctly, every repeat of a stable prefix (system prompt + tool definitions + reference documents) is served from cache and billed at the cheaper rate. Skrun does this automatically across 5 of the 6 first-class providers:
+LLM providers bill input tokens at a higher rate than cached tokens — typically 90% off on Anthropic, OpenAI GPT-5.x, Gemini 2.5+ and Mistral; 50% off on Groq's openai/gpt-oss-* family. When the runtime wires the provider's caching primitive correctly, every repeat of a stable prefix (system prompt + tool definitions + reference documents) is served from cache and billed at the cheaper rate. Skrun does this automatically across the 6 first-class providers:
 
-- **Anthropic** — explicit `cache_control: { type: "ephemeral" }` injected on the last block of the `tools` array AND the last block of the `system` block, but ONLY when each prefix's own token count exceeds the model threshold (1k-4k tokens depending on the model). Default TTL is 5 minutes — cache survives idle periods of less than 5 min within the same workspace.
-- **OpenAI** (Chat Completions + Responses API) — passes a stable `prompt_cache_key` body field derived from `${agent.name}@${agent.version}+default`, hashed with SHA-256. Caching is automatic past 1024-token prefixes. Same agent + same version share the cache pool across runs.
+- **Anthropic** — explicit `cache_control: { type: "ephemeral" }` injected on the last block of the `tools` array AND the last block of the `system` block, but ONLY when each prefix's own token count exceeds the model threshold (512 to 4,096 tokens depending on the model). When the request declares tools or continues a conversation — every turn of a tool loop does — a third point goes on the last block of the last message, once everything before it reaches the threshold, so the next turn reads the whole conversation so far from the cache. Default TTL is 5 minutes — cache survives idle periods of less than 5 min within the same workspace.
+- **OpenAI** (Chat Completions, the only OpenAI endpoint the runtime calls) — passes a stable `prompt_cache_key` body field derived from `${agent.name}@${agent.version}+default`, hashed with SHA-256. Caching is automatic past 1024-token prefixes. Same agent + same version share the cache pool across runs.
 - **Google Gemini** (2.5+ and 3.x) — implicit caching is on by default; the runtime parses `cachedContentTokenCount` from responses for accurate cost-tracking. Explicit Cache API (with hourly storage fee) is intentionally not wired — runtime backlog item.
 - **xAI Grok** — sets `x-grok-conv-id` HTTP header on Chat Completions requests for sticky-routing, mirroring OpenAI's `prompt_cache_key` semantics.
-- **Groq** — implicit on the `openai/gpt-oss-*` family + `kimi-k2-instruct` only; Llama / Qwen / compound models do not yet expose caching.
-- **Mistral** — no native caching API as of May 2026; the runtime emits a structured `cache_skipped` log and proceeds without cache primitives.
+- **Groq** — implicit on the `openai/gpt-oss-*` family only, the Groq models the capability matrix lists; Groq caches no other model yet.
+- **Mistral** — passes the same stable `prompt_cache_key` body field as OpenAI and reads the cached tokens back (`prompt_tokens_details.cached_tokens`); the cached part bills at a tenth of the input rate.
 
-**Reading the discount in your runs**: every `POST /run` response includes optional `usage.cache_read_tokens` (tokens served from cache, billed at the cached-read rate) and `usage.cache_write_tokens` (Anthropic only — tokens written to cache at the 1.25× write surcharge). When fields are absent, no cache activity occurred. The `cost.estimated` field already accounts for the cached-rate billing — within ±5% of the provider's actual invoice.
+**Reading the discount in your runs**: every `POST /run` response includes optional `usage.cache_read_tokens` (tokens served from cache, billed at the cached-read rate) and `usage.cache_write_tokens` (Anthropic only — tokens written to cache at the 1.25× write surcharge). When fields are absent, no cache activity occurred. The `cost.estimated` field already accounts for each model's cached-read rate and for Anthropic's write surcharge. It is an estimate, not the provider's invoice: OpenAI's cache writes on GPT-6.1, GPT-6 and GPT-5.6 (1.25× input) and the higher prices some providers charge past a long context are not counted.
 
-**Anthropic 5min vs 1h TTL break-even**: 5min TTL costs 1.25× input on writes + 0.10× on reads → break-even at ~2 reuses within 5 minutes. 1h TTL costs 2.0× write + 0.10× read → break-even at ~6-7 reuses within the hour. The runtime defaults to 5min — sufficient for most multi-turn agents and chained API calls. The 1h toggle is a runtime-backlog item for long-PDF workflows.
+**Anthropic 5min vs 1h TTL break-even**: 5min TTL costs 1.25× input on writes, 1h TTL 2× input. Reads cost 0.10× input on most Claude models, 0.05× on Claude Opus 5.5 and Sonnet 5.5, and 0.025× on Claude Fable 5.2, Mythos 5.2, Fable 5.1 and Mythos 5.1. At 0.10×, Anthropic puts the break-even at one read within 5 minutes, two within the hour. The runtime defaults to 5min — sufficient for most multi-turn agents and chained API calls. The 1h toggle is a runtime-backlog item for long-PDF workflows.
 
 **Cache invalidation triggers** (Anthropic explicit cache only — implicit providers re-detect prefix automatically): tool definitions change, image add / remove / reorder in messages, `tool_choice` value change, thinking-settings change, web-search or citations toggling, and any system prompt content change (even one character). Repeat calls with stable system + tools survive across iterations of the tool-loop without re-write.
 

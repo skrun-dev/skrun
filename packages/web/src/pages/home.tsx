@@ -12,13 +12,17 @@ import {
   IconSpark,
 } from "../components/shared/icons";
 import { Btn, Card, MetricCard, PageHeader, Pill, StatusDot } from "../components/shared/ui";
-import { useAgents, useRecentRuns, useStats } from "../lib/api-client";
+import { UsageStrip } from "../components/usage/usage-strip";
+import { instanceLinks, useAgents, useInstance, useRecentRuns, useStats } from "../lib/api-client";
 import { computeDeltaPercent, formatUsd } from "../lib/format";
 
 export function HomePage() {
   const { data: stats, isLoading: statsLoading, error: statsError } = useStats();
   const { data: runs, isLoading: runsLoading } = useRecentRuns(undefined, 15);
   const { data: agentsData } = useAgents(1, 20);
+  // "Read docs" leads to the operator's docs when it sets them, this server's API reference otherwise.
+  const { data: instance } = useInstance();
+  const { docs } = instanceLinks(instance);
 
   const [statsDays, setStatsDays] = useState(1);
 
@@ -222,9 +226,12 @@ export function HomePage() {
         ) : null}
       </div>
 
+      {/* The account's usage — shown only when the server sets a bound it shows */}
+      <UsageStrip />
+
       {/* Main content */}
       {!hasData ? (
-        <OnboardingCard />
+        <OnboardingCard docs={docs} />
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
           {/* Activity feed — 2/3 */}
@@ -349,7 +356,7 @@ export function HomePage() {
                   </div>
                 </div>
                 <a
-                  href="/docs"
+                  href={docs}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-[11px] text-sky-600 dark:text-sky-400 hover:underline inline-flex items-center gap-1"
@@ -367,7 +374,7 @@ export function HomePage() {
 
 // --- Onboarding ---
 
-function OnboardingCard() {
+function OnboardingCard({ docs }: { docs: string }) {
   return (
     <div className="border border-dashed border-gray-300 dark:border-gray-700 rounded-lg p-8">
       <div className="max-w-lg mx-auto text-center">
@@ -386,7 +393,7 @@ function OnboardingCard() {
               Import Agent
             </Btn>
           </Link>
-          <a href="/docs" target="_blank" rel="noopener noreferrer">
+          <a href={docs} target="_blank" rel="noopener noreferrer">
             <Btn variant="secondary">Read Docs</Btn>
           </a>
         </div>

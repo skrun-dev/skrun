@@ -9,7 +9,7 @@ import { SettingsPage } from "./settings";
 const mockKeys = [
   {
     id: "key-1",
-    key_prefix: "sk_live_abc1",
+    key_prefix: "skrun_sk_abc1",
     name: "CI pipeline",
     scopes: [],
     scope_kind: "account",
@@ -19,7 +19,7 @@ const mockKeys = [
   },
   {
     id: "key-2",
-    key_prefix: "sk_live_def2",
+    key_prefix: "skrun_sk_def2",
     name: "Dashboard key",
     scopes: ["agent:run"],
     scope_kind: "agents",
@@ -65,8 +65,8 @@ const server = setupServer(
     mintedBodies.push(body);
     return HttpResponse.json({
       id: "key-3",
-      key: "sk_live_full_key_shown_once_abc123def456",
-      key_prefix: "sk_live_full",
+      key: "minted-key-shown-once",
+      key_prefix: "skrun_sk_full",
       name: body.name || "Dashboard key",
       scopes: [],
       scope_kind: body.scope_kind ?? "account",
@@ -98,9 +98,9 @@ describe("SettingsPage", () => {
   it("UAT-3: lists API keys", async () => {
     renderWithProviders(<SettingsPage />);
     await waitFor(() => {
-      expect(screen.getByText("sk_live_abc1...")).toBeInTheDocument();
+      expect(screen.getByText("skrun_sk_abc1...")).toBeInTheDocument();
       expect(screen.getByText("CI pipeline")).toBeInTheDocument();
-      expect(screen.getByText("sk_live_def2...")).toBeInTheDocument();
+      expect(screen.getByText("skrun_sk_def2...")).toBeInTheDocument();
     });
   });
 

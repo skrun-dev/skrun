@@ -31,6 +31,15 @@
  * Optional env:
  *   PORT                  Listen port (default 4000)
  *   S3_REGION             Defaults to "auto" for R2, "us-east-1" for MinIO
+ *   SKRUN_DB_STATEMENT_TIMEOUT_MS
+ *                         The bound on each database statement, in ms — a
+ *                         whole number from 1000 to 600000 (default 10000);
+ *                         any other value refuses the start.
+ *   SKRUN_DELETION_JOURNAL
+ *                         "true" keeps a record of each account deletion and
+ *                         API key revocation under _deletions/ of S3_BUCKET
+ *                         (default "false"); any value other than true or
+ *                         false refuses the start.
  *   SKRUN_RUNTIME         "local" or "flyio" (default "local"). When
  *                         "flyio", additional env required — see
  *                         runtime/adapter-selection.ts.
@@ -46,8 +55,14 @@ import { startSessionSweep } from "./auth/session.js";
 import { startFileCacheSweep } from "./cache/file-cache-sweep.js";
 import { backfillBundleHashes } from "./db/backfill-bundle-hashes.js";
 import { runMigrations } from "./db/migrations-runner.js";
+import { readDbStatementTimeoutMs } from "./db/pg-timeouts.js";
 import { PostgresDb } from "./db/postgres.js";
+import { startRunOutputPurge } from "./files/output-purge.js";
 import { createApp } from "./index.js";
+import { resolveRuntime } from "./runtime/adapter-selection.js";
+import { installShutdownHandlers } from "./runtime/in-flight-runs.js";
+import { startStateSweep } from "./services/agent-state.js";
+import { readDeletionJournal } from "./services/deletion-journal.js";
 import { R2Storage } from "./storage/r2.js";
 
 function fail(msg: string): never {
@@ -68,7 +83,7 @@ if (!dbUrl) {
 if (!/^postgres(ql)?:\/\//.test(dbUrl)) {
   fail(
     `DATABASE_URL must start with postgres:// or postgresql:// (got: ${dbUrl.slice(0, 8)}...). ` +
-      "Pre-#007 cloud secrets used the Supabase HTTPS project URL — that format is no longer supported.",
+      "Older cloud secrets used the Supabase HTTPS project URL — that format is no longer supported.",
   );
 }
 
@@ -88,9 +103,22 @@ if (!accountId && !endpoint) {
   );
 }
 
-const db = new PostgresDb(dbUrl);
+// The bound on each statement the server sends its database, and the deletion
+// journal, read before any connection: a malformed value refuses the start,
+// naming the variable. createApp reads the journal again, the same way, and
+// builds it on the bundles' store; read only there, its refusal would come
+// after a connection and the migrations, as an uncaught exception.
+let statementTimeoutMs: number;
+try {
+  statementTimeoutMs = readDbStatementTimeoutMs(process.env);
+  readDeletionJournal(process.env);
+} catch (err) {
+  fail(err instanceof Error ? err.message : String(err));
+}
 
-// Auto-apply migrations on boot (#007 spec §Approach 4). `pg_advisory_lock`
+const db = new PostgresDb(dbUrl, {}, { statementTimeoutMs });
+
+// Auto-apply migrations on boot. `pg_advisory_lock`
 // in the runner serialises concurrent boots (rolling deploys); cloud
 // backfill probe records pre-007 MCP-applied migrations without re-running.
 const migResult = await runMigrations(db.getPool(), join(import.meta.dirname, "db/migrations"));
@@ -108,21 +136,43 @@ const storage = new R2Storage({
 // idempotent, out-of-lock — runs after migrations). No-op once all rows hashed.
 await backfillBundleHashes(db, storage);
 
-const app = createApp(storage, db);
+// The runtime, decided once: createApp is handed the mode and never reads it
+// again, and on the cloud runtime the dependencies come with it. The output
+// purge below runs on their store — the bucket runs upload to, which here is
+// also the bundles' one (same S3_* settings).
+const runtime = resolveRuntime();
+const app = createApp(storage, db, { runtimeMode: runtime.mode, flyioDeps: runtime.flyioDeps });
 
 // Expired sessions are swept on a fixed interval, on every instance. Started
 // here rather than inside createApp, which every test also calls: a timer per
 // built app would be a timer nothing asked for, and nothing would make it a
 // no-op by default.
 startSessionSweep(db);
-// Same reasoning for the file caches: expired run files are deleted on a
-// schedule, and what a previous process left behind is removed once, at boot.
-startFileCacheSweep();
+// Same reasoning for expired state notebooks: deleted within the hour after
+// their deadline, by a pass now and then one every hour.
+startStateSweep(db);
+// And for the output files a cloud run leaves in object storage: deleted once
+// their deadline has passed, by a pass now and then one every five minutes.
+// Outside the cloud runtime there is no store to hand over and nothing starts —
+// a run's files stay on local disk, where the file sweep started below covers them.
+startRunOutputPurge(db, runtime.flyioDeps?.storage);
 
 const port = Number(process.env.PORT ?? 4000);
 
-serve({ fetch: app.fetch, port }, () => {
+const server = serve({ fetch: app.fetch, port }, () => {
+  // The file caches' sweep, like the ones above: expired run files are deleted on a
+  // schedule, and what no live process holds under the temp directory is
+  // removed in the background. Started once the server listens, so a large
+  // stock left by an earlier version never stands between a start and its
+  // health check.
+  startFileCacheSweep();
   console.log(
-    `[skrun-api] listening on :${port} runtime=${process.env.SKRUN_RUNTIME ?? "local"} db=postgres storage=r2 migrations applied=${migResult.applied} backfilled=${migResult.backfilled} skipped=${migResult.skipped}`,
+    `[skrun-api] listening on :${port} runtime=${runtime.mode} db=postgres storage=r2 migrations applied=${migResult.applied} backfilled=${migResult.backfilled} skipped=${migResult.skipped}`,
   );
 });
+
+// A deploy, or `docker compose stop`, sends SIGTERM: the runs in flight are
+// ended — their rows written within a few seconds — before the process exits.
+// On the cloud runtime the stop holds its pool too: the maintenance stopped,
+// the ready machines it holds destroyed after the runs.
+installShutdownHandlers({ server, pool: runtime.flyioDeps?.pool });

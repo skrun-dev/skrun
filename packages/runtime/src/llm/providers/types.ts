@@ -20,6 +20,59 @@ export interface ToolCallResult {
   id?: string;
 }
 
+/**
+ * One assistant turn exactly as the provider returned it, tagged with the
+ * `name` of the adapter that produced it. Opaque everywhere else: the router
+ * stores it and hands it back, and only that adapter reads `content` —
+ * Anthropic its response `content` blocks (thinking blocks and their
+ * signatures included), Gemini its candidate `content` (thought signatures
+ * included), the OpenAI-compatible adapters their assistant message,
+ * restricted to the fields Chat Completions accepts back as input. What we do
+ * not understand, we send back untouched.
+ *
+ * It carries the model's own output: never logged, never persisted.
+ */
+export interface NativeTurn {
+  /** `LLMProvider.name` of the adapter that produced the turn. */
+  provider: string;
+  /** The provider's own shape of the turn, as returned. */
+  content: unknown;
+}
+
+/**
+ * One step of a conversation after its initial input: an assistant turn, the
+ * results of the tool calls it made (each with the id of its call when the
+ * provider gives one), or a later user message.
+ */
+export type HistoryEntry =
+  | { kind: "assistant"; turn: NativeTurn }
+  | { kind: "tool_results"; results: ToolCallResult[] }
+  | { kind: "user"; parts: SkrunPart[] };
+
+/**
+ * The conversation one router call held, returned so that a later call can
+ * continue it. Bound to the provider AND the model that produced its turns: a
+ * turn is valid only for the model that wrote it (a thinking signature is) —
+ * and to the destination they were exchanged with, `baseUrl`. In memory for
+ * the duration of a call; never logged, never persisted.
+ */
+export interface ConversationHistory {
+  provider: string;
+  model: string;
+  /**
+   * The endpoint an agent declared (`model.base_url`) the turns were
+   * exchanged with; absent at the provider's own API. Behind a declared
+   * endpoint the adapter is OpenAI-compatible whatever the provider's name,
+   * and so are its turns: a conversation goes back only to the same
+   * destination.
+   */
+  baseUrl?: string;
+  /** The conversation's first user message. */
+  input: SkrunPart[];
+  /** Everything after it, in order. */
+  entries: HistoryEntry[];
+}
+
 export interface LLMCallRequest {
   systemPrompt: string;
   /**
@@ -33,10 +86,16 @@ export interface LLMCallRequest {
    */
   userMessage: string;
   tools?: ToolDefinitionForLLM[];
-  /** Original tool call requests from the previous LLM response (contains args) */
-  toolCalls?: ToolCallRequest[];
-  /** Tool execution results matching the toolCalls above */
-  toolResults?: ToolCallResult[];
+  /**
+   * The conversation after `userContent`, in order: each assistant turn as the
+   * provider returned it, the tool results that answered it, later user
+   * messages. Empty on a first turn. The adapter renders all of it, in its
+   * provider's shape — a turn untouched, each result paired with its call by id
+   * where the provider gives one, by position otherwise. Every turn was
+   * produced by this adapter: a turn tagged with another provider is a
+   * programming error (`LLMHistoryError`).
+   */
+  history?: HistoryEntry[];
   temperature?: number;
   model: string;
   /**
@@ -64,12 +123,12 @@ export interface LLMCallRequest {
    * iterations of the same run share the same cache pool.
    *
    * Provider-specific transport (set by the adapter, not the router):
-   * - **OpenAI**: passed as `prompt_cache_key` body field on Chat Completions / Responses.
+   * - **OpenAI**, **Mistral**: passed as `prompt_cache_key` body field on Chat Completions
+   *   (OpenAI's Responses too).
    * - **xAI Grok** (Chat Completions): passed as `x-grok-conv-id` HTTP header.
    * - **xAI Grok** (Responses): passed as `prompt_cache_key` body field.
    * - **Anthropic / Gemini / Groq**: not used (Anthropic uses `cache_control` blocks,
    *   Gemini + Groq are fully implicit on stable-prefix detection).
-   * - **Mistral**: ignored (no native caching).
    *
    * Undefined when the router has no agent context (e.g. dev-mode raw call) — adapters
    * fall back to no-key behavior.
@@ -91,6 +150,8 @@ export function userMessageFromContent(parts: SkrunPart[]): string {
 export interface LLMCallResponse {
   content: string;
   toolCalls?: ToolCallRequest[];
+  /** This turn exactly as the provider returned it (see `NativeTurn`). */
+  assistantTurn: NativeTurn;
   /**
    * Token-usage shape returned from a single provider call. Adapter is
    * responsible for normalizing provider-specific fields into this uniform
@@ -100,14 +161,14 @@ export interface LLMCallResponse {
    *   portion (if any) is reported separately via `cacheReadTokens` and
    *   excluded from `promptTokens` to avoid double-counting in cost
    *   computation. Anthropic's native shape is already non-overlapping;
-   *   OpenAI / xAI / Groq / Gemini are GROSS in their native response, so
+   *   OpenAI / xAI / Groq / Mistral / Gemini are GROSS in their native response, so
    *   the adapter computes `promptTokens = gross_prompt_tokens - cached_tokens`.
    * - `completionTokens`: tokens billed at the output rate. Unchanged from
-   *   the pre-#68 shape.
+   *   the shape it had before prompt-cache accounting.
    * - `cacheReadTokens`: tokens served from the provider's cache and billed
    *   at the cached-read rate (typically 0.10× input on Anthropic, GPT-5.x,
-   *   Gemini 2.5+/3.x, 0.5× input on Groq gpt-oss + OpenAI gpt-4o legacy).
-   *   Optional — undefined when the provider doesn't expose it (Mistral) or
+   *   Gemini 2.5+/3.x and Mistral, 0.5× input on Groq gpt-oss + OpenAI gpt-4o
+   *   legacy). Optional — undefined when the provider does not report it, or
    *   when no cache hit occurred.
    * - `cacheWriteTokens`: tokens written to cache and billed at the cached-
    *   write rate. Anthropic only (5min TTL by default; the 1h TTL toggle

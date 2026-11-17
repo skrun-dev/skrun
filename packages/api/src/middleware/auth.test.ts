@@ -1,6 +1,12 @@
+import { createHash } from "node:crypto";
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { generateApiKey } from "../auth/api-key.js";
+import {
+  API_KEY_PREFIX,
+  apiKeyShapes,
+  generateApiKey,
+  RETIRED_API_KEY_PREFIX,
+} from "../auth/api-key.js";
 import { createSession, sessionCookieName } from "../auth/session.js";
 import { MemoryDb } from "../db/memory.js";
 import { createAuthMiddleware, getUser } from "./auth.js";
@@ -65,7 +71,7 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
     expect(body.username).toBe("alice");
   });
 
-  it("authenticates via API key (sk_live_*)", async () => {
+  it("authenticates via API key", async () => {
     const user = await db.createUser({ github_id: "gh-2", username: "bob" });
     const { key, keyHash, keyPrefix } = generateApiKey();
     await db.createApiKey({
@@ -348,6 +354,33 @@ describe("Auth Middleware (createAuthMiddleware)", () => {
     });
     expect((await dres.json()).key).toBeNull();
   });
+
+  it("an ordinary dev token records its account and carries no synthetic-account mark", async () => {
+    delete process.env.GITHUB_CLIENT_ID;
+    delete process.env.GITHUB_CLIENT_SECRET;
+    const res = await app.request("/protected/me", {
+      headers: { Authorization: "Bearer dev-token" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).not.toHaveProperty("syntheticAccount");
+    // The id is the recorded users row, not the derived fallback.
+    expect(await db.getUserById(body.id)).not.toBeNull();
+  });
+
+  it("a dev token whose account could not be recorded is marked synthetic", async () => {
+    delete process.env.GITHUB_CLIENT_ID;
+    delete process.env.GITHUB_CLIENT_SECRET;
+    vi.spyOn(db, "createUser").mockRejectedValue(new Error("database is locked"));
+    const res = await app.request("/protected/me", {
+      headers: { Authorization: "Bearer orphan-token" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.syntheticAccount).toBe(true);
+    expect(body.key).toBeNull();
+    expect(await db.getUserById(body.id)).toBeNull();
+  });
 });
 
 // VT-1 (#009): the fail-secure gate. The api test setup enables dev-auth
@@ -428,7 +461,7 @@ describe("Auth Middleware — a duplicated session cookie (#123)", () => {
   // disadvantage — and the case still has to refuse, because the ordering is the
   // attacker's to choose and refusing only the bad ordering would be refusing
   // only the attacks that failed anyway.
-  it("VT-34: a duplicated prefixed cookie authenticates nobody, is logged, and is erased on both scopes", async () => {
+  it("VT-11 (#125): a duplicated __Secure- cookie authenticates nobody, is logged, and is erased on both scopes", async () => {
     process.env.NODE_ENV = "production";
     process.env.SKRUN_SESSION_COOKIE_DOMAIN = "example.com";
 
@@ -449,10 +482,11 @@ describe("Auth Middleware — a duplicated session cookie (#123)", () => {
     expect(JSON.stringify(logWarnSpy.mock.calls)).not.toContain(valid);
 
     // Both scopes of the prefixed name are erased. The shared erasure factory
-    // also covers the pre-domain name, so there are four headers and not two:
-    // that is the factory doing its job, not this case overreaching.
+    // also covers the bare name on both scopes and the host-locked name
+    // host-only, so there are five headers and not two: that is the factory
+    // doing its job, not this case overreaching.
     const cookies = res.headers.getSetCookie();
-    expect(cookies).toHaveLength(4);
+    expect(cookies).toHaveLength(5);
     expect(cookies).toContain(`${name}=; Max-Age=0; Path=/; Secure`);
     expect(cookies).toContain(`${name}=; Max-Age=0; Domain=example.com; Path=/; Secure`);
 
@@ -475,16 +509,19 @@ describe("Auth Middleware — a duplicated session cookie (#123)", () => {
     });
     expect(withKey.status).toBe(200);
     expect((await withKey.json()).username).toBe("victim");
-    expect(withKey.headers.getSetCookie()).toHaveLength(4);
+    expect(withKey.headers.getSetCookie()).toHaveLength(5);
   });
 
-  // The transition, and it must NOT be touched. With no domain configured the two
-  // cookies legitimately share a name — the old host-only one and the new
-  // domain-scoped one — so refusing here would sign out every user of a
-  // deployment on the day it turns the domain on. Today's behaviour is kept: the
-  // parser's first occurrence wins, nothing is logged, nothing is erased.
-  it("VT-35: an unprefixed duplicate is the transition pair and is left alone", async () => {
-    delete process.env.SKRUN_SESSION_COOKIE_DOMAIN;
+  // The transition, and it must NOT be touched. The pair — the old host-only
+  // cookie and the new domain-scoped one sharing a name — exists only where a
+  // domain is configured outside production: in production the name is always
+  // prefixed, and a domain changes which prefix, so the two cookies can no longer
+  // share a name there. In that one configuration refusing would sign out every
+  // user on the day the domain is turned on, so the parser's first occurrence
+  // wins, nothing is logged, nothing is erased.
+  it("RT-7 (#125): an unprefixed duplicate is the transition pair and is left alone", async () => {
+    process.env.NODE_ENV = "development";
+    process.env.SKRUN_SESSION_COOKIE_DOMAIN = "example.com";
 
     const user = await db.createUser({ github_id: "gh-transition", username: "transition" });
     const valid = await createSession(db, user.id);
@@ -498,5 +535,194 @@ describe("Auth Middleware — a duplicated session cookie (#123)", () => {
     expect((await res.json()).username).toBe("transition");
     expect(logWarnSpy).not.toHaveBeenCalled();
     expect(res.headers.getSetCookie()).toHaveLength(0);
+  });
+});
+
+// A bearer shaped like a key — the current prefix or the retired one — is
+// answered by the key branch, without a database read when it cannot be a key,
+// and never reaches the dev-token fallback. Every key here is generated or
+// assembled at run time.
+describe("Auth Middleware — a key-shaped bearer", () => {
+  const envSnapshot = { ...process.env };
+  const INVALID_KEY = { error: { code: "UNAUTHORIZED", message: "Invalid API key" } };
+  let db: MemoryDb;
+  let app: Hono;
+
+  /** Dev mode: the dev-token fallback is on, OAuth is not configured. */
+  function devMode(): void {
+    delete process.env.GITHUB_CLIENT_ID;
+    delete process.env.GITHUB_CLIENT_SECRET;
+    process.env.SKRUN_DEV_AUTH = "1";
+  }
+
+  function oauthMode(): void {
+    process.env.GITHUB_CLIENT_ID = "id";
+    process.env.GITHUB_CLIENT_SECRET = "secret";
+  }
+
+  const modes: Array<[string, () => void]> = [
+    ["OAuth configured", oauthMode],
+    ["dev mode", devMode],
+  ];
+
+  /** A whole key of the retired format. */
+  function retiredKey(): string {
+    return `${RETIRED_API_KEY_PREFIX}${"0".repeat(32)}`;
+  }
+
+  /** A generated key, its last checksum character changed. */
+  function wrongChecksumKey(): string {
+    const { key } = generateApiKey();
+    return `${key.slice(0, -1)}${key.slice(-1) === "0" ? "1" : "0"}`;
+  }
+
+  beforeEach(() => {
+    db = new MemoryDb();
+    app = new Hono();
+    app.use("/protected/*", createAuthMiddleware(db));
+    app.get("/protected/me", (c) => c.json(getUser(c)));
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in envSnapshot)) delete process.env[key];
+    }
+    for (const [k, v] of Object.entries(envSnapshot)) {
+      if (v !== undefined) process.env[k] = v;
+    }
+    vi.restoreAllMocks();
+  });
+
+  it.each(
+    modes,
+  )("a key with the current prefix and a wrong checksum is refused without a key lookup (%s)", async (_mode, setMode) => {
+    setMode();
+    const lookup = vi.spyOn(db, "getApiKeyByHash");
+    expect(apiKeyShapes(wrongChecksumKey())).toHaveLength(1);
+
+    const res = await app.request("/protected/me", {
+      headers: { Authorization: `Bearer ${wrongChecksumKey()}` },
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual(INVALID_KEY);
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it.each(
+    modes,
+  )("a key of the retired format is refused like any invalid key, without a read (%s)", async (_mode, setMode) => {
+    setMode();
+    const lookup = vi.spyOn(db, "getApiKeyByHash");
+    const byGithubId = vi.spyOn(db, "getUserByGithubId");
+    const create = vi.spyOn(db, "createUser");
+
+    const res = await app.request("/protected/me", {
+      headers: { Authorization: `Bearer ${retiredKey()}` },
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual(INVALID_KEY);
+    expect(lookup).not.toHaveBeenCalled();
+    expect(byGithubId).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  // In dev mode any other bearer becomes an admin account named after it: a
+  // key-shaped one must not, or a mistyped or retired key would create one.
+  it.each([
+    ["the current prefix, malformed", () => `${API_KEY_PREFIX}abc123`],
+    ["the retired prefix", () => `${RETIRED_API_KEY_PREFIX}abc123`],
+  ])("a bearer with %s never becomes a dev token, and no account is created", async (_case, token) => {
+    devMode();
+    const bearer = token();
+    const users = (db as unknown as { users: Map<string, unknown> }).users;
+    const before = users.size;
+
+    const res = await app.request("/protected/me", {
+      headers: { Authorization: `Bearer ${bearer}` },
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual(INVALID_KEY);
+    const devId = createHash("sha256").update(bearer).digest("hex").slice(0, 16);
+    expect(await db.getUserByGithubId(`dev-${devId}`)).toBeNull();
+    expect(users.size).toBe(before);
+  });
+
+  // The prefix is compared without its letter case: a key typed or copied in
+  // another case is still read as a key. Only the exact prefix is well formed,
+  // so such a bearer is refused before any read — and never becomes a dev token.
+  const otherCase: Array<[string, () => string]> = [
+    [
+      "the current prefix in upper case, on a valid body and checksum",
+      () => {
+        const { key } = generateApiKey();
+        return `${API_KEY_PREFIX.toUpperCase()}${key.slice(API_KEY_PREFIX.length)}`;
+      },
+    ],
+    [
+      "the current prefix in mixed case",
+      () => `${API_KEY_PREFIX.charAt(0).toUpperCase()}${API_KEY_PREFIX.slice(1)}abc123`,
+    ],
+    [
+      "the retired prefix in upper case, on a whole key",
+      () => retiredKey().replace(RETIRED_API_KEY_PREFIX, RETIRED_API_KEY_PREFIX.toUpperCase()),
+    ],
+  ];
+  it.each(
+    modes.flatMap(([mode, setMode]) =>
+      otherCase.map(([label, token]) => [label, mode, setMode, token] as const),
+    ),
+  )("a bearer with %s is refused without a read, and no account is created (%s)", async (_label, _mode, setMode, token) => {
+    setMode();
+    const bearer = token();
+    const lookup = vi.spyOn(db, "getApiKeyByHash");
+    const byGithubId = vi.spyOn(db, "getUserByGithubId");
+    const create = vi.spyOn(db, "createUser");
+    const users = (db as unknown as { users: Map<string, unknown> }).users;
+    const before = users.size;
+
+    const res = await app.request("/protected/me", {
+      headers: { Authorization: `Bearer ${bearer}` },
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual(INVALID_KEY);
+    expect(lookup).not.toHaveBeenCalled();
+    expect(byGithubId).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(users.size).toBe(before);
+  });
+
+  it.each([
+    ["dev-token", "dev"],
+    ["alice-xyz", "alice"],
+  ])("in dev mode, %s keeps its namespace (%s) and the admin role", async (token, namespace) => {
+    devMode();
+    const res = await app.request("/protected/me", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.namespace).toBe(namespace);
+    expect(body.role).toBe("admin");
+  });
+
+  it("with OAuth configured, any other bearer is refused and the message names the current key format", async () => {
+    oauthMode();
+    const res = await app.request("/protected/me", {
+      headers: { Authorization: "Bearer some-opaque-token" },
+    });
+    expect(res.status).toBe(401);
+    const { error } = await res.json();
+    expect(error.code).toBe("UNAUTHORIZED");
+    expect(error.message).toContain(`${API_KEY_PREFIX}*`);
+    expect(error.message).not.toContain(RETIRED_API_KEY_PREFIX);
+  });
+
+  it("with OAuth configured, a request with no credential gets a message that names the current key format", async () => {
+    oauthMode();
+    const res = await app.request("/protected/me");
+    expect(res.status).toBe(401);
+    const { error } = await res.json();
+    expect(error.message).toContain(`${API_KEY_PREFIX}*`);
+    expect(error.message).not.toContain(RETIRED_API_KEY_PREFIX);
   });
 });

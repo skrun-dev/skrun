@@ -10,18 +10,20 @@
  * every branch is unit-testable in isolation.
  */
 
+import { ModelProviderSchema } from "@skrun-dev/schema";
 import type { DbAdapter } from "../db/adapter.js";
-import type { Agent, AgentLlmKeyInfo } from "../db/schema.js";
+import type { Agent, AgentLlmKeyInfo, AgentLlmKeyRecord } from "../db/schema.js";
 import { RegistryError } from "./registry.js";
 import { buildAad, KEY_ENVELOPE_VERSION, type KeyProvider } from "./secrets/key-provider.js";
 
 /**
- * Providers a creator may attach a key for — exactly those the LLM router can
- * instantiate (`router.ts` createProvider). NB `meta` is a valid agent.yaml model
- * provider but the router has no client for it, so a key for it would be inert;
- * we reject it at attach time rather than fail mysteriously at run.
+ * Providers a creator may attach a key for — exactly those agent.yaml knows
+ * (`ModelProviderSchema`, the rule `skrun llm-key` checks too). `meta` has no
+ * endpoint of its own: its key is served only at the `model.base_url` the agent
+ * declares, through the router's OpenAI-compatible client — and validation and
+ * the push refuse a `meta` model without one.
  */
-const ATTACHABLE_PROVIDERS = new Set(["anthropic", "openai", "google", "mistral", "groq", "xai"]);
+const ATTACHABLE_PROVIDERS: ReadonlySet<string> = new Set(ModelProviderSchema.options);
 
 /**
  * Minimum plaintext length. Every real provider key far exceeds this; it guards
@@ -90,18 +92,21 @@ export async function listCreatorKeys(db: DbAdapter, agent: Agent): Promise<Agen
 }
 
 /**
- * Decrypt all of an agent's attached creator keys into a provider→plaintext map
- * for the run-time resolution chain (harness-side only). Returns `{}` when none
- * are attached. A decrypt failure (e.g. the master key was rotated away, or the
- * row was tampered) is a HARD error — never silently skipped, which would fall
- * through to the wrong tier / wrong payer.
+ * Decrypt an agent's attached creator keys — the records its caller read with
+ * `db.getAgentLlmKeySecrets` — into a provider→plaintext map for the run-time
+ * resolution chain (harness-side only). Returns `{}` when none are attached. A
+ * decrypt failure (e.g. the master key was rotated away, or the row was
+ * tampered) is a HARD error — never silently skipped, which would fall through
+ * to the wrong tier / wrong payer.
+ *
+ * Given the records rather than reading them: the caller reads them first, so
+ * that a database that fails, or does not answer in time, is never taken for a
+ * key this server cannot decrypt.
  */
-export async function resolveCreatorKeys(
-  db: DbAdapter,
+export function decryptCreatorKeys(
   keyProvider: KeyProvider,
-  agentId: string,
-): Promise<Record<string, string>> {
-  const records = await db.getAgentLlmKeySecrets(agentId);
+  records: readonly AgentLlmKeyRecord[],
+): Record<string, string> {
   const out: Record<string, string> = {};
   for (const record of records) {
     out[record.provider] = keyProvider.decrypt(

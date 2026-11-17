@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseSSEStream } from "./sse.js";
+import { collectRunResult, parseSSEStream } from "./sse.js";
 import type { RunEvent } from "./types.js";
 
 function createSSEResponse(text: string): Response {
@@ -84,12 +84,12 @@ describe("parseSSEStream", () => {
     expect(events).toHaveLength(2);
   });
 
-  // RT-1: a runner_spawned event (a type older consumers never saw) must flow
+  // A runner_spawned event (a type older consumers never saw) must flow
   // through and be yielded, with the stream still terminating on run_complete.
   // The parser casts JSON -> RunEvent with no strict/discriminated validation,
   // so a new event type is backward-compatible for SDK consumers. (The
   // dashboard's timeline renders unknown types with a fallback style; that
-  // tolerance is asserted manually in the cloud measurement, Phase 6.2.)
+  // tolerance is asserted by hand, on a cloud run.)
   it("yields runner_spawned and still completes (unknown-event tolerance)", async () => {
     const text = [
       'event: run_start\ndata: {"type":"run_start","run_id":"x","timestamp":"t","agent":"a"}',
@@ -102,8 +102,73 @@ describe("parseSSEStream", () => {
     const spawned = events[1];
     if (spawned.type === "runner_spawned") {
       expect(spawned.phases.host_schedule_pull_ms).toBe(4800);
-      // Durations only — no operator-internal fields on the wire event.
+      // The phases only — no operator-internal fields on the wire event.
       expect(Object.keys(spawned)).not.toContain("private_ip");
     }
+  });
+});
+
+describe("collectRunResult", () => {
+  async function* events(...list: RunEvent[]): AsyncGenerator<RunEvent> {
+    yield* list;
+  }
+
+  it("throws STREAM_INTERRUPTED on a stream with no terminal event", async () => {
+    await expect(collectRunResult(events())).rejects.toMatchObject({
+      code: "STREAM_INTERRUPTED",
+    });
+  });
+
+  it("stops at the first terminal event", async () => {
+    const result = await collectRunResult(
+      events(
+        { type: "run_start", run_id: "x", timestamp: "t", agent: "a", agent_version: "1.2.3" },
+        { type: "run_error", run_id: "x", timestamp: "t", error: { code: "E", message: "boom" } },
+        {
+          type: "run_complete",
+          run_id: "x",
+          timestamp: "t",
+          output: { never: "read" },
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          cost: { estimated: 1 },
+          duration_ms: 1,
+          files: [],
+          files_excluded: {},
+        },
+      ),
+    );
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("boom");
+    expect(result.agent_version).toBe("1.2.3");
+    expect(result.files_excluded).toEqual({});
+  });
+
+  const complete: RunEvent = {
+    type: "run_complete",
+    run_id: "x",
+    timestamp: "t",
+    output: {},
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    cost: { estimated: 0 },
+    duration_ms: 1,
+    files: [],
+    files_excluded: { name_refused: 1, over_count: 4, upload_budget: 2 },
+  };
+
+  it("reports how many output files the run left out, by reason, as the synchronous result does", async () => {
+    const result = await collectRunResult(events(complete));
+
+    expect(result.files_excluded).toEqual({ name_refused: 1, over_count: 4, upload_budget: 2 });
+  });
+
+  it("reports no file left out from a server that does not count them", async () => {
+    const { files_excluded: _counts, ...fromAnEarlierServer } = complete as Extract<
+      RunEvent,
+      { type: "run_complete" }
+    >;
+
+    const result = await collectRunResult(events(fromAnEarlierServer as RunEvent));
+
+    expect(result.files_excluded).toEqual({});
   });
 });

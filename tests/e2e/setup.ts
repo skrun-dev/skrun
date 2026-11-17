@@ -5,6 +5,8 @@
 import { generateApiKey } from "../../packages/api/src/auth/api-key.js";
 import { MemoryDb } from "../../packages/api/src/db/memory.js";
 import { createApp } from "../../packages/api/src/index.js";
+import type { QuotaConfig } from "../../packages/api/src/quotas/thresholds.js";
+import { validBundle } from "../../packages/api/src/routes/agent-bundle.shared.js";
 import { RegistryService } from "../../packages/api/src/services/registry.js";
 import type { VerificationPolicy } from "../../packages/api/src/services/verification-policy.js";
 import { MemoryStorage } from "../../packages/api/src/storage/memory.js";
@@ -14,10 +16,20 @@ import { MemoryStorage } from "../../packages/api/src/storage/memory.js";
 // Vitest sets NODE_ENV=test (allowlisted) so the createApp dev-auth interlock won't trip.
 process.env.SKRUN_DEV_AUTH ??= "1";
 
-export function createTestApp(opts: { verificationPolicy?: VerificationPolicy } = {}) {
+/**
+ * A fresh app on in-memory storage and database. `quotaConfig` is the quota
+ * settings as the server would have read them (`parseQuotaEnv`); omitted, the
+ * app reads them from the environment, as a server does.
+ */
+export function createTestApp(
+  opts: { verificationPolicy?: VerificationPolicy; quotaConfig?: QuotaConfig } = {},
+) {
   const storage = new MemoryStorage();
   const db = new MemoryDb();
-  const app = createApp(storage, db, { verificationPolicy: opts.verificationPolicy });
+  const app = createApp(storage, db, {
+    verificationPolicy: opts.verificationPolicy,
+    quotaConfig: opts.quotaConfig,
+  });
   const service = new RegistryService(storage, db);
   return { app, storage, db, service };
 }
@@ -28,13 +40,13 @@ export const PROD_TOKEN = "prod-user-token";
 export const devAuth = { Authorization: `Bearer ${DEV_TOKEN}` };
 export const prodAuth = { Authorization: `Bearer ${PROD_TOKEN}` };
 
-/** Push a fake agent bundle to the registry */
+/** Push a minimal agent's bundle — one the push accepts — to the registry */
 export async function pushAgent(
   app: ReturnType<typeof createApp>,
   opts: { ns?: string; name?: string; version?: string; token?: string } = {},
 ) {
   const { ns = "dev", name = "test-agent", version = "1.0.0", token = DEV_TOKEN } = opts;
-  const bundle = Buffer.from("fake-agent-bundle");
+  const bundle = new Uint8Array(await validBundle(name));
   return app.request(`/api/agents/${ns}/${name}/push?version=${version}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
@@ -209,9 +221,9 @@ export async function verifyVersion(
 }
 
 /**
- * Create a non-admin user + a usable sk_live key. The dev/prod test tokens all
+ * Create a non-admin user + a usable API key. The dev/prod test tokens all
  * resolve to admin in dev-mode, so run-authorization tests that need a real
- * non-owner caller mint a key this way (the sk_live path runs before the
+ * non-owner caller mint a key this way (the API-key path runs before the
  * dev-token fallback).
  */
 export async function seedUserKey(

@@ -16,7 +16,7 @@ This agent takes a Markdown outline and produces a polished `.pptx` — title sl
 - One LLM API key (Google Gemini works on the free tier)
 - **Python 3.11+** locally
 
-That's it. The agent's `requirements.txt` (`python-pptx`) is resolved automatically by the Skrun runtime on first call and cached at `~/.skrun/deps/<hash>/`.
+That's it. The agent's `requirements.txt` (`python-pptx`) is resolved automatically by the local registry on its first call and cached on this machine, at `~/.skrun/deps/<hash>/`.
 
 (Windows: this agent's tools run under the local Python — Skrun runtime invokes `python` on Windows and `python3` on macOS/Linux. Standard for both.)
 
@@ -28,7 +28,7 @@ From the repo root:
 # 1. Push the agent to your local registry
 cd agents/slide-deck-generator
 skrun build && skrun push
-skrun verify dev/slide-deck-generator@0.2.0   # admin step; dev-token = auto-admin
+skrun verify dev/slide-deck-generator@0.3.1   # admin step; dev-token = auto-admin
 
 # 2. Call it (quick-try with the bundled outline — 6-slide Q2 update)
 curl -X POST http://localhost:4000/api/agents/dev/slide-deck-generator/run \
@@ -96,5 +96,9 @@ Tips:
 - Ship a `.docx` variant with the same outline format using `python-docx`.
 
 ## Version note
+
+v0.3.1 — the retired `filesystem` field and the empty `secrets` list removed from `agent.yaml`.
+
+v0.3.0 — the model is Gemini 3.8 Flash, with Gemini 3.5 Flash-Lite as fallback: Google opens Gemini 2.5 only to accounts that have used it before.
 
 v0.2.0 bumped from v0.1.0 — the manual `pip install python-pptx` step disappeared once Skrun's runtime gained `requirements.txt` resolution.

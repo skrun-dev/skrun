@@ -1,6 +1,6 @@
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { inputCache, registerInputFile } from "../cache/input-cache.js";
 import { _clearOutputCacheForTests, registerOutput } from "../cache/output-cache.js";
@@ -36,7 +36,7 @@ describe("resolveFileId", () => {
 
   it("resolves a registered input file with source=input and metadata", () => {
     const { path, size } = makeTempFile();
-    tempPaths.push(path);
+    tempPaths.push(dirname(path));
     const expiresAt = new Date(Date.now() + 86_400_000);
     registerInputFile("fil_resolved", {
       path,

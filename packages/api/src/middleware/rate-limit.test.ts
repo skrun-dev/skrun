@@ -102,3 +102,57 @@ describe("rateLimiter middleware keying (SEC-018 / SKRUN_TRUST_PROXY)", () => {
     expect(body.error?.code).toBe("RATE_LIMITED");
   });
 });
+
+// A refusal says how long to wait: the seconds until the window resets, as
+// X-RateLimit-Reset counts them (Unix seconds) — never a negative number.
+describe("rateLimiter middleware — Retry-After on a refusal", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+  });
+
+  it("a refused request is told the seconds left until X-RateLimit-Reset; an admitted one gets no Retry-After", async () => {
+    vi.stubEnv("SKRUN_TRUST_PROXY", "");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    // Half a second past a whole second: the reset is rounded up, now down.
+    const t0 = 1_800_000_000_500;
+    vi.setSystemTime(t0);
+    const app = appWith(1);
+
+    const admitted = await app.request("/x");
+    expect(admitted.status).toBe(200);
+    expect(admitted.headers.get("Retry-After")).toBeNull();
+
+    vi.setSystemTime(t0 + 30_000);
+    const limited = await app.request("/x");
+    expect(limited.status).toBe(429);
+    const reset = Number(limited.headers.get("X-RateLimit-Reset"));
+    expect(reset).toBe(Math.ceil((t0 + 60_000) / 1000));
+    expect(limited.headers.get("Retry-After")).toBe(
+      String(reset - Math.floor((t0 + 30_000) / 1000)),
+    );
+    expect(limited.headers.get("Retry-After")).toBe("31");
+  });
+
+  it("a reset the store reports already past asks for 0 seconds, never a negative wait", async () => {
+    vi.stubEnv("SKRUN_TRUST_PROXY", "");
+    const pastReset = Math.floor(Date.now() / 1000) - 5;
+    const app = new Hono();
+    app.use(
+      "/x",
+      rateLimiter({
+        name: "x",
+        windowMs: 60_000,
+        max: 1,
+        make: () => ({
+          check: async () => ({ success: false, limit: 1, remaining: 0, resetSeconds: pastReset }),
+        }),
+      }),
+    );
+    app.get("/x", (c) => c.text("ok"));
+
+    const limited = await app.request("/x");
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("Retry-After")).toBe("0");
+  });
+});

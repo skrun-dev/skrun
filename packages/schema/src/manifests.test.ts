@@ -242,6 +242,39 @@ describe("hasNonStdlibImports — Python", () => {
     writeFile("scripts/lib.ts", "import _ from 'lodash';\n");
     expect(hasNonStdlibImports(join(bundleRoot, "scripts"), "python")).toBe(false);
   });
+
+  it.each([
+    ["__future__", "from __future__ import annotations\n"],
+    ["codecs", "import codecs\n"],
+    ["optparse", "import optparse\n"],
+    ["graphlib", "from graphlib import TopologicalSorter\n"],
+  ])("knows %s as the standard library (no warning for it)", (module, source) => {
+    writeFile(`scripts/uses_${module.replace(/_/g, "")}.py`, source);
+    expect(hasNonStdlibImports(join(bundleRoot, "scripts"), "python"), module).toBe(false);
+  });
+
+  // Importable by the runtime image's Python 3.12 without a package from the
+  // index: `distutils` through setuptools, a system package there, and `test`,
+  // which its standard library ships.
+  it.each([
+    ["distutils", "from distutils.version import LooseVersion\n"],
+    ["test", "from test import support\n"],
+  ])("stays silent on %s, which the runtime image's Python imports", (module, source) => {
+    writeFile(`scripts/uses_${module}.py`, source);
+    expect(hasNonStdlibImports(join(bundleRoot, "scripts"), "python"), module).toBe(false);
+  });
+
+  // Removed from the standard library in Python 3.12: a script importing one
+  // needs a package, so it needs a manifest.
+  it.each([
+    ["asyncore", "import asyncore\n"],
+    ["asynchat", "import asynchat\n"],
+    ["imp", "import imp\n"],
+    ["smtpd", "import smtpd\n"],
+  ])("warns on %s, which Python 3.12 no longer ships", (module, source) => {
+    writeFile(`scripts/uses_${module}.py`, source);
+    expect(hasNonStdlibImports(join(bundleRoot, "scripts"), "python"), module).toBe(true);
+  });
 });
 
 describe("hasNonStdlibImports — Node", () => {
