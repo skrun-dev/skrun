@@ -1,5 +1,7 @@
 # CLI Reference
 
+> **Windows (PowerShell):** use `curl.exe` for the curl examples. Windows PowerShell 5.1 aliases `curl` to `Invoke-WebRequest`, which accepts different arguments. The PowerShell examples below send JSON from a UTF-8 file to avoid native-command quoting differences.
+
 ## skrun init
 
 Create a new Skrun agent.
@@ -580,3 +582,44 @@ skrun deploy --message "v1.2 — added fallback to Claude Haiku"
 ```
 
 Notes are max 500 characters, plain text. They're visible in the dashboard at `/dashboard/agents/:ns/:name` and via `GET /api/agents/:ns/:name/versions`.
+
+### Test POST /run from PowerShell
+
+Start `skrun dev` in your agent directory first. Replace `url` below with the input fields declared in your `agent.yaml`. The dev server returns mock responses and needs no registry token.
+
+```powershell
+$body = @{
+  input = @{
+    url = "https://example.com"
+  }
+} | ConvertTo-Json -Depth 10
+
+# UTF-8 without a BOM works in both Windows PowerShell 5.1 and PowerShell 7.
+$utf8 = New-Object System.Text.UTF8Encoding $false
+[System.IO.File]::WriteAllText("$PWD/input.json", $body, $utf8)
+curl.exe -X POST http://localhost:3000/run `
+  -H "Content-Type: application/json" `
+  --data-binary "@input.json"
+```
+
+### Call a deployed agent from PowerShell
+
+Replace the registry URL and `acme/seo-audit` with your registry and agent. Set `SKRUN_API_TOKEN` in your environment to a registry token authorized to run that agent. Its inputs must match `agent.yaml`; this example assumes a `url` field. The registry also needs an available model key — see [Caller-provided API keys](api.md#caller-provided-api-keys). Any verification requirement configured by the registry must be satisfied before calling it.
+
+```powershell
+$registryUrl = "https://your-registry.example"
+$body = @{
+  input = @{
+    url = "https://example.com"
+  }
+} | ConvertTo-Json -Depth 10
+
+$utf8 = New-Object System.Text.UTF8Encoding $false
+[System.IO.File]::WriteAllText("$PWD/input.json", $body, $utf8)
+curl.exe -X POST "$registryUrl/api/agents/acme/seo-audit/run" `
+  -H "Authorization: Bearer $env:SKRUN_API_TOKEN" `
+  -H "Content-Type: application/json" `
+  --data-binary "@input.json"
+```
+
+Both examples write `input.json` in the current directory. Remove it after use if it contains sensitive input.
